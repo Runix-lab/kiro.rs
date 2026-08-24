@@ -1156,6 +1156,14 @@ impl SseStateManager {
             .any(|b| b.block_type != "thinking")
     }
 
+    /// 上游是否已明确下发过 stop_reason。
+    ///
+    /// 供断流标记判断"该不该覆盖"：上游说过什么就以它为准，只有它没说过时才允许
+    /// 把 stop_reason 定成 `max_tokens`。
+    pub fn has_stop_reason(&self) -> bool {
+        self.stop_reason.is_some()
+    }
+
     /// 获取最终的 stop_reason
     pub fn get_stop_reason(&self) -> String {
         if let Some(ref reason) = self.stop_reason {
@@ -2600,6 +2608,23 @@ impl BufferedStreamContext {
     /// 注入由 CacheMeter 计算的缓存覆盖情况（estimate 口径），最终上报时分摊。
     pub fn set_cache_usage(&mut self, cache_usage: super::cache_metering::CacheUsage) {
         self.inner.cache_usage = cache_usage;
+    }
+
+    /// 标记上游中途断流，让最终 `stop_reason` 报 `max_tokens` 而不是伪造 `end_turn`。
+    ///
+    /// 为什么必须由调用方显式标记、不能靠"上游没给 stopReason"推断：**纯 web_search
+    /// 请求同样没有上游 stopReason，但它必须报 `end_turn`**（见
+    /// `stop_reason_web_search_only_stays_end_turn`）。两种情形在数据上完全同形，
+    /// 只有断流现场知道自己是断的。
+    ///
+    /// 取 `max_tokens` 是因为协议里它已经表示"输出被截断"（`ContentLengthExceededException`
+    /// 走的就是这个值），客户端本来就会处理；而 `end_turn` / `tool_use` 都断言正常收尾。
+    ///
+    /// 只在已收到过上游 stopReason 时不覆盖 —— 上游明确说了什么就以它为准。
+    pub fn mark_upstream_interrupted(&mut self) {
+        if !self.inner.state_manager.has_stop_reason() {
+            self.inner.state_manager.set_stop_reason("max_tokens");
+        }
     }
 
     /// 处理 Kiro 事件并缓冲结果
@@ -5332,6 +5357,68 @@ mod tests {
 
         assert_eq!(ctx.resolved_usage(), (40, 20, 20));
         assert_eq!(ctx.resolved_output_tokens(), 9);
+    }
+
+    /// 取出 message_delta 里的 stop_reason。
+    fn stop_reason_of(events: &[SseEvent]) -> Option<String> {
+        events
+            .iter()
+            .find(|e| e.event == "message_delta")
+            .and_then(|e| e.data.get("delta"))
+            .and_then(|d| d.get("stop_reason"))
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+    }
+
+    /// 缓冲模式下上游中途断流（如 720s 客户端超时上限触发）时，绝不能把截断谎报成
+    /// `end_turn`。
+    ///
+    /// 危害在于：响应头（200 + text/event-stream）在收到第一个 chunk 前就已发出，
+    /// 断流后错误分支会把缓冲事件 flush 给客户端并补齐 `message_delta` / `message_stop`。
+    /// 若此时 `stop_reason` 落到 `end_turn` 兜底，客户端收到的是一个**完整、合法、
+    /// 声称模型自然说完**的 SSE 序列，从外部无法察觉自己只拿到半截答案 —— 而内部
+    /// trace 记的是 `interrupted`，两侧对同一次请求给出矛盾的答案。
+    #[test]
+    fn interrupted_buffered_stream_does_not_fake_end_turn() {
+        let mut ctx = BufferedStreamContext::new(
+            "claude-opus-4-7",
+            100,
+            false,
+            HashMap::new(),
+            test_known_tools(),
+        );
+        // 上游断流：从未下发 stopReason。
+        ctx.mark_upstream_interrupted();
+        let events = ctx.finish_and_get_all_events();
+
+        let reason = stop_reason_of(&events).expect("必须有 message_delta");
+        assert_ne!(
+            reason, "end_turn",
+            "断流被谎报成正常收尾，客户端无法察觉截断"
+        );
+        assert_eq!(reason, "max_tokens", "截断应报 max_tokens（协议既有语义）");
+    }
+
+    /// 反向约束：没有断流标记时，行为必须与修复前完全一致。
+    ///
+    /// 纯 web_search 请求同样没有上游 stopReason 却必须报 `end_turn`
+    /// （见 `stop_reason_web_search_only_stays_end_turn`），所以兜底本身不能改。
+    #[test]
+    fn uninterrupted_buffered_stream_still_reports_end_turn() {
+        let mut ctx = BufferedStreamContext::new(
+            "claude-opus-4-7",
+            100,
+            false,
+            HashMap::new(),
+            test_known_tools(),
+        );
+        let events = ctx.finish_and_get_all_events();
+
+        assert_eq!(
+            stop_reason_of(&events).as_deref(),
+            Some("end_turn"),
+            "未断流时兜底行为不得改变"
+        );
     }
 
     #[test]

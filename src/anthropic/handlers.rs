@@ -1961,6 +1961,10 @@ fn create_buffered_sse_stream(
                             }
                             Some(Err(e)) => {
                                 tracing::error!("读取响应流失败: {}", e);
+                                // 断流现场只有这里知道。必须在 flush 前标记，否则补出的
+                                // message_delta 会落到 end_turn 兜底，把截断谎报成正常
+                                // 收尾——响应头早已是 200，客户端从外部察觉不到。
+                                ctx.mark_upstream_interrupted();
                                 // 发生错误，完成处理并返回所有事件
                                 let all_events = ctx.finish_and_get_all_events();
                                 let (i, o, cc, cr, credits) = ctx.final_usage();
