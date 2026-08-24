@@ -16,6 +16,8 @@ use super::base::EventPayload;
 static ALL_ZERO_HITS: AtomicU64 = AtomicU64::new(0);
 /// 诊断探针计数器：上游零缓存但本地已算出缓存覆盖的累计命中次数。
 static CACHE_DISCARDED_HITS: AtomicU64 = AtomicU64::new(0);
+/// 诊断探针计数器：uncachedInputTokens 为 0 而缓存读取有值的累计命中次数。
+static INPUT_ZEROED_HITS: AtomicU64 = AtomicU64::new(0);
 
 /// 诊断探针：量化「上游 tokenUsage 不可信」的真实频率。
 ///
@@ -47,6 +49,28 @@ pub fn probe_untrusted_token_usage(usage: TokenUsage, local_cache_covered_est: i
                 local_cache_covered_est,
                 "上游未回报缓存分项，但本地 CacheMeter 已算出缓存覆盖；\
                  上游零值优先级更高，本地模拟值将被丢弃。详见 ANALYSIS.md §3.2"
+            );
+        }
+        return;
+    }
+    // 第三种情形：input 归零但缓存有值。`input_tokens` 直接取 uncachedInputTokens，
+    // 因此这条会让整个输入侧账目变成 0 —— 但它有两种相反的成因，光看解析后的值分不出：
+    //   缺失键 → 残缺 payload（真 bug）；显式 0 → 整个 prompt 全部命中缓存（合法）。
+    // `#[serde(default)]` 把两者抹成同一个值，所以这里只能先把现场打全，由人判读。
+    // 彻底分辨需要在反序列化时记录键是否出现，见 ANALYSIS.md §3.2 末尾。
+    if usage.uncached_input_tokens == 0 && usage.cache_read_input_tokens > 0 {
+        let hits = INPUT_ZEROED_HITS.fetch_add(1, Ordering::Relaxed) + 1;
+        if hits == 1 || hits % 100 == 0 {
+            tracing::warn!(
+                occurrences = hits,
+                uncached_input_tokens = usage.uncached_input_tokens,
+                output_tokens = usage.output_tokens,
+                cache_read_input_tokens = usage.cache_read_input_tokens,
+                cache_write_input_tokens = usage.cache_write_input_tokens,
+                local_cache_covered_est,
+                "上游 tokenUsage 的 uncachedInputTokens 为 0 而缓存读取有值，\
+                 本次 input_tokens 将上报为 0；无法区分「残缺 payload」与「全命中缓存」。\
+                 详见 ANALYSIS.md §3.2"
             );
         }
     }
