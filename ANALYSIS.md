@@ -142,7 +142,16 @@ config.json + credentials.json → `MultiTokenManager`（凭据池）→ `KiroPr
 
 **探针现状**（`probe_untrusted_token_usage`，`metadata.rs`）：三个判据 —— ①四字段全零 ②cache 为零但本地有覆盖 ③`uncachedInputTokens=0` 而 `cacheRead>0`。第三条是 `0581637` 补的，此前是盲点。
 
-**探针的根本限制**：`#[serde(default)]` 把「键缺失」与「键存在且为 0」抹成同一个值，所以第三条判据打出的现场**无法自行区分**「残缺 payload（真 bug）」与「整个 prompt 全命中缓存（合法）」。要彻底分辨，需在反序列化时记录键是否出现（例如让 `MetadataEvent` 额外保留一份原始 `tokenUsage` JSON 对象，在探针处检查键存在性）。**在此之前不许给这条 P0 下"是 bug"的定性。**
+**~~探针的根本限制~~ → 已解除**（`e309b94`）：`#[serde(default)]` 曾把「键缺失」与「键存在且为 0」抹成同一个值，第三条判据因此只能描述症状、无法定性。现在 `TokenUsage` 带一个 `present` 位掩码（手写 `Deserialize`，四个字段先读成 `Option`），两种情形可分：
+
+| 情形 | `present` | 判定 |
+|---|---|---|
+| 缺 `uncachedInputTokens` 键 | 该位为 0 | **残缺 payload，真 bug** → 探针 `warn` |
+| 上游明确报 `uncachedInputTokens: 0` | 该位为 1 | **整个 prompt 全命中缓存，合法** → 探针降 `debug` |
+
+四个数值字段名字与语义未变、缺失键仍填 0，**不改变任何上报数值**；`present` 纯诊断。两条传播规则：`sanitized()` 原样带过位掩码（钳负不改变"上游给过哪些键"这个事实）；`saturating_add` 取**交集**（多跳合并时，一份完整 payload 不该掩盖另一份的残缺）。
+
+**所以现在可以定性了** —— 但仍需生产样本：新版本上线后才有 `tokenUsage` 解析，样本量够了看 `warn` 有没有出现即可结论。零 `warn` + 有 `debug` = 上游行为正常，这条 P0 只是理论脆弱性；出现 `warn` = 残缺 payload 坐实，该加守卫。
 
 ### 3.3 反推 input_tokens 依赖硬编码窗口表
 
@@ -268,7 +277,7 @@ max_retries = (该分组凭据数 × MAX_RETRIES_PER_CREDENTIAL(3)).min(MAX_TOTA
 
 1. **部分 `tokenUsage` payload 静默清零 + 丢弃模拟值**（§3.2）。`metadata.rs` / `stream.rs:1569` / `handlers.rs:1219` / `handlers.rs:410-418`。修法：赋值处或 `resolve_*` 处加守卫——`tokenUsage` 全零时视作未下发；cache 字段为零但本地 `cache_covered_est > 0` 时至少打 warn。
 
-   **当前状态：INCONCLUSIVE，不许动手。** 该路径 2026-08-24 13:16 才首次上生产（§3.2.1），生产样本还不够；且探针受 `#[serde(default)]` 限制，分不出「残缺 payload」与「全命中缓存」。先做 §3.2.1 末尾说的键存在性记录，拿到能定性的证据再谈修。
+   **当前状态：仍 INCONCLUSIVE，但已可定性 —— 缺的只是样本。** 该路径 2026-08-24 13:16 才首次上生产（§3.2.1）。探针原先分不出「残缺 payload」与「全命中缓存」，`e309b94` 补上 `present` 位掩码后这条限制已解除。**判据**：跑够样本后看日志 —— 出现 `warn`（缺键）= 残缺 payload 坐实、该加守卫；只有 `debug`（显式 0）= 上游行为正常、这条只是理论脆弱性。**在拿到样本前仍不许动计量代码。**
 2. ~~**纯 websearch 不写 traces.db**（§4.1）~~ → **已修并在真实环境验证**：`sink` 透传 + 两入口各自建 tracer 并 finalize，4 条单测覆盖（含红绿反向验证）。
 
    **端到端证据**（2026-08-24，`kiro-rs:518dfbd` 镜像，隔离数据目录、80446 行真实 trace 快照）：发一条纯 websearch 请求（`tools` 仅一个 `web_search`），因该环境无可用凭据返回 502，但 **traces 行数 80446 → 80447**，落库那行 `final_status=error` / `error_type=unknown` / `input_tokens=14`。修复前这条请求在 traces.db 里完全不存在。
@@ -323,7 +332,7 @@ max_retries = (该分组凭据数 × MAX_RETRIES_PER_CREDENTIAL(3)).min(MAX_TOTA
 
 ## 8. 必须运行时验证的事项（当前不可下结论）
 
-1. **`tokenUsage` 缺失 / 部分下发的真实频率** ← 决定 P0-1 和 §3.1 的实际权重。**注意：0.7.4 完全不解析 tokenUsage（§3.2.1 已坐实），所以历史数据回答不了这个问题**，只能从 2026-08-24 13:16 之后的样本统计。探针已就位（三判据），但要分辨"残缺 payload vs 全命中缓存"还需补键存在性记录。
+1. **`tokenUsage` 缺失 / 部分下发的真实频率** ← 决定 P0-1 和 §3.1 的实际权重。**注意：0.7.4 完全不解析 tokenUsage（§3.2.1 已坐实），所以历史数据回答不了这个问题**，只能从 2026-08-24 13:16 之后的样本统计。探针已完备：三判据 + `present` 位掩码（`e309b94`），能自行区分残缺 payload 与全命中缓存。**采集方式**：`docker logs kiro-rs | grep "缺失.*uncachedInputTokens"` 数 `warn` 条数即可。
 2. **上游重试放大的实际倍数** ← 决定入口 RPM 与上游 RPM 的差距。
 3. **生产 QPS 量级** ← 决定 P2-7 的全量写盘是否已是现实瓶颈。
 4. **traces.db 实际行数与分钟聚合耗时** ← 决定 RPM/TPM 能否退而用 SQL 实现。
