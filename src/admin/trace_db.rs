@@ -689,6 +689,14 @@ CREATE TABLE IF NOT EXISTS traces (
 CREATE INDEX IF NOT EXISTS idx_traces_ts ON traces(ts_epoch DESC);
 CREATE INDEX IF NOT EXISTS idx_traces_status ON traces(final_status);
 CREATE INDEX IF NOT EXISTS idx_traces_cred ON traces(final_credential_id);
+-- key_id / model 两列参与 build_where 但原先无索引，请求日志按 Key 或模型筛时
+-- COUNT(*) 走全表扫（实测 200 万行 ≈ 88ms，且与分页查询同握一把 conn 锁，期间阻塞 trace 写入）。
+-- 必须是复合索引且第二列带 ts_epoch DESC：查询恒为「筛某列 + ORDER BY ts_epoch DESC + LIMIT」，
+-- 只建单列索引会让 planner 放弃 idx_traces_ts 的天然有序性、改成捞全部匹配行再排序，
+-- 实测在低基数列上反而慢上千倍。带上 ts_epoch 后过滤与排序由同一索引服务，
+-- COUNT 还能走覆盖索引（实测 88ms→0.75ms，深分页 72ms→0.27ms）。
+CREATE INDEX IF NOT EXISTS idx_traces_key_ts ON traces(key_id, ts_epoch DESC);
+CREATE INDEX IF NOT EXISTS idx_traces_model_ts ON traces(model, ts_epoch DESC);
 
 CREATE TABLE IF NOT EXISTS trace_attempts (
     trace_id      TEXT NOT NULL,
@@ -982,5 +990,101 @@ mod tests {
         let out = truncate_snippet(&long).unwrap();
         assert!(out.ends_with("…(truncated)"));
         assert!(out.len() <= ERROR_SNIPPET_MAX + 20);
+    }
+
+    /// 取一条 SQL 的完整查询计划文本。
+    fn query_plan(conn: &Connection, sql: &str) -> String {
+        let mut stmt = conn
+            .prepare(&format!("EXPLAIN QUERY PLAN {}", sql))
+            .unwrap();
+        let rows = stmt
+            .query_map([], |r| r.get::<_, String>(3))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        rows.join(" | ")
+    }
+
+    /// 守的是 planner 的**选择**，不只是索引存在：请求日志的查询恒为
+    /// 「筛某列 + ORDER BY ts_epoch DESC + LIMIT」，必须由带 ts_epoch 的复合索引服务。
+    /// 若日后有人补了单列 `traces(key_id)`，planner 可能改走它、退化成捞全部匹配行再排序
+    /// （实测低基数列上慢上千倍），这条测试会红。
+    #[test]
+    fn key_and_model_filters_use_composite_indexes() {
+        let store = mem_store();
+        let conn = store.conn.lock();
+
+        let key_page = "SELECT trace_id FROM traces WHERE key_id = 3 \
+                        ORDER BY ts_epoch DESC LIMIT 200";
+        let plan = query_plan(&conn, key_page);
+        assert!(
+            plan.contains("idx_traces_key_ts"),
+            "按 Key 筛必须走 (key_id, ts_epoch DESC) 复合索引，实际计划: {plan}"
+        );
+
+        let model_page = "SELECT trace_id FROM traces WHERE model = 'claude-opus-5' \
+                          ORDER BY ts_epoch DESC LIMIT 200";
+        let plan = query_plan(&conn, model_page);
+        assert!(
+            plan.contains("idx_traces_model_ts"),
+            "按模型筛必须走 (model, ts_epoch DESC) 复合索引，实际计划: {plan}"
+        );
+
+        // 分页的 COUNT(*) 没有 LIMIT，原先是全表扫；复合索引让它走覆盖索引。
+        let count_sql = "SELECT COUNT(*) FROM traces WHERE key_id = 3";
+        let plan = query_plan(&conn, count_sql);
+        assert!(
+            plan.contains("idx_traces_key_ts"),
+            "分页 COUNT 必须走索引而非全表扫，实际计划: {plan}"
+        );
+        assert!(
+            !plan.contains("SCAN traces"),
+            "分页 COUNT 不应再出现全表扫，实际计划: {plan}"
+        );
+    }
+
+    /// 老库升级路径：SCHEMA 每次 open 都执行，`CREATE INDEX IF NOT EXISTS` 幂等，
+    /// 因此已存在的 traces.db 会在启动时补齐这两个索引（无需单独迁移）。
+    #[test]
+    fn composite_indexes_are_added_idempotently_to_existing_db() {
+        let conn = Connection::open_in_memory().unwrap();
+        // 模拟老库：建表但只有原来的三个索引
+        conn.execute_batch(
+            "CREATE TABLE traces (
+                trace_id TEXT PRIMARY KEY, ts TEXT NOT NULL, ts_epoch INTEGER NOT NULL,
+                key_id INTEGER NOT NULL, key_source TEXT NOT NULL, model TEXT NOT NULL,
+                is_stream INTEGER NOT NULL, final_status TEXT NOT NULL,
+                final_credential_id INTEGER NOT NULL, error_type TEXT, error_message TEXT,
+                total_attempts INTEGER NOT NULL, duration_ms INTEGER NOT NULL,
+                interrupted_after_bytes INTEGER);
+             CREATE INDEX idx_traces_ts ON traces(ts_epoch DESC);",
+        )
+        .unwrap();
+
+        let index_names = |c: &Connection| -> Vec<String> {
+            let mut stmt = c
+                .prepare(
+                    "SELECT name FROM sqlite_master WHERE type='index' AND tbl_name='traces' \
+                          AND name LIKE 'idx_%' ORDER BY name",
+                )
+                .unwrap();
+            stmt.query_map([], |r| r.get::<_, String>(0))
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap()
+        };
+        assert!(!index_names(&conn).contains(&"idx_traces_key_ts".to_string()));
+
+        // 首次带新 SCHEMA 启动
+        conn.execute_batch(SCHEMA).unwrap();
+        TraceStore::migrate(&conn).unwrap();
+        let after_first = index_names(&conn);
+        assert!(after_first.contains(&"idx_traces_key_ts".to_string()));
+        assert!(after_first.contains(&"idx_traces_model_ts".to_string()));
+
+        // 再启动一次不应报错、也不应重复建
+        conn.execute_batch(SCHEMA).unwrap();
+        TraceStore::migrate(&conn).unwrap();
+        assert_eq!(after_first, index_names(&conn));
     }
 }
