@@ -592,3 +592,50 @@ export interface UpdateGroupRequest {
   /** 新备注；空字符串清除；undefined 保留原值 */
   description?: string
 }
+
+/** 速率环里的一个分钟桶。字段与后端 `MinuteSample` 一一对应。 */
+export interface MinuteSample {
+  /** Unix 分钟数（epoch 秒 / 60）。画图要 ×60000 换成毫秒。 */
+  minute: number
+  /** 入口请求数：外部请求，一次算一次。 */
+  ingressCalls: number
+  ingressErrors: number
+  inputTokens: number
+  outputTokens: number
+  cacheWriteTokens: number
+  cacheReadTokens: number
+  /** 上游跳数：含重试与故障转移，一次外部请求可能有多跳。 */
+  upstreamAttempts: number
+  upstreamFailures: number
+}
+
+/**
+ * GET /api/admin/stats/rate 的响应。
+ *
+ * 两组数字都是成对的，不要单看其中一个：入口与上游相差的倍数就是重试放大，
+ * 全口径与计费口径 TPM 的差值就是缓存读取的量。
+ */
+export interface RateSnapshot {
+  /** 这些速率对应的 Unix 分钟（上一个完整分钟，不是当前正在累加的那个）。 */
+  minute: number
+  /** 入口 RPM：真实外部流量。 */
+  ingressRpm: number
+  ingressErrors: number
+  /** 上游 RPM：provider 跳数，看上游压力。 */
+  upstreamRpm: number
+  upstreamFailures: number
+  /** TPM 全口径，含缓存读取。 */
+  tpmTotal: number
+  /** TPM 计费口径，不含缓存读取。 */
+  tpmBillable: number
+  peakIngressRpm: number
+  peakUpstreamRpm: number
+  peakTpmTotal: number
+  peakTpmBillable: number
+  /** 上游跳数 / 入口请求数。1.0 = 零重试。 */
+  retryAmplification: number
+  /** 环覆盖的分钟数（后端固定 120）。 */
+  windowMinutes: number
+  /** 逐分钟序列，时间升序、缺口补零。 */
+  series: MinuteSample[]
+}

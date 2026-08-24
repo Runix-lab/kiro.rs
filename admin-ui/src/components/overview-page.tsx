@@ -17,6 +17,7 @@ import type {
   TimeSeriesPoint,
 } from '@/types/api'
 import { TimeSeriesChart } from '@/components/charts/time-series-chart'
+import { RatePanel } from '@/components/rate-panel'
 import { ModelPieChart } from '@/components/charts/model-pie-chart'
 import { CredentialBarChart } from '@/components/charts/credential-bar-chart'
 import { cn, formatCredits, formatNumber } from '@/lib/utils'
@@ -122,6 +123,7 @@ export function OverviewPage() {
         onGranularityChange={filters.setDraftGranularity}
         onPresetRangeChange={filters.selectPresetRange}
       />
+      <RatePanel />
       <DistributionPanels
         byCred={credData}
         byModel={modelData}
