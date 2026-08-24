@@ -150,6 +150,8 @@ config.json + credentials.json → `MultiTokenManager`（凭据池）→ `KiroPr
 
 **修法**（本次）：`handle_websearch_request` 增 `sink` 参数透传给 `call_mcp_api`；`/v1` 与 `/cc/v1` **两个入口各自**自建 tracer 并在早退前 `finalize_websearch_trace`。附带收益：`call_mcp_with_trace` 会记下带真实 credential_id 的 attempt，trace 里的凭据归属不再恒为 0。
 
+**验证状态**：单测 4 条（含红绿反向验证）+ 真实镜像端到端实测，见 §7 P0-2。
+
 **刻意未动**：同处 `hook.record(0, ...)` 一个字没改。聚合器侧 `credential_id==0` 的记录不进凭据分布（§4.2），改它会连带变更聚合口径，属另一件事。因此 trace 有真实凭据、聚合器仍记 0，这是有意的边界。
 
 用量口径也刻意与 `hook.record` 对齐（只记 input，output/cache/credits 记 0）：该路径打 MCP 端点、不产生上游 token 用量，响应里的 output_tokens 是本地摘要的字符估算值。两个 sink 记同一份数，避免再造一处矛盾。
@@ -230,7 +232,11 @@ max_retries = (该分组凭据数 × MAX_RETRIES_PER_CREDENTIAL(3)).min(MAX_TOTA
 **P0 — 数据正确性，会让你看错数**
 
 1. **部分 `tokenUsage` payload 静默清零 + 丢弃模拟值**（§3.2）。`metadata.rs:14-29` / `stream.rs:1569` / `handlers.rs:1219` / `handlers.rs:410-418`。修法：赋值处或 `resolve_*` 处加守卫——`tokenUsage` 全零时视作未下发；cache 字段为零但本地 `cache_covered_est > 0` 时至少打 warn。**动手前先按 §3.2 末尾的方法确认上游真会触发。**
-2. ~~**纯 websearch 不写 traces.db**（§4.1）~~ → **已修**：`sink` 透传 + 两入口各自建 tracer 并 finalize，4 条单测覆盖（含红绿反向验证）。**注意**：单测只覆盖 finalize 行为，"sink 真的透传到 MCP 调用"这层因仓内无 mock server 依赖未做自动化覆盖，靠类型系统（调用方必须显式传参）与 diff 可读性保证。
+2. ~~**纯 websearch 不写 traces.db**（§4.1）~~ → **已修并在真实环境验证**：`sink` 透传 + 两入口各自建 tracer 并 finalize，4 条单测覆盖（含红绿反向验证）。
+
+   **端到端证据**（2026-08-24，`kiro-rs:518dfbd` 镜像，隔离数据目录、80446 行真实 trace 快照）：发一条纯 websearch 请求（`tools` 仅一个 `web_search`），因该环境无可用凭据返回 502，但 **traces 行数 80446 → 80447**，落库那行 `final_status=error` / `error_type=unknown` / `input_tokens=14`。修复前这条请求在 traces.db 里完全不存在。
+
+   其中 **`total_attempts=3`** 证明 sink 确实透传进了 MCP 调用链（`call_mcp_with_trace` 记下 3 次凭据重试）。此前本文与 commit message 都写"这层无自动化覆盖、靠类型系统保证"，该说法已被这次验证推翻。
 3. **cache 两套口径不可区分**（§3.1）。修法：响应/trace 里加来源标记（upstream / simulated），前端据此区别展示；根治要比"继续把两种精度塞一个字段"更彻底。
 
 **P1 — 可观测性缺口**
