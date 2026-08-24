@@ -52,6 +52,8 @@ pub(crate) struct UsageRecordHook {
     pub recorder: Option<SharedRecorder>,
     pub aggregator: Option<SharedAggregator>,
     pub client_keys: Option<SharedClientKeyManager>,
+    /// 分钟级速率环（入口口径 RPM/TPM）。与 trace 开关无关。
+    pub rate_ring: Option<crate::anthropic::rate_ring::SharedRateRing>,
     pub key_id: u64,
     pub model: String,
     pub started_at: Instant,
@@ -63,6 +65,7 @@ impl UsageRecordHook {
             recorder: state.usage_recorder.clone(),
             aggregator: state.usage_aggregator.clone(),
             client_keys: state.client_keys.clone(),
+            rate_ring: state.rate_ring.clone(),
             key_id,
             model,
             started_at: Instant::now(),
@@ -101,6 +104,16 @@ impl UsageRecordHook {
         }
         if let Some(a) = &self.aggregator {
             a.ingest(&rec);
+        }
+        // 入口口径：一次外部请求记一次，与重试跳数无关。
+        if let Some(ring) = &self.rate_ring {
+            ring.record_ingress(
+                rec.input_tokens,
+                rec.output_tokens,
+                rec.cache_creation_tokens,
+                rec.cache_read_tokens,
+                status != "success",
+            );
         }
         if status == "success" && self.key_id != 0 {
             if let Some(m) = &self.client_keys {

@@ -17,6 +17,7 @@ use crate::common::auth;
 use crate::kiro::provider::KiroProvider;
 
 use super::cache_metering::SharedCacheMeter;
+use super::rate_ring::SharedRateRing;
 use super::types::ErrorResponse;
 
 /// 命中的鉴权上下文（注入到请求扩展，供 handler 记录用量）
@@ -50,6 +51,11 @@ pub struct AppState {
     pub cache_meter: Option<SharedCacheMeter>,
     /// 请求链路追踪存储（SQLite，可选）
     pub trace_store: Option<SharedTraceStore>,
+    /// 分钟级速率环（RPM / TPM 采集层）
+    ///
+    /// 刻意不挂在 `trace_store` 之下：traces.db 可被用户从面板关掉，而 RPM/TPM 是
+    /// 核心运维指标，不能随可选功能一起消失。
+    pub rate_ring: Option<SharedRateRing>,
 }
 
 impl AppState {
@@ -68,6 +74,7 @@ impl AppState {
             usage_aggregator: None,
             cache_meter: None,
             trace_store: None,
+            rate_ring: None,
         }
     }
 
@@ -99,6 +106,12 @@ impl AppState {
     /// 注入链路追踪存储
     pub fn with_trace_store(mut self, store: Option<SharedTraceStore>) -> Self {
         self.trace_store = store;
+        self
+    }
+
+    /// 注入分钟级速率环
+    pub fn with_rate_ring(mut self, ring: Option<SharedRateRing>) -> Self {
+        self.rate_ring = ring;
         self
     }
 }

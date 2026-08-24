@@ -1220,6 +1220,33 @@ pub async fn stats_overview(State(state): State<AdminState>) -> impl IntoRespons
     Json(response)
 }
 
+/// GET /api/admin/stats/rate
+///
+/// 分钟级 RPM / TPM。数据来自内存速率环，**与 trace 开关无关**（关掉 traces.db
+/// 不影响这里）。速率取上一个完整分钟，当前分钟仍在累加、读出来会偏低。
+///
+/// 两个口径都返回，不要混用：
+/// - `ingressRpm` 是外部请求数，看真实流量
+/// - `upstreamRpm` 是 provider 跳数（含重试与故障转移），看上游压力
+/// - 两者比值 `retryAmplification` 就是重试放大倍数
+///
+/// TPM 同样两个口径：`tpmTotal` 含缓存读取，`tpmBillable` 不含。生产实测这两个数能
+/// 差几十倍，所以不能只暴露一个。
+pub async fn stats_rate(State(state): State<AdminState>) -> axum::response::Response {
+    let Some(ring) = state.rate_ring.as_ref() else {
+        // 未注入速率环的装配（嵌入式/测试）。明确回 503 而不是回一堆 0，
+        // 否则前端无法区分"没装采集层"与"真的没流量"。
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(super::types::AdminErrorResponse::invalid_request(
+                "速率采集层未启用",
+            )),
+        )
+            .into_response();
+    };
+    Json(ring.snapshot()).into_response()
+}
+
 /// GET /api/admin/stats/timeseries?range=24h|7d|30d&granularity=hour|day&group=...
 pub async fn stats_timeseries(
     State(state): State<AdminState>,

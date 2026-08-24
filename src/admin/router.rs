@@ -27,9 +27,9 @@ use super::{
         set_credential_priority, set_global_proxy, set_load_balancing_mode,
         set_log_governance_config, set_proxy_enabled, set_self_heal_config, set_update_config,
         start_idc_login, start_idc_relogin, start_social_login, start_social_relogin,
-        stats_by_credential, stats_by_model, stats_overview, stats_timeseries, test_model,
-        trace_failure_stats, update_admin_key, update_client_key, update_credential, update_group,
-        update_refresh_token,
+        stats_by_credential, stats_by_model, stats_overview, stats_rate, stats_timeseries,
+        test_model, trace_failure_stats, update_admin_key, update_client_key, update_credential,
+        update_group, update_refresh_token,
     },
     middleware::{AdminState, admin_auth_middleware},
 };
@@ -181,6 +181,7 @@ pub fn create_admin_router(state: AdminState) -> Router {
         .route("/groups", get(list_groups).post(create_group))
         .route("/groups/{name}", delete(delete_group).patch(update_group))
         .route("/stats/overview", get(stats_overview))
+        .route("/stats/rate", get(stats_rate))
         .route("/stats/timeseries", get(stats_timeseries))
         .route("/stats/by-model", get(stats_by_model))
         .route("/stats/by-credential", get(stats_by_credential))

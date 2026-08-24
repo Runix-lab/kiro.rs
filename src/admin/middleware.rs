@@ -35,6 +35,10 @@ pub struct AdminState {
     pub trace_store: SharedTraceStore,
     /// 账号分组注册表（持久化到 groups.json）
     pub groups: SharedGroupManager,
+    /// 分钟级速率环（与 anthropic 路由共享），RPM/TPM 的唯一数据源。
+    ///
+    /// `Option` 是为了兼容不注入它的嵌入式/测试装配；生产路径恒为 `Some`。
+    pub rate_ring: Option<crate::anthropic::rate_ring::SharedRateRing>,
 }
 
 impl AdminState {
@@ -53,7 +57,17 @@ impl AdminState {
             usage_aggregator,
             trace_store,
             groups,
+            rate_ring: None,
         }
+    }
+
+    /// 注入分钟级速率环（RPM/TPM 数据源）。
+    pub fn with_rate_ring(
+        mut self,
+        ring: Option<crate::anthropic::rate_ring::SharedRateRing>,
+    ) -> Self {
+        self.rate_ring = ring;
+        self
     }
 }
 

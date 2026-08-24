@@ -123,12 +123,37 @@ pub struct KiroProvider {
     /// `ListAvailableProfiles`。命中真实 ARN 的账号会把 ARN 持久化进凭据，之后
     /// 通过 `streaming_profile_arn()` 直接命中，不再进入解析路径。
     profile_resolution_attempted: Mutex<HashSet<u64>>,
+    /// 分钟级速率环（上游口径：每跳 +1）。
+    ///
+    /// 刻意**不**走 `TraceSink`：`emit_attempt` 在 sink 为 None 时直接返回，那样上游 RPM
+    /// 就会跟着 trace 开关一起消失。上游压力是核心运维指标，必须独立于可选功能。
+    rate_ring: Mutex<Option<crate::anthropic::rate_ring::SharedRateRing>>,
 }
 
 impl KiroProvider {
     /// 返回共享凭据管理器，供模型发现等只读控制面逻辑复用。
     pub fn token_manager(&self) -> &Arc<MultiTokenManager> {
         &self.token_manager
+    }
+
+    /// 注入速率环。装配期调用一次；未注入时上游计数为无操作。
+    pub fn set_rate_ring(&self, ring: crate::anthropic::rate_ring::SharedRateRing) {
+        *self.rate_ring.lock() = Some(ring);
+    }
+
+    /// 取回速率环，供 Admin 读取同一份数据。
+    ///
+    /// 环由 anthropic 路由装配时建立并塞进 provider，主程序据此拿到同一个实例，
+    /// 避免 Admin 与 API 侧各建一个环、各数一半流量。
+    pub fn rate_ring(&self) -> Option<crate::anthropic::rate_ring::SharedRateRing> {
+        self.rate_ring.lock().clone()
+    }
+
+    /// 记一跳上游调用。无论 trace 是否启用都会计数。
+    fn count_upstream_attempt(&self, outcome: &str) {
+        if let Some(ring) = self.rate_ring.lock().as_ref() {
+            ring.record_upstream_attempt(outcome == outcome::SUCCESS);
+        }
     }
 
     /// 创建带代理配置和端点注册表的 KiroProvider 实例
@@ -163,6 +188,7 @@ impl KiroProvider {
             endpoints,
             default_endpoint,
             profile_resolution_attempted: Mutex::new(HashSet::new()),
+            rate_ring: Mutex::new(None),
         }
     }
 
@@ -300,7 +326,7 @@ impl KiroProvider {
         let body = match result.response.text().await {
             Ok(body) => body,
             Err(e) => {
-                Self::emit_attempt(
+                self.emit_attempt(
                     Some(sink),
                     result.attempt,
                     result.credential_id,
@@ -321,7 +347,7 @@ impl KiroProvider {
             .err()
             .filter(|_| validation_outcome != outcome::SUCCESS)
             .map(|e| format!("{}: {}", e, body));
-        Self::emit_attempt(
+        self.emit_attempt(
             Some(sink),
             result.attempt,
             result.credential_id,
@@ -368,7 +394,7 @@ impl KiroProvider {
                 Ok(c) => c,
                 Err(e) => {
                     if is_rate_limit_error(&e) {
-                        Self::emit_attempt(
+                        self.emit_attempt(
                             sink,
                             attempt,
                             0,
@@ -385,7 +411,7 @@ impl KiroProvider {
                     if let Some(rate_limit) = take_rate_limit_error(&mut last_error) {
                         return Err(rate_limit);
                     }
-                    Self::emit_attempt(
+                    self.emit_attempt(
                         sink,
                         attempt,
                         0,
@@ -403,7 +429,7 @@ impl KiroProvider {
             // Pure MCP routes (including Web Search) require the same Enterprise / IdC
             // profileArn resolution as regular model calls.
             if let Err(e) = self.ensure_profile_arn(&mut ctx).await {
-                Self::emit_attempt(
+                self.emit_attempt(
                     sink,
                     attempt,
                     ctx.id,
@@ -422,7 +448,7 @@ impl KiroProvider {
             let endpoint = match self.endpoint_for(&ctx.credentials) {
                 Ok(e) => e,
                 Err(e) => {
-                    Self::emit_attempt(
+                    self.emit_attempt(
                         sink,
                         attempt,
                         ctx.id,
@@ -454,7 +480,7 @@ impl KiroProvider {
             let client = match self.client_for(&ctx.credentials) {
                 Ok(client) => client,
                 Err(e) => {
-                    Self::emit_attempt(
+                    self.emit_attempt(
                         sink,
                         attempt,
                         ctx.id,
@@ -483,7 +509,7 @@ impl KiroProvider {
                         max_retries,
                         e
                     );
-                    Self::emit_attempt(
+                    self.emit_attempt(
                         sink,
                         attempt,
                         ctx.id,
@@ -521,7 +547,7 @@ impl KiroProvider {
 
             // 402 额度用尽
             if status.as_u16() == 402 && endpoint.is_monthly_request_limit(&body) {
-                Self::emit_attempt(
+                self.emit_attempt(
                     sink,
                     attempt,
                     ctx.id,
@@ -543,7 +569,7 @@ impl KiroProvider {
 
             // 400 Bad Request
             if status.as_u16() == 400 {
-                Self::emit_attempt(
+                self.emit_attempt(
                     sink,
                     attempt,
                     ctx.id,
@@ -563,7 +589,7 @@ impl KiroProvider {
                     && self.token_manager.get_suspended_detection_enabled()
                     && endpoint.is_account_suspended(&body)
                 {
-                    Self::emit_attempt(
+                    self.emit_attempt(
                         sink,
                         attempt,
                         ctx.id,
@@ -583,7 +609,7 @@ impl KiroProvider {
                     continue;
                 }
 
-                Self::emit_attempt(
+                self.emit_attempt(
                     sink,
                     attempt,
                     ctx.id,
@@ -626,7 +652,7 @@ impl KiroProvider {
                     status,
                     body
                 );
-                Self::emit_attempt(
+                self.emit_attempt(
                     sink,
                     attempt,
                     ctx.id,
@@ -658,7 +684,7 @@ impl KiroProvider {
 
             // 其他 4xx
             if status.is_client_error() {
-                Self::emit_attempt(
+                self.emit_attempt(
                     sink,
                     attempt,
                     ctx.id,
@@ -672,7 +698,7 @@ impl KiroProvider {
             }
 
             // 兜底
-            Self::emit_attempt(
+            self.emit_attempt(
                 sink,
                 attempt,
                 ctx.id,
@@ -723,7 +749,7 @@ impl KiroProvider {
                 Ok(c) => c,
                 Err(e) => {
                     if is_rate_limit_error(&e) {
-                        Self::emit_attempt(
+                        self.emit_attempt(
                             sink, attempt, 0, "", None, outcome::TRANSIENT,
                             Some(&e.to_string()), attempt_start,
                         );
@@ -732,7 +758,7 @@ impl KiroProvider {
                     if let Some(rate_limit) = take_rate_limit_error(&mut last_error) {
                         return Err(rate_limit);
                     }
-                    Self::emit_attempt(
+                    self.emit_attempt(
                         sink, attempt, 0, "", None, outcome::UNKNOWN,
                         Some(&e.to_string()), attempt_start,
                     );
@@ -743,7 +769,7 @@ impl KiroProvider {
 
             // 确保 Enterprise / IdC 账号的真实 profileArn 已解析（流式端点强制要求）
             if let Err(e) = self.ensure_profile_arn(&mut ctx).await {
-                Self::emit_attempt(
+                self.emit_attempt(
                     sink,
                     attempt,
                     ctx.id,
@@ -762,7 +788,7 @@ impl KiroProvider {
             let endpoint = match self.endpoint_for(&ctx.credentials) {
                 Ok(e) => e,
                 Err(e) => {
-                    Self::emit_attempt(
+                    self.emit_attempt(
                         sink, attempt, ctx.id, "", None, outcome::UNKNOWN,
                         Some(&e.to_string()), attempt_start,
                     );
@@ -811,7 +837,7 @@ impl KiroProvider {
                         max_retries,
                         e
                     );
-                    Self::emit_attempt(
+                    self.emit_attempt(
                         sink, attempt, ctx.id, endpoint_name, None,
                         outcome::NETWORK_ERROR, Some(&e.to_string()), attempt_start,
                     );
@@ -831,7 +857,7 @@ impl KiroProvider {
 
             // 成功响应
             if status.is_success() {
-                Self::emit_attempt(
+                self.emit_attempt(
                     sink, attempt, ctx.id, endpoint_name, Some(status.as_u16()),
                     outcome::SUCCESS, None, attempt_start,
                 );
@@ -855,7 +881,7 @@ impl KiroProvider {
                     status,
                     body
                 );
-                Self::emit_attempt(
+                self.emit_attempt(
                     sink, attempt, ctx.id, endpoint_name, Some(status.as_u16()),
                     outcome::QUOTA_EXHAUSTED, Some(&body), attempt_start,
                 );
@@ -885,7 +911,7 @@ impl KiroProvider {
 
             // 400 Bad Request - 请求问题，重试/切换凭据无意义
             if status.as_u16() == 400 {
-                Self::emit_attempt(
+                self.emit_attempt(
                     sink, attempt, ctx.id, endpoint_name, Some(400),
                     outcome::BAD_REQUEST, Some(&body), attempt_start,
                 );
@@ -907,7 +933,7 @@ impl KiroProvider {
                         status,
                         body
                     );
-                    Self::emit_attempt(
+                    self.emit_attempt(
                         sink, attempt, ctx.id, endpoint_name, Some(403),
                         outcome::ACCOUNT_SUSPENDED, Some(&body), attempt_start,
                     );
@@ -941,7 +967,7 @@ impl KiroProvider {
                     status,
                     body
                 );
-                Self::emit_attempt(
+                self.emit_attempt(
                     sink, attempt, ctx.id, endpoint_name, Some(status.as_u16()),
                     outcome::AUTH_FAILED, Some(&body), attempt_start,
                 );
@@ -1008,7 +1034,7 @@ impl KiroProvider {
                         model.as_deref(),
                         group,
                     );
-                Self::emit_attempt(
+                self.emit_attempt(
                     sink, attempt, ctx.id, endpoint_name, Some(429),
                     outcome::ACCOUNT_THROTTLED, Some(&body), attempt_start,
                 );
@@ -1040,7 +1066,7 @@ impl KiroProvider {
                     status,
                     body
                 );
-                Self::emit_attempt(
+                self.emit_attempt(
                     sink, attempt, ctx.id, endpoint_name, Some(status.as_u16()),
                     outcome::BAD_REQUEST, Some(&body), attempt_start,
                 );
@@ -1056,7 +1082,7 @@ impl KiroProvider {
                     status,
                     body
                 );
-                Self::emit_attempt(
+                self.emit_attempt(
                     sink,
                     attempt,
                     ctx.id,
@@ -1079,7 +1105,7 @@ impl KiroProvider {
                     status,
                     body
                 );
-                Self::emit_attempt(
+                self.emit_attempt(
                     sink, attempt, ctx.id, endpoint_name, Some(status.as_u16()),
                     outcome::TRANSIENT, Some(&body), attempt_start,
                 );
@@ -1110,7 +1136,7 @@ impl KiroProvider {
 
             // 其他 4xx - 通常为请求/配置问题：直接返回，不计入凭据失败
             if status.is_client_error() {
-                Self::emit_attempt(
+                self.emit_attempt(
                     sink, attempt, ctx.id, endpoint_name, Some(status.as_u16()),
                     outcome::BAD_REQUEST, Some(&body), attempt_start,
                 );
@@ -1125,7 +1151,7 @@ impl KiroProvider {
                 status,
                 body
             );
-            Self::emit_attempt(
+            self.emit_attempt(
                 sink, attempt, ctx.id, endpoint_name, Some(status.as_u16()),
                 outcome::UNKNOWN, Some(&body), attempt_start,
             );
@@ -1150,9 +1176,13 @@ impl KiroProvider {
         }))
     }
 
-    /// 向 trace sink 上报一跳结果（sink 为 None 时无开销）
+    /// 上报一跳结果：先记速率环（上游口径），再给 trace sink。
+    ///
+    /// 顺序是刻意的 —— 速率计数必须发生在 sink 的 `None` 早退之前，否则关掉 trace
+    /// 就会连上游 RPM 一起丢掉。
     #[allow(clippy::too_many_arguments)]
     fn emit_attempt(
+        &self,
         sink: Option<&dyn TraceSink>,
         attempt: usize,
         credential_id: u64,
@@ -1162,6 +1192,7 @@ impl KiroProvider {
         error_body: Option<&str>,
         started: Instant,
     ) {
+        self.count_upstream_attempt(outcome);
         let Some(sink) = sink else { return };
         sink.on_attempt(TraceAttempt {
             attempt: attempt as u32,

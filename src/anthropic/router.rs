@@ -84,12 +84,19 @@ pub fn create_router_with_shared_provider(
     trace_store: Option<SharedTraceStore>,
 ) -> Router {
     let mut state = AppState::new(extract_thinking, tool_compatibility_mode);
+    // RPM/TPM 采集层。无条件建立：既不依赖 Admin，也不依赖 trace 开关 ——
+    // traces.db 可被用户关掉，而速率是核心运维指标，不能跟着一起消失。
+    let rate_ring: super::rate_ring::SharedRateRing =
+        std::sync::Arc::new(super::rate_ring::RateRing::new());
     if let Some(provider) = kiro_provider {
+        // provider 自己持一份，用于上游口径（每跳 +1）；入口口径走 UsageRecordHook。
+        provider.set_rate_ring(rate_ring.clone());
         state = state.with_shared_kiro_provider(provider);
     }
     state = state.with_usage(client_keys, usage_recorder, usage_aggregator);
     state = state.with_cache_meter(cache_meter);
     state = state.with_trace_store(trace_store);
+    state = state.with_rate_ring(Some(rate_ring));
 
     // 需要认证的 /v1 路由
     let v1_routes = Router::new()
