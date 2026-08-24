@@ -11,6 +11,8 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 
 use chrono::Utc;
 use parking_lot::RwLock;
@@ -61,6 +63,19 @@ pub struct ClientKey {
 pub struct ClientKeyManager {
     inner: RwLock<Inner>,
     path: Option<PathBuf>,
+    /// 有未落盘的用量计数变更。
+    ///
+    /// `record_usage` 每请求都会调用，而 `save_locked` 是"全部 Key 序列化成 pretty JSON
+    /// 覆写整个文件"——高 QPS 下这是明确的吞吐天花板，且发生在写锁内。改为置脏标记 +
+    /// 后台周期落盘（范式取自 `CacheMeter::spawn_background`）。
+    ///
+    /// **只有用量计数走延迟落盘**：创建 / 删除 / 改名 / 禁用 / 轮换 / 重置统计这些结构性
+    /// 变更仍然立即写盘——它们频率极低，而丢失的代价远高于一批计数。
+    ///
+    /// 代价：进程崩溃会丢最多一个 flush 周期的**展示用**计数。已确认这些计数器不参与
+    /// 任何额度 / 放行 / 扣费判定（无 quota/limit/remaining 字段，`disabled` 只由管理动作
+    /// 显式设置），所以丢失不影响资金安全，只影响面板数字精度。
+    dirty: AtomicBool,
 }
 
 struct Inner {
@@ -78,6 +93,7 @@ impl ClientKeyManager {
                 next_id: 1,
             }),
             path: None,
+            dirty: AtomicBool::new(false),
         }
     }
 
@@ -111,6 +127,7 @@ impl ClientKeyManager {
                 next_id: max_id + 1,
             }),
             path: Some(path),
+            dirty: AtomicBool::new(false),
         })
     }
 
@@ -473,7 +490,11 @@ impl ClientKeyManager {
             }
             entry.last_used_at = Some(Utc::now().to_rfc3339());
         }
-        self.save_locked(&inner);
+        // 只置脏，由后台周期落盘。这里原先是每请求一次"全部 Key 序列化 + 覆写整个
+        // 文件"，且在写锁内——高 QPS 下的吞吐天花板。其余 9 个 save_locked 调用点都是
+        // 低频结构性变更，仍立即写盘。
+        drop(inner);
+        self.mark_dirty();
     }
 
     /// 获取统计后的 active Key 数（未禁用）
@@ -518,6 +539,45 @@ pub fn mask_client_key(key: &str) -> String {
 
 pub fn default_path_in(dir: &Path) -> PathBuf {
     dir.join("client_api_keys.json")
+}
+
+/// 后台落盘周期。取 30s：丢失窗口足够小（展示用计数），又把每请求一次全量写盘
+/// 压成每 30s 至多一次。
+const FLUSH_INTERVAL_SECS: u64 = 30;
+
+impl ClientKeyManager {
+    /// 标记有未落盘的用量变更。O(1)，不取锁、不碰磁盘。
+    fn mark_dirty(&self) {
+        self.dirty.store(true, Ordering::Relaxed);
+    }
+
+    /// 若有脏数据则落盘一次。无脏数据时零开销（不取锁）。
+    ///
+    /// 先清标记再写盘：写盘期间新到的 `record_usage` 会重新置脏，下个周期继续落。
+    /// 反过来（先写后清）会把这期间的变更连同标记一起清掉，导致丢数据。
+    pub fn flush_if_dirty(&self) {
+        if !self.dirty.swap(false, Ordering::Relaxed) {
+            return;
+        }
+        let inner = self.inner.read();
+        self.save_locked(&inner);
+    }
+
+    /// 启动后台周期落盘任务。装配期调用一次。
+    ///
+    /// 未配置 `path`（内存模式 / 测试）时直接返回，不起任务。
+    pub fn spawn_background(self: Arc<Self>) {
+        if self.path.is_none() {
+            return;
+        }
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(Duration::from_secs(FLUSH_INTERVAL_SECS));
+            loop {
+                ticker.tick().await;
+                self.flush_if_dirty();
+            }
+        });
+    }
 }
 
 pub type SharedClientKeyManager = Arc<ClientKeyManager>;
@@ -647,5 +707,94 @@ mod tests {
         mgr.sync_system_key("默认密钥".into(), None, "custom-api-key".into());
         assert!(!mgr.delete(0), "系统密钥 id=0 不可删除");
         assert!(mgr.is_system(0));
+    }
+
+    /// 建一个挂真实路径的 manager；返回的路径由调用方负责删。
+    fn manager_with_path(tag: &str) -> (ClientKeyManager, PathBuf) {
+        let path = std::env::temp_dir().join(format!(
+            "kiro_ck_{}_{}_{}.json",
+            tag,
+            std::process::id(),
+            Utc::now().timestamp_nanos_opt().unwrap_or(0)
+        ));
+        let mgr = ClientKeyManager::load(&path).expect("load 应能建空库");
+        (mgr, path)
+    }
+
+    /// 注意落盘是 camelCase（`totalInputTokens`），不是 Rust 字段名。
+    fn tokens_on_disk(path: &Path) -> Option<u64> {
+        let text = std::fs::read_to_string(path).ok()?;
+        let list: Vec<serde_json::Value> = serde_json::from_str(&text).ok()?;
+        list.first()?.get("totalInputTokens")?.as_u64()
+    }
+
+    /// 用量计数**不再**每请求写盘：`record_usage` 只置脏，磁盘要等 flush。
+    ///
+    /// 这条是本次改动的存在理由 —— 原先每请求一次"全部 Key 序列化 + 覆写整个文件"
+    /// 且在写锁内，是明确的吞吐天花板。
+    #[test]
+    fn record_usage_defers_the_write_until_flush() {
+        let (mgr, path) = manager_with_path("defer");
+        let entry = mgr.create("k".to_string(), None, None);
+        // create 是结构性变更，立即写盘 —— 此时盘上计数应为 0
+        assert_eq!(tokens_on_disk(&path), Some(0), "create 应已落盘");
+
+        mgr.record_usage(entry.id, 123, 4, 0, 0, 0.0);
+        // 内存已累计
+        let in_memory = mgr
+            .list()
+            .into_iter()
+            .find(|k| k.id == entry.id)
+            .expect("Key 应存在");
+        assert_eq!(in_memory.total_input_tokens, 123);
+        // 但盘上还是旧值 —— 写被推迟了
+        assert_eq!(tokens_on_disk(&path), Some(0), "record_usage 不该立即写盘");
+
+        mgr.flush_if_dirty();
+        assert_eq!(
+            tokens_on_disk(&path),
+            Some(123),
+            "flush 后必须落盘，否则计数会永久丢失"
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// 无脏数据时 flush 是空操作，不会白写一遍文件。
+    #[test]
+    fn flush_is_a_noop_when_nothing_changed() {
+        let (mgr, path) = manager_with_path("noop");
+        mgr.create("k".to_string(), None, None);
+        mgr.flush_if_dirty(); // 清掉 create 可能留下的脏标记
+
+        let before = std::fs::metadata(&path).and_then(|m| m.modified()).ok();
+        mgr.flush_if_dirty();
+        let after = std::fs::metadata(&path).and_then(|m| m.modified()).ok();
+        assert_eq!(before, after, "无脏数据不应触碰文件");
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// 结构性变更必须**仍然**立即写盘 —— 只有用量计数走延迟。
+    ///
+    /// 这些操作频率极低，而丢失代价远高于一批展示用计数。
+    #[test]
+    fn structural_changes_still_write_through() {
+        let (mgr, path) = manager_with_path("struct");
+        let entry = mgr.create("k".to_string(), None, None);
+        mgr.record_usage(entry.id, 7, 0, 0, 0, 0.0);
+        mgr.flush_if_dirty();
+
+        // 禁用是结构性变更，不经 flush 也该落盘
+        mgr.set_disabled(entry.id, true);
+        let text = std::fs::read_to_string(&path).unwrap();
+        let list: Vec<serde_json::Value> = serde_json::from_str(&text).unwrap();
+        assert_eq!(
+            list[0].get("disabled").and_then(|v| v.as_bool()),
+            Some(true),
+            "set_disabled 必须立即写盘"
+        );
+
+        let _ = std::fs::remove_file(&path);
     }
 }

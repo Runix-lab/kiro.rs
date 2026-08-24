@@ -261,6 +261,9 @@ async fn main() {
         cache_dir.join("cache_metering.json"),
     )));
     cache_meter.clone().spawn_background();
+    // 客户端 Key 用量计数改为周期落盘：原先每请求一次全量 JSON 覆写（在写锁内）是
+    // 吞吐天花板。结构性变更（创建/删除/禁用等）仍立即写盘，不走这条。
+    client_key_manager.clone().spawn_background();
 
     let anthropic_app = anthropic::create_router_with_shared_provider(
         Some(kiro_provider.clone()),
