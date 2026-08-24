@@ -560,6 +560,8 @@ fn render_websearch_response(
                 output_tokens,
                 cache_read_input_tokens: 0,
                 cache_write_input_tokens: 0,
+                // 本地构造，不是上游 payload —— present 保持 0，诊断探针据此不误报。
+                ..Default::default()
             },
             "",
             None,

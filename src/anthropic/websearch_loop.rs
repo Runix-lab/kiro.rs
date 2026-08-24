@@ -116,6 +116,8 @@ impl RoundOutcome {
             output_tokens: token::estimate_output_tokens(&output),
             cache_read_input_tokens: 0,
             cache_write_input_tokens: 0,
+            // 本地估算的兜底值，不是上游 payload —— present 保持 0。
+            ..Default::default()
         }
     }
 }
@@ -2200,6 +2202,7 @@ mod tests {
             output_tokens: 5,
             cache_read_input_tokens: 7,
             cache_write_input_tokens: 4,
+            ..Default::default()
         });
         let provider_usage = provider_round.resolved_token_usage(888);
         assert_eq!(
@@ -2209,6 +2212,7 @@ mod tests {
                 output_tokens: 5,
                 cache_read_input_tokens: 7,
                 cache_write_input_tokens: 4,
+                ..Default::default()
             }
         );
 
@@ -2235,6 +2239,7 @@ mod tests {
                 output_tokens: 5,
                 cache_read_input_tokens: 7,
                 cache_write_input_tokens: 4,
+                ..Default::default()
             },
             0.125,
         );
@@ -2250,6 +2255,7 @@ mod tests {
                 output_tokens: -2,
                 cache_read_input_tokens: -3,
                 cache_write_input_tokens: -4,
+                ..Default::default()
             },
             f64::NAN,
         );
@@ -2267,6 +2273,7 @@ mod tests {
             output_tokens: 5,
             cache_read_input_tokens: 7,
             cache_write_input_tokens: 4,
+            ..Default::default()
         };
         let content = vec![json!({"type": "text", "text": "ok"})];
         let response = render_json(
@@ -2321,6 +2328,7 @@ mod tests {
             output_tokens,
             cache_read_input_tokens: 0,
             cache_write_input_tokens: 0,
+            ..Default::default()
         }
     }
 

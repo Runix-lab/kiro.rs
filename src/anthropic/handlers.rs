@@ -2448,6 +2448,7 @@ mod tests {
             output_tokens: 11,
             cache_read_input_tokens: 7,
             cache_write_input_tokens: 4,
+            ..Default::default()
         };
 
         assert_eq!(

@@ -5291,6 +5291,7 @@ mod tests {
                 output_tokens: 11,
                 cache_read_input_tokens: 7,
                 cache_write_input_tokens: 4,
+                ..Default::default()
             }),
         }));
         let _ = ctx.process_kiro_event(&Event::Metadata(MetadataEvent { token_usage: None }));
@@ -5303,6 +5304,7 @@ mod tests {
                 output_tokens: 22,
                 cache_read_input_tokens: 23,
                 cache_write_input_tokens: 24,
+                ..Default::default()
             }),
         }));
         assert_eq!(ctx.resolved_usage(), (0, 24, 23));
@@ -5341,6 +5343,7 @@ mod tests {
             output_tokens: 11,
             cache_read_input_tokens: 7,
             cache_write_input_tokens: 4,
+            ..Default::default()
         };
         let mut ctx = BufferedStreamContext::new(
             "claude-opus-4-7",
