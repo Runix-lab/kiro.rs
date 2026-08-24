@@ -568,11 +568,15 @@ fn render_websearch_response(
 }
 
 /// 处理 WebSearch 请求
+///
+/// `sink` 透传给 `call_mcp_api`：纯 WebSearch 不经过 chat 流程，若不透传则这条请求
+/// 在 traces.db 里没有任何 attempt，请求日志页会看不到它（而聚合器却记了它）。
 pub async fn handle_websearch_request(
     provider: std::sync::Arc<crate::kiro::provider::KiroProvider>,
     payload: &MessagesRequest,
     input_tokens: i32,
     group: Option<&str>,
+    sink: Option<&dyn TraceSink>,
 ) -> Response {
     // 1. 提取搜索查询
     let query = match extract_search_query(payload) {
@@ -596,7 +600,7 @@ pub async fn handle_websearch_request(
 
     // 3. 调用 Kiro MCP API
     let search_results =
-        match finish_mcp_call(call_mcp_api(&provider, &mcp_request, None, group).await) {
+        match finish_mcp_call(call_mcp_api(&provider, &mcp_request, sink, group).await) {
             Ok(results) => results,
             Err(response) => return response,
         };

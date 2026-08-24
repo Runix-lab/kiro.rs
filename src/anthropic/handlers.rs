@@ -262,6 +262,31 @@ fn canonical_attempt_outcome(value: &str) -> &'static str {
     }
 }
 
+/// 落一条纯 WebSearch 请求的 trace。
+///
+/// 用量口径**刻意与同处的 `hook.record` 保持一致**（只记 input，output/cache/credits 记 0）：
+/// 该路径打的是 MCP 端点，不产生上游 token 用量，响应里的 output_tokens 是本地摘要的
+/// 字符估算值。两个 sink 记同一份数，避免请求日志与聚合器再次互相矛盾。
+fn finalize_websearch_trace(tracer: &RequestTracer, status: &str, input_tokens: i32) {
+    let error_type = if status == "success" {
+        None
+    } else {
+        // MCP 调用失败时 provider 已记下带分类的 attempt；无 attempt（如查询提取失败
+        // 这类未发起调用的早退）则归 UNKNOWN。
+        Some(last_attempt_outcome(tracer).unwrap_or(outcome::UNKNOWN))
+    };
+    tracer.finalize(
+        status,
+        error_type,
+        None,
+        None,
+        TraceUsage {
+            input_tokens: input_tokens.max(0) as u64,
+            ..TraceUsage::zero()
+        },
+    );
+}
+
 /// Image-budget warning threshold (in raw base64 chars, not decoded bytes).
 /// Emits a warning when the total base64 char count of all image content in one request exceeds this threshold.
 /// The threshold does not reject the request (the upstream makes the final call); it only gives operators more precise diagnostics.
@@ -665,19 +690,33 @@ pub async fn post_messages(
             payload.tools.clone(),
         ) as i32;
 
+        // 纯 WebSearch 不经过 chat 流程，仍需自建 tracer：否则这条请求只进聚合器、
+        // 不进 traces.db，概览与请求日志页会对同一批流量给出矛盾的答案。
+        let tracer = RequestTracer::new(
+            &state,
+            RequestTraceOptions {
+                key_ctx: key_ctx.clone(),
+                model: payload.model.clone(),
+                is_stream: payload.stream,
+            },
+        );
         let resp = websearch::handle_websearch_request(
             provider,
             &payload,
             input_tokens,
             key_ctx.group.as_deref(),
+            Some(&tracer),
         )
         .await;
-        // WebSearch 路径走 MCP 端点，没有 credential_id 上下文，统一记 0
+        // 凭据归属只落 trace（sink 已记下 MCP 那一跳），聚合器这侧仍记 0：
+        // `add_record_to_bucket` 对 credential_id==0 的记录不写凭据分布，改动它会连带
+        // 变更聚合口径，不在本次范围内。
         let status = if resp.status().is_success() {
             "success"
         } else {
             "error"
         };
+        finalize_websearch_trace(&tracer, status, input_tokens);
         hook.record(0, input_tokens, 0, 0, 0, 0.0, status);
         return resp;
     }
@@ -1590,11 +1629,21 @@ pub async fn post_messages_cc(
             payload.tools.clone(),
         ) as i32;
 
+        // 同 post_messages：纯 WebSearch 也要自建 tracer，否则请求日志页丢这批流量。
+        let tracer = RequestTracer::new(
+            &state,
+            RequestTraceOptions {
+                key_ctx: key_ctx.clone(),
+                model: payload.model.clone(),
+                is_stream: payload.stream,
+            },
+        );
         let resp = websearch::handle_websearch_request(
             provider,
             &payload,
             input_tokens,
             key_ctx.group.as_deref(),
+            Some(&tracer),
         )
         .await;
         let status = if resp.status().is_success() {
@@ -1602,6 +1651,7 @@ pub async fn post_messages_cc(
         } else {
             "error"
         };
+        finalize_websearch_trace(&tracer, status, input_tokens);
         hook.record(0, input_tokens, 0, 0, 0, 0.0, status);
         return resp;
     }
@@ -2416,5 +2466,126 @@ mod tests {
         assert!(validate_max_tokens(1).is_ok());
         assert!(validate_max_tokens(0).is_err());
         assert!(validate_max_tokens(-1).is_err());
+    }
+
+    /// 构造一个挂内存 store 的 tracer，供纯 WebSearch trace 测试使用。
+    fn websearch_tracer(
+        store: &std::sync::Arc<crate::admin::trace_db::TraceStore>,
+    ) -> RequestTracer {
+        RequestTracer {
+            store: Some(store.clone()),
+            trace_id: Uuid::new_v4().to_string(),
+            ts: Utc::now().to_rfc3339(),
+            key_id: 3,
+            key_source: TraceKeySource::ClientKey,
+            model: "claude-sonnet-4.6".to_string(),
+            is_stream: false,
+            started_at: Instant::now(),
+            first_token_at: parking_lot::Mutex::new(None),
+            attempts: parking_lot::Mutex::new(Vec::new()),
+        }
+    }
+
+    #[test]
+    fn pure_websearch_request_lands_in_trace_store() {
+        use crate::admin::trace_db::{TraceQuery, TraceStore};
+
+        let store = std::sync::Arc::new(TraceStore::open_in_memory().unwrap());
+        let tracer = websearch_tracer(&store);
+        // provider 在 MCP 调用里记下的那一跳。
+        tracer.on_attempt(TraceAttempt {
+            attempt: 0,
+            credential_id: 42,
+            endpoint: "ide".to_string(),
+            http_status: Some(200),
+            outcome: outcome::SUCCESS.to_string(),
+            error_snippet: None,
+            duration_ms: 12,
+        });
+
+        finalize_websearch_trace(&tracer, "success", 137);
+
+        let (records, total) = store.query_paged(&TraceQuery {
+            limit: 10,
+            ..Default::default()
+        });
+        assert_eq!(total, 1, "纯 WebSearch 请求必须出现在请求日志里");
+        let record = &records[0];
+        assert_eq!(record.final_status, "success");
+        assert!(record.error_type.is_none());
+        assert_eq!(record.input_tokens, 137);
+        // 与同处 hook.record 的口径一致：该路径无上游 token 用量。
+        assert_eq!(record.output_tokens, 0);
+        assert_eq!(record.cache_creation_tokens, 0);
+        assert_eq!(record.cache_read_tokens, 0);
+        assert_eq!(record.credits, 0.0);
+        // sink 透传后凭据不再恒为 0，凭据分布能归因到这条请求。
+        assert_eq!(record.final_credential_id, 42);
+        assert_eq!(record.total_attempts, 1);
+    }
+
+    #[test]
+    fn failed_websearch_trace_takes_error_type_from_last_attempt() {
+        use crate::admin::trace_db::{TraceQuery, TraceStore};
+
+        let store = std::sync::Arc::new(TraceStore::open_in_memory().unwrap());
+        let tracer = websearch_tracer(&store);
+        tracer.on_attempt(TraceAttempt {
+            attempt: 0,
+            credential_id: 9,
+            endpoint: "ide".to_string(),
+            http_status: Some(403),
+            outcome: outcome::AUTH_FAILED.to_string(),
+            error_snippet: None,
+            duration_ms: 8,
+        });
+
+        finalize_websearch_trace(&tracer, "error", 44);
+
+        let (records, _) = store.query_paged(&TraceQuery {
+            limit: 10,
+            ..Default::default()
+        });
+        let record = &records[0];
+        assert_eq!(record.final_status, "error");
+        assert_eq!(record.error_type.as_deref(), Some(outcome::AUTH_FAILED));
+        assert_eq!(record.final_credential_id, 9);
+    }
+
+    #[test]
+    fn websearch_trace_without_attempts_falls_back_to_unknown() {
+        use crate::admin::trace_db::{TraceQuery, TraceStore};
+
+        let store = std::sync::Arc::new(TraceStore::open_in_memory().unwrap());
+        let tracer = websearch_tracer(&store);
+
+        // 查询提取失败这类早退：根本没发起 MCP 调用，因此没有任何 attempt。
+        finalize_websearch_trace(&tracer, "error", 0);
+
+        let (records, total) = store.query_paged(&TraceQuery {
+            limit: 10,
+            ..Default::default()
+        });
+        assert_eq!(total, 1, "未发起上游调用的早退也要留痕");
+        let record = &records[0];
+        assert_eq!(record.error_type.as_deref(), Some(outcome::UNKNOWN));
+        assert_eq!(record.total_attempts, 0);
+        assert_eq!(record.final_credential_id, 0);
+    }
+
+    #[test]
+    fn websearch_trace_clamps_negative_input_tokens() {
+        use crate::admin::trace_db::{TraceQuery, TraceStore};
+
+        let store = std::sync::Arc::new(TraceStore::open_in_memory().unwrap());
+        let tracer = websearch_tracer(&store);
+
+        finalize_websearch_trace(&tracer, "success", -5);
+
+        let (records, _) = store.query_paged(&TraceQuery {
+            limit: 10,
+            ..Default::default()
+        });
+        assert_eq!(records[0].input_tokens, 0);
     }
 }

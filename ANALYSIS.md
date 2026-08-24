@@ -10,7 +10,7 @@
 | 症状 | 根因 | 性质 |
 |---|---|---|
 | 有时候 cache 没展示 | **两个独立根因**：① 上游 `tokenUsage` 缺失时 cache 数字完全由中转层模拟，与 Kiro 实际缓存无关；② 部分 payload 会静默把 cache 清零，并丢弃本地算好的模拟值 | ① 设计取舍<br>② **真 bug** |
-| 有时候没有流量 | 纯 websearch 请求全程不写 traces.db；叠加 `credential_id==0` 被踢出凭据分布 | **真 bug** + 设计如此叠加放大 |
+| 有时候没有流量 | 纯 websearch 请求全程不写 traces.db（**已修**，§4.1）；叠加 `credential_id==0` 被踢出凭据分布（未动） | **真 bug** + 设计如此叠加放大 |
 | 要 RPM / TPM | RPM 只是限流闸门不是指标（默认关闭、重启清零、口径是上游跳数）；TPM 完全不存在；聚合器最细只到小时 | 需新建采集层 |
 
 最尖锐的一条：**`TokenUsage` 每个字段都是 `#[serde(default)]`，上游发来部分 payload 会静默变成全零，且该值优先级最高、直接覆盖本地算好的缓存值。** 见 §3.2。
@@ -134,7 +134,7 @@ config.json + credentials.json → `MultiTokenManager`（凭据池）→ `KiroPr
 | 3 | `isolation_seed()` 返回 None → 整个模拟关闭 | 主 apiKey(`key_id=0`) 且请求无 session（`cache_metering.rs:542-555`） | **设计如此**（防跨用户假命中） |
 | 4 | `extract_segments` 无可切段 → covered=0 | 单条 message、无 system/tools（最后一条不切段） | 设计如此（确实无可复用前缀） |
 | 5 | **混合工具 agentic 循环无 CacheMeter 兜底** | `web_search` 与其他工具混用走 `run_web_search_loop` | **缺陷**：`websearch_loop.rs` 全文零 `CacheUsage`/`cache_metering` 引用（已 grep 确认），完全依赖上游 `TokenUsage`；上游不给就是硬 0，连模拟兜底都没有 |
-| 6 | 纯 websearch 早退硬编码零 | `handlers.rs:681` `hook.record(0, input_tokens, 0, 0, 0, 0.0, ...)` | **真 bug**（同时不写 trace，见 §4.1） |
+| 6 | 纯 websearch 早退硬编码零 | `handlers.rs` 早退处 `hook.record(0, input_tokens, 0, 0, 0, 0.0, ...)` | trace 缺失部分**已修**（§4.1）；cache 恒 0 是该路径固有性质（不打上游、无上游用量） |
 | 7 | `cache_meter` 为 None → `unwrap_or_default()` 全零 | `handlers.rs:786-789 / 1709-1712` | 理论路径（`main.rs:272` 恒传 `Some`，仅测试/其他嵌入方式会命中） |
 | 8 | 多进程部署前缀链永不命中 | 水平扩展、请求被 LB 分散 | **缺陷**：cache_read 恒 0 且无任何告警（§3.1） |
 
@@ -142,13 +142,17 @@ config.json + credentials.json → `MultiTokenManager`（凭据池）→ `KiroPr
 
 ## 4. "有时候没有流量"的根因
 
-### 4.1 纯 websearch 请求全程不写 traces.db（**真 bug**）
+### 4.1 纯 websearch 请求全程不写 traces.db（**真 bug — 已修**）
 
-`handlers.rs:657-683` 这条早退路径：估算 input_tokens → 调 `handle_websearch_request` → 记 `hook.record(0, input_tokens, 0, 0, 0, 0.0, status)` → `return resp`。**期间从未构造 `RequestTracer`**；`websearch.rs` 全文零 tracer 引用（已 grep 确认）。
+**原状**：`handlers.rs` 那条早退路径估算 input_tokens → 调 `handle_websearch_request` → 记 `hook.record(0, input_tokens, 0, 0, 0, 0.0, status)` → `return resp`，**期间从未构造 `RequestTracer`**。后果是这类请求**进了聚合器**（概览卡片、趋势图有它），但**请求日志页完全看不到**——两个页面对同一批流量给出矛盾的答案。
 
-后果：这类请求**进了聚合器**（概览卡片、趋势图有它），但**请求日志页完全看不到**。两个页面对同一批流量给出矛盾的答案。
+值得注意的是 v0.7.6 那个 `fix(trace): record mixed web-search requests`（#66）只覆盖了**混合工具**路径：它把 `call_mcp_api` 的 `sink: Option<&dyn TraceSink>` 参数和 `call_mcp_with_trace` 都铺好了，但**纯 websearch 这条一直传 `None`**。所以修复不是新建管子，是把已有的管子接上。
 
-同一处还有三重数据失真：`credential_id` 记 0、cache 全 0、credits 记 0。
+**修法**（本次）：`handle_websearch_request` 增 `sink` 参数透传给 `call_mcp_api`；`/v1` 与 `/cc/v1` **两个入口各自**自建 tracer 并在早退前 `finalize_websearch_trace`。附带收益：`call_mcp_with_trace` 会记下带真实 credential_id 的 attempt，trace 里的凭据归属不再恒为 0。
+
+**刻意未动**：同处 `hook.record(0, ...)` 一个字没改。聚合器侧 `credential_id==0` 的记录不进凭据分布（§4.2），改它会连带变更聚合口径，属另一件事。因此 trace 有真实凭据、聚合器仍记 0，这是有意的边界。
+
+用量口径也刻意与 `hook.record` 对齐（只记 input，output/cache/credits 记 0）：该路径打 MCP 端点、不产生上游 token 用量，响应里的 output_tokens 是本地摘要的字符估算值。两个 sink 记同一份数，避免再造一处矛盾。
 
 ### 4.2 `credential_id == 0` 被踢出凭据分布（设计如此，但叠加放大）
 
@@ -226,7 +230,7 @@ max_retries = (该分组凭据数 × MAX_RETRIES_PER_CREDENTIAL(3)).min(MAX_TOTA
 **P0 — 数据正确性，会让你看错数**
 
 1. **部分 `tokenUsage` payload 静默清零 + 丢弃模拟值**（§3.2）。`metadata.rs:14-29` / `stream.rs:1569` / `handlers.rs:1219` / `handlers.rs:410-418`。修法：赋值处或 `resolve_*` 处加守卫——`tokenUsage` 全零时视作未下发；cache 字段为零但本地 `cache_covered_est > 0` 时至少打 warn。**动手前先按 §3.2 末尾的方法确认上游真会触发。**
-2. **纯 websearch 不写 traces.db**（§4.1）。`handlers.rs:657-683`。修法：该路径补 `RequestTracer` 并 `finalize`。
+2. ~~**纯 websearch 不写 traces.db**（§4.1）~~ → **已修**：`sink` 透传 + 两入口各自建 tracer 并 finalize，4 条单测覆盖（含红绿反向验证）。**注意**：单测只覆盖 finalize 行为，"sink 真的透传到 MCP 调用"这层因仓内无 mock server 依赖未做自动化覆盖，靠类型系统（调用方必须显式传参）与 diff 可读性保证。
 3. **cache 两套口径不可区分**（§3.1）。修法：响应/trace 里加来源标记（upstream / simulated），前端据此区别展示；根治要比"继续把两种精度塞一个字段"更彻底。
 
 **P1 — 可观测性缺口**
