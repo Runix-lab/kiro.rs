@@ -125,6 +125,21 @@ config.json + credentials.json → `MultiTokenManager`（凭据池）→ `KiroPr
 
 问题在于：新模型上线要人肉改代码，**没有任何机制拿上游 `ListAvailableModels` 的 `TokenLimits` 去交叉验证这张表**——而这个接口本来就在调（`available_models.rs:42-50` 有 `maxInputTokens` 字段）。这是可以自动化却没自动化的地方。
 
+### 3.4 cache 归零路径穷举
+
+| # | 路径 | 触发条件 | 性质 |
+|---|---|---|---|
+| 1 | `tokenUsage` 缺失 → CacheMeter 模拟 | 上游未下发该事件 | 设计取舍（数字与上游实际缓存无关） |
+| 2 | 部分 payload 静默清零 + 丢弃模拟值 | 上游发不含 cache 字段的 `tokenUsage` | **真 bug**（§3.2） |
+| 3 | `isolation_seed()` 返回 None → 整个模拟关闭 | 主 apiKey(`key_id=0`) 且请求无 session（`cache_metering.rs:542-555`） | **设计如此**（防跨用户假命中） |
+| 4 | `extract_segments` 无可切段 → covered=0 | 单条 message、无 system/tools（最后一条不切段） | 设计如此（确实无可复用前缀） |
+| 5 | **混合工具 agentic 循环无 CacheMeter 兜底** | `web_search` 与其他工具混用走 `run_web_search_loop` | **缺陷**：`websearch_loop.rs` 全文零 `CacheUsage`/`cache_metering` 引用（已 grep 确认），完全依赖上游 `TokenUsage`；上游不给就是硬 0，连模拟兜底都没有 |
+| 6 | 纯 websearch 早退硬编码零 | `handlers.rs:681` `hook.record(0, input_tokens, 0, 0, 0, 0.0, ...)` | **真 bug**（同时不写 trace，见 §4.1） |
+| 7 | `cache_meter` 为 None → `unwrap_or_default()` 全零 | `handlers.rs:786-789 / 1709-1712` | 理论路径（`main.rs:272` 恒传 `Some`，仅测试/其他嵌入方式会命中） |
+| 8 | 多进程部署前缀链永不命中 | 水平扩展、请求被 LB 分散 | **缺陷**：cache_read 恒 0 且无任何告警（§3.1） |
+
+判读要点：**只有 #2、#5、#6、#8 值得修**。#1 是口径问题（要治得让来源可区分，不是"修零"），#3/#4 是正确行为，#7 生产不会发生。排查现场先定位落在哪条路径上，别把 #3/#4 当 bug 追。
+
 ## 4. "有时候没有流量"的根因
 
 ### 4.1 纯 websearch 请求全程不写 traces.db（**真 bug**）
