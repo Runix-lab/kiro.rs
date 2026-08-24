@@ -438,6 +438,57 @@ pub(super) fn map_provider_error(err: Error) -> Response {
 ///
 /// 返回 `(uncached_input, output, cache_write, cache_read)`。精确 provider 快照优先；
 /// 缺失时才使用 contextUsage/输入估算和本地 CacheMeter 分摊。
+/// 一次请求的 cache/usage 数字来自哪里。
+///
+/// 存在的理由：`cache_read_input_tokens` / `cache_creation_input_tokens` 这两个数**有两套
+/// 精度完全不同的口径**，却塞在同一个 JSON 字段里返回，客户端与运营侧都无法区分自己看到
+/// 的是上游真值还是中转层猜的（详见 ANALYSIS.md §3.1）。分类是解决它的第一步：先让来源
+/// 在内部可判、可落 trace，再谈要不要对外暴露。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum UsageSource {
+    /// 上游 `metadataEvent.tokenUsage` 四个键齐全 —— Kiro 后端真值，最高置信度。
+    UpstreamComplete,
+    /// 上游下发了 `tokenUsage` 但键不齐 —— 缺失键被填 0，该部分是**假的零**而非真值。
+    UpstreamPartial,
+    /// 未收到 `tokenUsage`，数字全部由本地 `CacheMeter` 模拟 + `split_against_total` 分摊。
+    /// **与 Kiro 后端是否真做了 prompt cache 零关联。**
+    Simulated,
+}
+
+impl UsageSource {
+    /// 落 trace / 日志用的稳定标识。
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::UpstreamComplete => "upstream",
+            Self::UpstreamPartial => "upstream_partial",
+            Self::Simulated => "simulated",
+        }
+    }
+
+    /// 这份数字能否当作 Kiro 后端的真值用。
+    ///
+    /// `UpstreamPartial` 判 false 是刻意的：它混了真值与被 serde 填出来的假零，
+    /// 拿去做任何精确判断都会出错。
+    pub(crate) fn is_trustworthy(self) -> bool {
+        matches!(self, Self::UpstreamComplete)
+    }
+}
+
+/// 判定一次请求的用量来源。
+///
+/// 与 `resolve_non_stream_usage` 分开，是为了不改后者的返回类型 —— 它的四元组被多处解构，
+/// 加一个字段会波及无关调用点。来源只在需要标注置信度时查一次。
+///
+/// 判据与 `resolve_non_stream_usage` 的分支**必须保持一致**：`Some` 走上游、`None` 走模拟。
+/// 两者若漂移，trace 上标的来源就会与实际用的数字不符。
+pub(crate) fn classify_usage_source(provider_usage: Option<TokenUsage>) -> UsageSource {
+    match provider_usage {
+        Some(u) if u.is_complete() => UsageSource::UpstreamComplete,
+        Some(_) => UsageSource::UpstreamPartial,
+        None => UsageSource::Simulated,
+    }
+}
+
 fn resolve_non_stream_usage(
     fallback_total_input_tokens: i32,
     context_total_input_tokens: Option<i32>,
@@ -1408,6 +1459,18 @@ async fn handle_non_stream_request(
             cache_usage,
             provider_token_usage,
         );
+    // 记下这批数字的来源。响应里两套精度混在同一字段（ANALYSIS.md §3.1），日志是目前
+    // 唯一能区分"上游真值"与"本地模拟"的地方 —— 排查"cache 数字不对"必须先看这条，
+    // 否则会把模拟路的固有偏差当 bug 追。
+    let usage_source = classify_usage_source(provider_token_usage);
+    if !usage_source.is_trustworthy() {
+        tracing::debug!(
+            source = usage_source.as_str(),
+            cache_read_tokens,
+            cache_creation_tokens,
+            "本次 cache 数字非上游真值"
+        );
+    }
 
     // 构建 Anthropic 响应
     let mut usage_json = json!({
@@ -2484,6 +2547,54 @@ mod tests {
         assert!(validate_max_tokens(1).is_ok());
         assert!(validate_max_tokens(0).is_err());
         assert!(validate_max_tokens(-1).is_err());
+    }
+
+    /// 来源三分必须与 `resolve_non_stream_usage` 的分支一致：`Some` 走上游、`None` 走模拟。
+    /// 两者漂移就会在 trace 上标错来源。
+    #[test]
+    fn usage_source_splits_three_ways() {
+        use crate::kiro::model::events::present;
+
+        // 四键齐全 → 上游真值
+        let complete = TokenUsage {
+            uncached_input_tokens: 10,
+            output_tokens: 5,
+            cache_read_input_tokens: 1,
+            cache_write_input_tokens: 1,
+            present: present::ALL,
+        };
+        assert_eq!(
+            classify_usage_source(Some(complete)),
+            UsageSource::UpstreamComplete
+        );
+        assert!(classify_usage_source(Some(complete)).is_trustworthy());
+
+        // 键不齐 → 混了真值与 serde 填出来的假零，不可当真值用
+        let partial = TokenUsage {
+            output_tokens: 5,
+            present: present::OUTPUT,
+            ..Default::default()
+        };
+        assert_eq!(
+            classify_usage_source(Some(partial)),
+            UsageSource::UpstreamPartial
+        );
+        assert!(
+            !classify_usage_source(Some(partial)).is_trustworthy(),
+            "残缺 payload 不能标成可信"
+        );
+
+        // 未下发 → 全靠 CacheMeter 模拟
+        assert_eq!(classify_usage_source(None), UsageSource::Simulated);
+        assert!(!classify_usage_source(None).is_trustworthy());
+    }
+
+    /// 标识串是要落 trace / 日志的，改动会让历史数据对不上，用测试钉住。
+    #[test]
+    fn usage_source_labels_are_stable() {
+        assert_eq!(UsageSource::UpstreamComplete.as_str(), "upstream");
+        assert_eq!(UsageSource::UpstreamPartial.as_str(), "upstream_partial");
+        assert_eq!(UsageSource::Simulated.as_str(), "simulated");
     }
 
     /// 构造一个挂内存 store 的 tracer，供纯 WebSearch trace 测试使用。
