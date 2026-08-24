@@ -9,11 +9,13 @@
 
 | 症状 | 根因 | 性质 |
 |---|---|---|
-| 有时候 cache 没展示 | **两个独立根因**：① 上游 `tokenUsage` 缺失时 cache 数字完全由中转层模拟，与 Kiro 实际缓存无关；② 部分 payload 会静默把 cache 清零，并丢弃本地算好的模拟值 | ① 设计取舍<br>② **真 bug** |
+| 有时候 cache 没展示 | **两个独立根因**：① 上游 `tokenUsage` 缺失时 cache 数字完全由中转层模拟，与 Kiro 实际缓存无关——**且 0.7.4 是 100% 模拟**（§3.2.1 已坐实）；② 部分 payload 会静默把 cache 清零并丢弃模拟值，**但该路径 2026-08-24 才首次上生产，权重待实测** | ① 设计取舍<br>② 代码脆弱性确凿，现实权重 **INCONCLUSIVE** |
 | 有时候没有流量 | 纯 websearch 请求全程不写 traces.db（**已修**，§4.1）；叠加 `credential_id==0` 被踢出凭据分布（未动） | **真 bug** + 设计如此叠加放大 |
 | 要 RPM / TPM | RPM 只是限流闸门不是指标（默认关闭、重启清零、口径是上游跳数）；TPM 完全不存在；聚合器最细只到小时 | 需新建采集层 |
 
 最尖锐的一条：**`TokenUsage` 每个字段都是 `#[serde(default)]`，上游发来部分 payload 会静默变成全零，且该值优先级最高、直接覆盖本地算好的缓存值。** 见 §3.2。
+
+⚠️ **但别把它当"现存故障"** —— §3.2.1 已坐实这条路径 2026-08-24 13:16 才第一次上生产（0.7.4 完全不解析 `tokenUsage`）。切换前那 8 万行 traces 里的 cache 数字**全部是本地模拟值**，任何"从历史数据看出 P0 在发生"的推断都是错的（我自己先踩过一次，见 §3.2.1 表格）。
 
 ## 1. 端到端请求链路
 
@@ -115,7 +117,32 @@ config.json + credentials.json → `MultiTokenManager`（凭据池）→ `KiroPr
 全仓 grep `is_zero` / `is_empty` / `has_usage` / `is_all_zero`：**零命中**，确实没有任何守卫。
 
 > **待运行时验证**：Kiro 实际会不会发部分 `tokenUsage`（只有 outputTokens、无 cache 字段）。**代码脆弱性已确认无疑**，但上游是否真触发这条路径，光读代码定不了。这决定根因二的实际权重。
-> 验证方法：在 `stream.rs:1560` 那条 debug 日志基础上加一条 warn——当 `tokenUsage` 存在但四字段全零、或 cache 字段为零而本地 `cache_usage.cache_covered_est > 0` 时打点，跑一天生产流量看命中次数。
+
+#### 3.2.1 关键前提：这条路径 2026-08-24 才第一次上生产
+
+**已坐实**：`0.7.4` 完全不解析 `tokenUsage`。
+
+- `src/kiro/model/events/metadata.rs` 是 `66dbc46`（2026-08-12）**新建**的文件（`git show` 显示 `new file mode` + `@@ -0,0 +1,173 @@`），该 commit 说明原文「**恢复** metadataEvent.tokenUsage 解析及各响应路径的精确用量聚合」
+- 0.7.4 基线（`a2f4d7f~1`）全仓 grep `tokenUsage|token_usage|provider_token_usage`：**0 个文件命中**；HEAD 是 5 个
+- 生产直到 2026-08-24 13:16 都在跑 `0.7.4`
+
+推论：0.7.4 时期 `provider_usage` **恒为 `None`**，`resolve_non_stream_usage` 永远走 `split_against_total` 那条模拟分支。
+
+**这直接改写了对生产数据的解读**（80,554 行 traces，切换前累积）：
+
+| 观测 | 曾经的解读 | 坐实后的事实 |
+|---|---|---|
+| 97.7% 成功请求 `cache_read > 0` | 缓存工作良好 | **100% 是 CacheMeter 模拟值**，与 Kiro 后端真实缓存零关联 |
+| 238 条 `input_tokens=0` 而 `cache_read` 高达 111676 | 命中了本节这条"部分 payload 静默清零" | **不可能** —— 该代码路径当时不存在。真实成因是 `split_against_total` 把 input 分摊成了 0 |
+| `claude-sonnet-4.5` 缓存恒 0（223 条全 0） | 上游不下发 | §3.4 的 #4：该模型请求形态切不出可复用前缀，设计如此 |
+
+那 238 条按天分布集中在 08-18 ~ 08-21（08-21 一天 201 条），**最后一条 08-21T08:36:39，之后三天为零** —— 而这三天生产仍在跑 0.7.4，所以它的停止与本次上线无关，成因在客户端流量形态或上游行为，不在中转层版本。
+
+**因此根因二的权重目前无法评估**：它是 2026-08-24 13:16 随新二进制**第一次进入生产**的代码路径。切换后至今样本太小（90 个成功请求），在 0.313% 基线率下期望命中不足 1 次，零命中没有统计效力。
+
+**探针现状**（`probe_untrusted_token_usage`，`metadata.rs`）：三个判据 —— ①四字段全零 ②cache 为零但本地有覆盖 ③`uncachedInputTokens=0` 而 `cacheRead>0`。第三条是 `0581637` 补的，此前是盲点。
+
+**探针的根本限制**：`#[serde(default)]` 把「键缺失」与「键存在且为 0」抹成同一个值，所以第三条判据打出的现场**无法自行区分**「残缺 payload（真 bug）」与「整个 prompt 全命中缓存（合法）」。要彻底分辨，需在反序列化时记录键是否出现（例如让 `MetadataEvent` 额外保留一份原始 `tokenUsage` JSON 对象，在探针处检查键存在性）。**在此之前不许给这条 P0 下"是 bug"的定性。**
 
 ### 3.3 反推 input_tokens 依赖硬编码窗口表
 
@@ -231,7 +258,9 @@ max_retries = (该分组凭据数 × MAX_RETRIES_PER_CREDENTIAL(3)).min(MAX_TOTA
 
 **P0 — 数据正确性，会让你看错数**
 
-1. **部分 `tokenUsage` payload 静默清零 + 丢弃模拟值**（§3.2）。`metadata.rs:14-29` / `stream.rs:1569` / `handlers.rs:1219` / `handlers.rs:410-418`。修法：赋值处或 `resolve_*` 处加守卫——`tokenUsage` 全零时视作未下发；cache 字段为零但本地 `cache_covered_est > 0` 时至少打 warn。**动手前先按 §3.2 末尾的方法确认上游真会触发。**
+1. **部分 `tokenUsage` payload 静默清零 + 丢弃模拟值**（§3.2）。`metadata.rs` / `stream.rs:1569` / `handlers.rs:1219` / `handlers.rs:410-418`。修法：赋值处或 `resolve_*` 处加守卫——`tokenUsage` 全零时视作未下发；cache 字段为零但本地 `cache_covered_est > 0` 时至少打 warn。
+
+   **当前状态：INCONCLUSIVE，不许动手。** 该路径 2026-08-24 13:16 才首次上生产（§3.2.1），生产样本还不够；且探针受 `#[serde(default)]` 限制，分不出「残缺 payload」与「全命中缓存」。先做 §3.2.1 末尾说的键存在性记录，拿到能定性的证据再谈修。
 2. ~~**纯 websearch 不写 traces.db**（§4.1）~~ → **已修并在真实环境验证**：`sink` 透传 + 两入口各自建 tracer 并 finalize，4 条单测覆盖（含红绿反向验证）。
 
    **端到端证据**（2026-08-24，`kiro-rs:518dfbd` 镜像，隔离数据目录、80446 行真实 trace 快照）：发一条纯 websearch 请求（`tools` 仅一个 `web_search`），因该环境无可用凭据返回 502，但 **traces 行数 80446 → 80447**，落库那行 `final_status=error` / `error_type=unknown` / `input_tokens=14`。修复前这条请求在 traces.db 里完全不存在。
@@ -286,7 +315,7 @@ max_retries = (该分组凭据数 × MAX_RETRIES_PER_CREDENTIAL(3)).min(MAX_TOTA
 
 ## 8. 必须运行时验证的事项（当前不可下结论）
 
-1. **`tokenUsage` 缺失 / 部分下发的真实频率** ← 决定 P0-1 和 §3.1 的实际权重。方法见 §3.2 末尾。
+1. **`tokenUsage` 缺失 / 部分下发的真实频率** ← 决定 P0-1 和 §3.1 的实际权重。**注意：0.7.4 完全不解析 tokenUsage（§3.2.1 已坐实），所以历史数据回答不了这个问题**，只能从 2026-08-24 13:16 之后的样本统计。探针已就位（三判据），但要分辨"残缺 payload vs 全命中缓存"还需补键存在性记录。
 2. **上游重试放大的实际倍数** ← 决定入口 RPM 与上游 RPM 的差距。
 3. **生产 QPS 量级** ← 决定 P2-7 的全量写盘是否已是现实瓶颈。
 4. **traces.db 实际行数与分钟聚合耗时** ← 决定 RPM/TPM 能否退而用 SQL 实现。
