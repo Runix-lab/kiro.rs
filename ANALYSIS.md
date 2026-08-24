@@ -305,7 +305,7 @@ max_retries = (该分组凭据数 × MAX_RETRIES_PER_CREDENTIAL(3)).min(MAX_TOTA
 
 **P1 — 可观测性缺口**
 
-4. ~~RPM/TPM 无采集层~~ → **已建**（§6）：`src/anthropic/rate_ring.rs` 120 桶分钟环、入口/上游双口径、`GET /api/admin/stats/rate`、概览页「实时速率」面板。**尚未上生产**，线上镜像 `518dfbd` 不含它。
+4. ~~RPM/TPM 无采集层~~ → **已建**（§6）：`src/anthropic/rate_ring.rs` 120 桶分钟环、入口/上游双口径、`GET /api/admin/stats/rate`、概览页「实时速率」面板。**已上生产**（2026-08-24 23:29 UTC，镜像 `kiro-rs:06a17f3`）。生产实测双口径：入口 3 / 上游 9 → `retryAmplification = 3.0`。
 5. 多实例下 CacheMeter 静默失效、无任何提示（§3.1）
 6. ~~`traces` 表 `key_id` / `model` 裸筛无索引~~ → **已修，但修法与本文初版建议相反，见 §7.1**
 
