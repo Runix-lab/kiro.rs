@@ -31,7 +31,9 @@ config.json + credentials.json → `MultiTokenManager`（凭据池）→ `KiroPr
 | `/v1/messages` (`:608`) | `handle_stream_request` (`:844`) | 真流式，边收边转发 |
 | `/cc/v1/messages` (`:1538`) | `handle_stream_request_buffered` (`:1764`) | **假流式**，见下 |
 
-`/cc/v1` 用 `BufferedStreamContext`（`stream.rs:2562-2670`）：把整条上游流吃完、事件全缓冲，流结束后才回填 `message_start.usage.input_tokens/cache_*`，再一次性发出所有 SSE（`stream.rs:2636-2647`）。动机是让 `message_start` 里的 `input_tokens` 是准确值（Anthropic 官方协议要求），而 Kiro 只有流跑完才给得出这个数。**代价是完全牺牲 TTFB**：客户端拿到第一个字节前要空等整轮生成完成，长输出场景下是数十秒到数分钟，期间只有 ping 保活，且**没有硬超时保护**。
+`/cc/v1` 用 `BufferedStreamContext`（`stream.rs:2562-2670`）：把整条上游流吃完、事件全缓冲，流结束后才回填 `message_start.usage.input_tokens/cache_*`，再一次性发出所有 SSE（`stream.rs:2636-2647`）。动机是让 `message_start` 里的 `input_tokens` 是准确值（Anthropic 官方协议要求），而 Kiro 只有流跑完才给得出这个数。**代价是完全牺牲 TTFB**：客户端拿到第一个字节前要空等整轮生成完成，长输出场景下是数十秒到数分钟，期间只有 ping 保活（`PING_INTERVAL_SECS = 25`）。
+
+> **更正**：本文初版写"没有硬超时保护"，**错了**。`provider.rs:179` 与 `:202` 两处 `build_client(.., 720, ..)` 都设了 720s，而 reqwest 的 `ClientBuilder::timeout()` 覆盖 connect + request + **response body**，所以上游读取有 12 分钟硬上限。真正的问题在超时**之后**——见 §4.4，那条比"缺超时"严重得多。
 
 **websearch 两条特殊路径**（四个入口都检测，`handlers.rs:657, 1576`）：
 
@@ -202,6 +204,20 @@ config.json + credentials.json → `MultiTokenManager`（凭据池）→ `KiroPr
 
 早退路径记的是全零（`hook.record(0, 0, 0, 0, 0, 0.0, "error")`）。它们**会计入 calls 和 errors**（`BucketStats::add`，`usage_stats.rs:186-196`），所以调用数不会丢，但 token 维度全零会拉低平均值。
 
+### 4.4 `/cc/v1` 断流把截断谎报成正常收尾（**真 bug — 已修**）
+
+这条是对客真实性问题，比 §4.1/§4.2 的"数字看错"严重一档：**客户拿到的是假的完整答案**。
+
+**链路**：`/cc/v1` 在收到上游第一个 chunk 前就发出了 `200` + `text/event-stream` 响应头。上游读取在 720s 硬上限（§1 更正）或网络中断处被掐断时，错误分支把缓冲事件 flush 给客户端，并由 `generate_final_events` 补齐 `message_delta` / `message_stop`。而 `stop_reason` 取自 `get_stop_reason()`，其兜底是 `end_turn`。
+
+**后果**：客户端收到一个**完整、合法、声称模型自然说完**的 SSE 序列，从外部无法察觉自己只拿到半截答案。而内部 trace 记的是 `interrupted`、`hook.record` 记的是 `error` —— **请求日志与客户看到的现象互相矛盾**。真流式模式下客户端至少能观察到内容突然中止，缓冲模式一次性 flush 把这个线索也抹掉了。
+
+**为什么不能改兜底**：纯 web_search 请求同样没有上游 `stopReason`，却**必须**报 `end_turn`（`stop_reason_web_search_only_stays_end_turn` 锚定）。断流与 web-search-only 在数据上完全同形，只有断流现场知道自己是断的。
+
+**修法**（`e1d3e33`）：`BufferedStreamContext::mark_upstream_interrupted()`，由缓冲错误分支在 flush 前调用。报 `max_tokens` —— 该值在本仓已表示"输出被截断"（`ContentLengthExceededException` 走的就是它），客户端本来就会处理；`end_turn` / `tool_use` 都断言正常收尾。已收到上游 `stopReason` 时不覆盖（`has_stop_reason()`）。
+
+**爆炸半径**：仅缓冲错误分支，真流式未动。两条测试锚定两个方向（断流不得报 `end_turn`、未断流仍报 `end_turn`），拿掉标记验证过前者变红后者仍绿；8 条历史 `stop_reason` 回归全绿。
+
 ## 5. 故障转移与凭据调度
 
 **重试预算**（`provider.rs:702-1151` `call_api_with_retry`）：
@@ -285,6 +301,8 @@ max_retries = (该分组凭据数 × MAX_RETRIES_PER_CREDENTIAL(3)).min(MAX_TOTA
    其中 **`total_attempts=3`** 证明 sink 确实透传进了 MCP 调用链（`call_mcp_with_trace` 记下 3 次凭据重试）。此前本文与 commit message 都写"这层无自动化覆盖、靠类型系统保证"，该说法已被这次验证推翻。
 3. **cache 两套口径不可区分**（§3.1）。修法：响应/trace 里加来源标记（upstream / simulated），前端据此区别展示；根治要比"继续把两种精度塞一个字段"更彻底。
 
+4. ~~**`/cc/v1` 断流谎报 `end_turn`**~~ → **已修**（§4.4，`e1d3e33`）。这条是本清单里唯一**对客**的真实性问题：其余三条是"你看错数字"，这条是"客户拿到假的完整答案"。
+
 **P1 — 可观测性缺口**
 
 4. ~~RPM/TPM 无采集层~~ → **已建**（§6）：`src/anthropic/rate_ring.rs` 120 桶分钟环、入口/上游双口径、`GET /api/admin/stats/rate`、概览页「实时速率」面板。**尚未上生产**，线上镜像 `518dfbd` 不含它。
@@ -326,7 +344,7 @@ max_retries = (该分组凭据数 × MAX_RETRIES_PER_CREDENTIAL(3)).min(MAX_TOTA
 
 10. `get_context_window_size` 硬编码窗口表，漏配即 5 倍误差且无告警（§3.3）。修法：拿上游 `ListAvailableModels` 的 `TokenLimits` 交叉校验，不一致时 warn。
 11. **`/v1` 与 `/cc/v1` 是两份近乎逐行复制的 handler**，维护漂移**已经发生**：`count_image_budget` 只在 `post_messages`（`handlers.rs:614`）调用，`post_messages_cc` 完全没有这段——两个入口行为已不一致（已 grep 证实）。
-12. `/cc/v1` 假流式无硬超时保护（§1）
+12. ~~`/cc/v1` 假流式无硬超时保护~~ → **定性错了**：硬超时存在（720s，§1 更正）。真正的问题是超时**之后**把截断谎报成 `end_turn`，那是对客真实性 bug、**已升级为 P0 并修复**（§4.4，`e1d3e33`）。假流式牺牲 TTFB 本身仍是设计取舍，未改。
 13. `MAX_TOTAL_RETRIES=4` 与大账号池冲突（§5，是权衡不是 bug，但需按实际池子规模校准）
 14. 共享 profileArn 占位符无运行时校验（§2.1）
 
