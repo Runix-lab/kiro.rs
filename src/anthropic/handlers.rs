@@ -1215,6 +1215,12 @@ async fn handle_non_stream_request(
                                     output_tokens = usage.output_tokens,
                                     "收到 metadataEvent.tokenUsage 精确用量"
                                 );
+                                // 诊断探针（只记日志、不改行为）：这份快照即将覆盖
+                                // CacheMeter 的模拟值，先记录它是否可信。见 ANALYSIS.md §3.2。
+                                crate::kiro::model::events::probe_untrusted_token_usage(
+                                    usage,
+                                    cache_usage.cache_covered_est,
+                                );
                                 // 单条 provider 流内是最终快照，重复事件取最后一份。
                                 provider_token_usage = Some(usage);
                             }

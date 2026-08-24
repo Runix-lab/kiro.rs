@@ -3,12 +3,54 @@
 //! Kiro 在 `metadataEvent.tokenUsage` 中返回本次模型调用的精确 token 用量。
 //! 四个字段是单次调用的最终快照，不是增量事件；调用方应在同一条流内保留最后一份快照。
 
+use std::sync::atomic::{AtomicU64, Ordering};
+
 use serde::Deserialize;
 
 use crate::kiro::parser::error::ParseResult;
 use crate::kiro::parser::frame::Frame;
 
 use super::base::EventPayload;
+
+/// 诊断探针计数器：全零 tokenUsage 的累计命中次数。
+static ALL_ZERO_HITS: AtomicU64 = AtomicU64::new(0);
+/// 诊断探针计数器：上游零缓存但本地已算出缓存覆盖的累计命中次数。
+static CACHE_DISCARDED_HITS: AtomicU64 = AtomicU64::new(0);
+
+/// 诊断探针：量化「上游 tokenUsage 不可信」的真实频率。
+///
+/// 背景：`tokenUsage` 一旦是 `Some`，其优先级高于中转层 `CacheMeter` 的模拟值，
+/// 会直接决定最终上报的 input / cache 分项（见 `resolve_non_stream_usage` 与
+/// `StreamContext::resolved_usage`）。但由于全字段 `#[serde(default)]`，上游发来的
+/// 部分 payload 会静默变成零值快照，从而把本地算好的缓存覆盖一起抹掉。
+///
+/// 该函数**只记日志、不改任何行为**，用于先摸清这两种情形在生产中是否真的发生、
+/// 频率多高，再决定是否值得加零值守卫。为避免刷屏，仅在首次与每 100 次时告警。
+/// 频率摸清并做出决策后，本函数及其调用点可整体删除。
+pub fn probe_untrusted_token_usage(usage: TokenUsage, local_cache_covered_est: i32) {
+    if usage.is_all_zero() {
+        let hits = ALL_ZERO_HITS.fetch_add(1, Ordering::Relaxed) + 1;
+        if hits == 1 || hits % 100 == 0 {
+            tracing::warn!(
+                occurrences = hits,
+                "metadataEvent.tokenUsage 四字段全零，与「未下发」不可区分；\
+                 本次用量已退化为本地估算。详见 ANALYSIS.md §3.2"
+            );
+        }
+        return;
+    }
+    if usage.reports_no_cache() && local_cache_covered_est > 0 {
+        let hits = CACHE_DISCARDED_HITS.fetch_add(1, Ordering::Relaxed) + 1;
+        if hits == 1 || hits % 100 == 0 {
+            tracing::warn!(
+                occurrences = hits,
+                local_cache_covered_est,
+                "上游未回报缓存分项，但本地 CacheMeter 已算出缓存覆盖；\
+                 上游零值优先级更高，本地模拟值将被丢弃。详见 ANALYSIS.md §3.2"
+            );
+        }
+    }
+}
 
 /// 单次 Kiro 模型调用的精确 token 用量。
 #[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
@@ -37,6 +79,23 @@ impl TokenUsage {
             cache_read_input_tokens: self.cache_read_input_tokens.max(0),
             cache_write_input_tokens: self.cache_write_input_tokens.max(0),
         }
+    }
+
+    /// 四个字段是否全为零。
+    ///
+    /// 全零快照与「上游未下发 tokenUsage」在语义上**不可区分**：因为每个字段都带
+    /// `#[serde(default)]`，一个只含无关字段的 payload 也会反序列化成全零快照，
+    /// 而 `Option` 仍是 `Some`。调用方据此判断该快照是否值得信任。
+    pub fn is_all_zero(self) -> bool {
+        self.uncached_input_tokens == 0
+            && self.output_tokens == 0
+            && self.cache_read_input_tokens == 0
+            && self.cache_write_input_tokens == 0
+    }
+
+    /// 上游是否完全没有回报缓存分项（读写两个 cache 字段都为零）。
+    pub fn reports_no_cache(self) -> bool {
+        self.cache_read_input_tokens == 0 && self.cache_write_input_tokens == 0
     }
 
     #[cfg(test)]
@@ -130,6 +189,38 @@ mod tests {
                 cache_write_input_tokens: 0,
             })
         );
+    }
+
+    /// 全零快照与「未下发 tokenUsage」在语义上不可区分，调用方必须显式识别。
+    #[test]
+    fn all_zero_snapshot_is_indistinguishable_from_missing() {
+        assert!(TokenUsage::default().is_all_zero());
+        let event: MetadataEvent = serde_json::from_str(r#"{"tokenUsage":{}}"#).unwrap();
+        assert!(event.token_usage.unwrap().is_all_zero());
+    }
+
+    /// 危险情形：部分 payload 不是全零（躲过 `is_all_zero`），但缓存分项确实缺失。
+    /// 此时该快照优先级仍最高，会把本地 CacheMeter 的模拟值一并丢弃。
+    #[test]
+    fn partial_payload_evades_all_zero_check_but_lacks_cache_accounting() {
+        let event: MetadataEvent =
+            serde_json::from_str(r#"{"tokenUsage":{"outputTokens":9}}"#).unwrap();
+        let usage = event.token_usage.unwrap();
+
+        assert!(!usage.is_all_zero(), "有 outputTokens 就不算全零");
+        assert!(usage.reports_no_cache(), "但缓存分项确实缺失");
+    }
+
+    #[test]
+    fn full_snapshot_reports_cache_and_is_not_all_zero() {
+        let usage = TokenUsage {
+            uncached_input_tokens: 101,
+            output_tokens: 23,
+            cache_read_input_tokens: 300,
+            cache_write_input_tokens: 40,
+        };
+        assert!(!usage.is_all_zero());
+        assert!(!usage.reports_no_cache());
     }
 
     #[test]
