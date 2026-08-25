@@ -1712,14 +1712,24 @@ pub async fn billing_export(
                 // "一半空白一半 0.000000"的列——客户会问 0 是免费还是没算。
                 None if discount.is_some() && rec.status != "success" => Some(0.0),
                 None => discount.and_then(|d| {
+                    // 与总账共用同一个历史补偿系数，否则明细和总账会对不上
+                    let scale = chrono::DateTime::parse_from_rfc3339(&rec.ts)
+                        .map(|t| {
+                            crate::common::pricing::historical_token_scale(
+                                &rec.model,
+                                t.timestamp(),
+                            )
+                        })
+                        .unwrap_or(1.0);
+                    let up = |v: u64| if scale == 1.0 { v } else { (v as f64 * scale) as u64 };
                     state
                         .pricing
                         .official_usd(
                             &rec.model,
-                            rec.input_tokens,
+                            up(rec.input_tokens),
                             rec.output_tokens,
-                            rec.cache_creation_tokens,
-                            rec.cache_read_tokens,
+                            up(rec.cache_creation_tokens),
+                            up(rec.cache_read_tokens),
                         )
                         .map(|o| o * d)
                 }),

@@ -101,9 +101,13 @@ const BUILTIN_PRICES: &[(&str, ModelPrice)] = &[
     ("claude-opus-4-6", ModelPrice::standard(5.0, 25.0)),
     ("claude-opus-4-5", ModelPrice::standard(5.0, 25.0)),
     ("claude-opus-4-1", ModelPrice::standard(15.0, 75.0)),
-    // Sonnet 5 现价是introductory $2/$10（有效期至 2026-08-31），list 价 $3/$15。
-    // 用现价：官方价值按实际能拿到的价算，折扣才不会偏乐观。促销结束后改回 3/15，
-    // 或用 config 的 pricing.models 覆盖。
+    // Sonnet 5 = $2/$10。
+    //
+    // ⚠️ 这里曾写着「introductory 价，有效期至 2026-08-31，促销结束后改回 3/15」。
+    // 那句话现在是错的：$2/$10 已转为永久价。**不要照着改回 3/15** —— 按 2026-08
+    // 的量，改回去会让四个客户的账单虚增约 $316（for_O 独占约 $267），而且这种
+    // 虚增在界面上完全看不出来，只会表现为"折扣变好了"。
+    // 改价前先核对厂商官方定价页，不要信这行注释里的历史说法。
     ("claude-sonnet-5", ModelPrice::standard(2.0, 10.0)),
     ("claude-sonnet-4-6", ModelPrice::standard(3.0, 15.0)),
     ("claude-sonnet-4-5", ModelPrice::standard(3.0, 15.0)),
@@ -266,6 +270,50 @@ fn is_date_snapshot(rest: &str) -> bool {
     }
 }
 
+/// opus-5 上下文窗口修复上线的时刻（Unix 秒，2026-08-24T13:16:40Z）。
+///
+/// 这之前生产跑的 v0.7.4 的 `get_context_window_size` 漏配了 `claude-opus-5`，
+/// 它掉进 200_000 兜底而不是 1_000_000。
+const OPUS5_WINDOW_FIX_TS: i64 = 1_787_577_400;
+
+/// 该时段 opus-5 token 计量被压小的倍数。
+///
+/// 理论值 1_000_000/200_000 = 5.0，三条独立实测吻合：
+/// - 同会话跨切换点 262602/52398 = 5.012
+/// - credits/Mtok 阶跃 4.49×（含其它同期变化的稀释）
+/// - `converter.rs` 里修复者自己写的注释："会让该模型的 usage 上报缩小 5 倍"
+const OPUS5_WINDOW_SCALE: f64 = 5.0;
+
+/// 历史 token 计量的补偿系数。
+///
+/// # 为什么需要它
+///
+/// 上游只回报上下文占用百分比，token 数是本地按 `pct × window / 100` 还原的。
+/// 窗口常量配小 5 倍，该模型的 input / 缓存写 / 缓存读**三项全部等比压小**
+/// （`split_against_total` 按总量拆分）。官方牌价因此被算小，折扣看起来虚高
+/// ——实测 opus-5 显示 5.42 折，真实是 ~1.3 折，全部 key 合计少算官方牌价
+/// $1,917~$2,197。
+///
+/// # 边界
+///
+/// 只作用于**修复上线之前**的 `claude-opus-5` 记录。返回 1.0 表示不补偿。
+///
+/// # 日落条款
+///
+/// 这个函数是一次性的历史数据补偿，**不是通用机制**。以后再出窗口配置错误，
+/// 正确做法是修 `get_context_window_size` 并让 `context_window_guard` 提前报警，
+/// 不要往这里加分支——每加一条都是在给账单叠加一层不可审计的乘数。
+pub fn historical_token_scale(model: &str, ts_epoch_secs: i64) -> f64 {
+    if ts_epoch_secs >= OPUS5_WINDOW_FIX_TS {
+        return 1.0;
+    }
+    if normalize_model(model) == "claude-opus-5" {
+        OPUS5_WINDOW_SCALE
+    } else {
+        1.0
+    }
+}
+
 /// 折扣比：实付 ÷ 官方。官方价缺失或为 0 时返回 `None`。
 pub fn discount_ratio(credit_usd: f64, official_usd: Option<f64>) -> Option<f64> {
     match official_usd {
@@ -424,5 +472,45 @@ mod variant_tests {
         assert!(is_variant_of("claude-opus-4-5-thinking", "claude-opus-4-5"));
         assert!(!is_variant_of("claude-opus-4-5-pro", "claude-opus-4-5"));
         assert!(!is_variant_of("claude-opus-4-5-max", "claude-opus-4-5"));
+    }
+}
+
+#[cfg(test)]
+mod historical_scale_tests {
+    use super::*;
+
+    /// 补偿只作用于修复之前的 opus-5，其它模型任何时间都不动。
+    #[test]
+    fn only_opus5_before_the_fix_is_scaled() {
+        let before = OPUS5_WINDOW_FIX_TS - 1;
+        let after = OPUS5_WINDOW_FIX_TS;
+        assert_eq!(historical_token_scale("claude-opus-5", before), 5.0);
+        assert_eq!(historical_token_scale("claude-opus-5", after), 1.0, "修复时刻起不再补偿");
+        // 其它模型窗口配置一直是对的，补偿会变成凭空多收
+        for m in ["claude-opus-4-8", "claude-sonnet-5", "claude-haiku-4.5", "gpt-5.6-sol"] {
+            assert_eq!(historical_token_scale(m, before), 1.0, "{} 不该被补偿", m);
+            assert_eq!(historical_token_scale(m, after), 1.0);
+        }
+    }
+
+    /// 模型名归一化后再判定：点号/横线/日期快照写法都要命中同一档。
+    #[test]
+    fn model_name_variants_resolve_to_the_same_scale() {
+        let before = OPUS5_WINDOW_FIX_TS - 1;
+        assert_eq!(historical_token_scale("claude-opus-5", before), 5.0);
+        assert_eq!(historical_token_scale("CLAUDE-OPUS-5", before), 5.0);
+        // 变体不做补偿：窗口 bug 只影响目录里那个确切的 model id
+        assert_eq!(historical_token_scale("claude-opus-5-thinking", before), 1.0);
+    }
+
+    /// 边界前后各挪一秒都不该改变系数表的形态（区间内无记录，纯防回归）。
+    #[test]
+    fn the_boundary_is_a_hard_cut_not_a_ramp() {
+        for delta in [-2i64, -1, 0, 1, 2] {
+            let ts = OPUS5_WINDOW_FIX_TS + delta;
+            let got = historical_token_scale("claude-opus-5", ts);
+            let want = if delta < 0 { 5.0 } else { 1.0 };
+            assert_eq!(got, want, "ts 偏移 {} 秒时系数应为 {}", delta, want);
+        }
     }
 }

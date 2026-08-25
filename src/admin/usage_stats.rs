@@ -350,15 +350,28 @@ pub fn billing_from_logs(
             acc.upstream_calls += 1;
         }
         if success {
+            // 历史补偿：2026-08-24 窗口修复之前，opus-5 的 token 三项被等比压小
+            // 约 5 倍（详见 pricing::historical_token_scale）。官方牌价由 token
+            // 换算而来，不还原就等于按 1/5 的用量给客户开票。
+            //
+            // 只乘 token 三项：output 不受窗口影响（它不走 contextUsageEvent），
+            // credits 是上游真值更不能动——动了成本就假了。
+            let scale = chrono::DateTime::parse_from_rfc3339(&rec.ts)
+                .map(|t| {
+                    crate::common::pricing::historical_token_scale(&rec.model, t.timestamp())
+                })
+                .unwrap_or(1.0);
+            let up = |v: u64| if scale == 1.0 { v } else { (v as f64 * scale) as u64 };
+
             let m = per_key_model
                 .entry((rec.key_id, rec.model.clone()))
                 .or_default();
             m.calls += 1;
             m.credits += sane_credits(rec.credits);
-            m.input += rec.input_tokens;
+            m.input += up(rec.input_tokens);
             m.output += rec.output_tokens;
-            m.cache_write += rec.cache_creation_tokens;
-            m.cache_read += rec.cache_read_tokens;
+            m.cache_write += up(rec.cache_creation_tokens);
+            m.cache_read += up(rec.cache_read_tokens);
         }
     });
 
@@ -1474,6 +1487,61 @@ mod tests {
         );
         // 单价口径下应收按全部 credits 算（口径统一，导出侧也是这么算的）
         assert!((row.receivable_usd.unwrap() - 10.0 * 0.05).abs() < 1e-9);
+    }
+
+    /// 历史补偿必须只作用于修复之前的 opus-5，且只动 token 不动 credits。
+    /// 乘错模型 = 凭空多收；乘到 credits 上 = 成本变假、毛利全错。
+    #[test]
+    fn historical_compensation_scales_tokens_but_never_credits() {
+        let dir = temp_dir("histscale");
+        let d = dir.as_path();
+        // 2026-08-20 = 窗口修复之前；2026-08-25 = 之后
+        std::fs::write(
+            d.join("usage_log.2026-08-20.jsonl"),
+            concat!(
+                r#"{"ts":"2026-08-20T01:00:00+00:00","keyId":1,"credentialId":2,"model":"claude-opus-5","inputTokens":1000,"outputTokens":100,"cacheCreationTokens":200,"cacheReadTokens":300,"credits":7.0,"status":"success"}"#, "\n",
+                r#"{"ts":"2026-08-20T02:00:00+00:00","keyId":2,"credentialId":2,"model":"claude-sonnet-5","inputTokens":1000,"outputTokens":100,"cacheCreationTokens":200,"cacheReadTokens":300,"credits":7.0,"status":"success"}"#, "\n",
+            ),
+        )
+        .unwrap();
+
+        let pricing = crate::common::pricing::PricingTable::from_config(
+            &crate::common::pricing::PricingConfig::default(),
+        );
+        let (rows, _) = billing_from_logs(
+            d,
+            NaiveDate::from_ymd_opt(2026, 8, 20).unwrap(),
+            NaiveDate::from_ymd_opt(2026, 8, 21).unwrap(),
+            &pricing,
+            &|_| (None, None),
+        );
+
+        let opus = rows.iter().find(|r| r.key_id == 1).unwrap();
+        let sonnet = rows.iter().find(|r| r.key_id == 2).unwrap();
+
+        // credits 是上游真值：两边都不得被放大
+        assert_eq!(opus.credits, 7.0, "credits 被补偿系数污染了，成本会变假");
+        assert_eq!(sonnet.credits, 7.0);
+
+        // 官方牌价按补偿后的 token 算：opus-5 的三项各 ×5，output 不动
+        let expect_opus = pricing
+            .official_usd("claude-opus-5", 5000, 100, 1000, 1500)
+            .unwrap();
+        assert!(
+            (opus.official_usd.unwrap() - expect_opus).abs() < 1e-9,
+            "opus-5 未按 5 倍还原: {:?} vs {}",
+            opus.official_usd,
+            expect_opus
+        );
+
+        // sonnet-5 窗口配置一直是对的，补偿会变成凭空多收
+        let expect_sonnet = pricing
+            .official_usd("claude-sonnet-5", 1000, 100, 200, 300)
+            .unwrap();
+        assert!(
+            (sonnet.official_usd.unwrap() - expect_sonnet).abs() < 1e-9,
+            "sonnet-5 被误补偿了，等于凭空多收"
+        );
     }
 
     /// 损坏的行（负 credits / NaN）不能污染账单，也不能让整个导出失败。
