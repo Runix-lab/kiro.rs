@@ -71,11 +71,19 @@ impl Default for PricingConfig {
     }
 }
 
-/// Claude 家族内置默认牌价（官方 API list 价，2026-08 口径）。
+/// 内置默认牌价（官方 API list 价，2026-08 口径）。
 ///
 /// 前缀匹配：`claude-opus-4-8` 命中 `claude-opus-4-8`，带日期后缀的变体也能命中。
 /// 匹配时取最长前缀，避免 `claude-sonnet-4` 抢走 `claude-sonnet-4-6` 的精确命中。
+///
+/// GPT-5.6 三档（sol/terra/luna 是 OpenAI 官方型号名，Kiro 目录直接沿用）取
+/// developers.openai.com 标准上下文档牌价（2026-08-25 抓取，含 8/22 sol 降价；
+/// 恰好同为 缓存写 1.25×、缓存读 0.1× 输入价）。sol 为促销价（至少到 2026-11-21），
+/// 涨价后可用 `pricing.models` 配置覆盖，无需改代码。长上下文加价档不建模。
 const BUILTIN_PRICES: &[(&str, ModelPrice)] = &[
+    ("gpt-5-6-sol", ModelPrice::standard(4.0, 20.0)),
+    ("gpt-5-6-terra", ModelPrice::standard(2.0, 12.0)),
+    ("gpt-5-6-luna", ModelPrice::standard(0.2, 1.2)),
     ("claude-fable-5", ModelPrice::standard(10.0, 50.0)),
     ("claude-opus-5", ModelPrice::standard(5.0, 25.0)),
     ("claude-opus-4-8", ModelPrice::standard(5.0, 25.0)),
@@ -206,8 +214,19 @@ mod tests {
     #[test]
     fn unknown_model_is_unpriced_not_free() {
         let t = PricingTable::default();
-        assert!(t.price_for("gpt-5.6-terra").is_none());
-        assert!(t.official_usd("gpt-5.6-terra", 1000, 1000, 0, 0).is_none());
+        assert!(t.price_for("deepseek-3.2").is_none());
+        assert!(t.official_usd("deepseek-3.2", 1000, 1000, 0, 0).is_none());
+    }
+
+    #[test]
+    fn gpt56_family_is_priced_via_dot_name_normalization() {
+        let t = PricingTable::default();
+        // Kiro 目录用点号名 gpt-5.6-*，归一化后命中内置 gpt-5-6-* 条目
+        assert_eq!(t.price_for("gpt-5.6-sol").unwrap().input_per_mtok, 4.0);
+        assert_eq!(t.price_for("gpt-5.6-terra").unwrap().output_per_mtok, 12.0);
+        let luna = t.price_for("gpt-5.6-luna").unwrap();
+        assert!((luna.cache_write_per_mtok - 0.25).abs() < 1e-12);
+        assert!((luna.cache_read_per_mtok - 0.02).abs() < 1e-12);
     }
 
     #[test]
@@ -216,7 +235,8 @@ mod tests {
         cfg.models.insert(
             "GPT-5.6-Terra".to_string(),
             ModelPrice {
-                input_per_mtok: 2.0,
+                // 故意偏离内置价（内置 $2），证明配置覆盖赢过内置表
+                input_per_mtok: 9.9,
                 output_per_mtok: 8.0,
                 cache_write_per_mtok: 2.5,
                 cache_read_per_mtok: 0.2,
@@ -227,7 +247,7 @@ mod tests {
             ModelPrice::standard(4.0, 20.0),
         );
         let t = PricingTable::from_config(&cfg);
-        assert_eq!(t.price_for("gpt-5.6-terra").unwrap().input_per_mtok, 2.0);
+        assert_eq!(t.price_for("gpt-5.6-terra").unwrap().input_per_mtok, 9.9);
         assert_eq!(t.price_for("claude-opus-4.8").unwrap().input_per_mtok, 4.0);
     }
 

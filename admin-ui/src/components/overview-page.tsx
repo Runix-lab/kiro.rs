@@ -120,6 +120,11 @@ export function OverviewPage() {
       />
       <RatePanel />
       <TpmPanel timeFilter={filters.timeFilter} statsFilter={filters.statsFilter} />
+      <ModelUsageCard
+        data={modelData}
+        timeText={timeLabel(filters.timeFilter)}
+        groupFilterActive={groupFilterActive}
+      />
       <DistributionPanels
         byCred={credData}
         byModel={modelData}
@@ -596,53 +601,90 @@ function ModelPanel({
           <h2 className="text-base font-semibold tracking-tight">按模型分布</h2>
           <span className="text-[11px] text-muted-foreground">{timeText}</span>
         </div>
-        {groupFilterActive && (
-          <p className="mb-3 rounded-md bg-amber-500/10 px-2.5 py-1.5 text-[11px] text-amber-600">
-            当前已启用「分组筛选」。模型分布暂未细分到分组维度，本卡片显示的是
-            <strong className="mx-0.5">不区分分组</strong>的模型聚合结果。
-          </p>
-        )}
+        {groupFilterActive && <GroupScopeNote />}
         <ModelPieChart data={data} />
-        {data.length > 0 && <ModelTable data={data} />}
       </CardContent>
     </Card>
   )
 }
 
-function ModelTable({ data }: { data: ModelDistribution[] }) {
+function GroupScopeNote() {
   return (
-    <div className="mt-3 max-h-64 overflow-auto text-[12px]">
-      <table className="min-w-[620px] w-full">
-        <thead className="text-muted-foreground">
-          <tr>
-            <th className="text-left font-medium pb-1">模型</th>
-            <th className="text-right font-medium">调用</th>
-            <th className="text-right font-medium">输入</th>
-            <th className="text-right font-medium">输出</th>
-            <th className="text-right font-medium">缓存读</th>
-            <th className="text-right font-medium">Credit</th>
-            <th className="text-right font-medium">实付$</th>
-            <th className="text-right font-medium">官方$</th>
-            <th className="text-right font-medium">折扣</th>
-          </tr>
-        </thead>
-        <tbody>
-          {data.map((m) => (
-            <tr key={m.model} className="border-t border-border/40">
-              <td className="py-1 truncate">{m.model}</td>
-              <td className="text-right tabular-nums">{formatNumber(m.calls)}</td>
-              <td className="text-right tabular-nums">{formatNumber(m.inputTokens)}</td>
-              <td className="text-right tabular-nums">{formatNumber(m.outputTokens)}</td>
-              <td className="text-right tabular-nums">{formatNumber(m.cacheReadTokens)}</td>
-              <td className="text-right tabular-nums">{formatCredits(m.credits)}</td>
-              <td className="text-right tabular-nums">{formatUsd(m.creditUsd)}</td>
-              <td className="text-right tabular-nums">{formatUsd(m.officialUsd)}</td>
-              <td className="text-right tabular-nums">{formatDiscount(m.discountRatio)}</td>
-            </tr>
-          ))}
-        </tbody>
-      </table>
-    </div>
+    <p className="mb-3 rounded-md bg-amber-500/10 px-2.5 py-1.5 text-[11px] text-amber-600">
+      当前已启用「分组筛选」。模型分布暂未细分到分组维度，此处显示的是
+      <strong className="mx-0.5">不区分分组</strong>的模型聚合结果。
+    </p>
+  )
+}
+
+/// 全宽模型用量/成本/折扣明细表——这是运营侧最常看的数字，独占一整行、
+/// 用大一号字，不再挤在饼图卡片的角落里。
+function ModelUsageCard({
+  data,
+  timeText,
+  groupFilterActive,
+}: {
+  data: ModelDistribution[]
+  timeText: string
+  groupFilterActive: boolean
+}) {
+  return (
+    <Card className="mb-6">
+      <CardContent className="p-4 sm:p-5">
+        <div className="mb-3 flex flex-col gap-1 sm:flex-row sm:items-center sm:justify-between">
+          <div>
+            <h2 className="text-base font-semibold tracking-tight">模型用量与折扣</h2>
+            <p className="text-[12px] text-muted-foreground">
+              折扣 = 实付 ÷ 官方牌价 · 未配价模型显示 —
+            </p>
+          </div>
+          <span className="text-[11px] text-muted-foreground">{timeText}</span>
+        </div>
+        {groupFilterActive && <GroupScopeNote />}
+        {data.length === 0 ? (
+          <div className="flex h-24 items-center justify-center text-[13px] text-muted-foreground">
+            窗口内无数据
+          </div>
+        ) : (
+          <div className="max-h-[480px] overflow-auto text-[13px]">
+            <table className="w-full min-w-[860px]">
+              <thead className="sticky top-0 bg-card text-muted-foreground">
+                <tr>
+                  <th className="pb-2 text-left font-medium">模型</th>
+                  <th className="pb-2 text-right font-medium">调用</th>
+                  <th className="pb-2 text-right font-medium">输入</th>
+                  <th className="pb-2 text-right font-medium">输出</th>
+                  <th className="pb-2 text-right font-medium">缓存读</th>
+                  <th className="pb-2 text-right font-medium">缓存写</th>
+                  <th className="pb-2 text-right font-medium">Credit</th>
+                  <th className="pb-2 text-right font-medium">实付$</th>
+                  <th className="pb-2 text-right font-medium">官方$</th>
+                  <th className="pb-2 text-right font-medium">折扣</th>
+                </tr>
+              </thead>
+              <tbody>
+                {data.map((m) => (
+                  <tr key={m.model} className="border-t border-border/40">
+                    <td className="max-w-[260px] truncate py-2 pr-3 font-medium">{m.model}</td>
+                    <td className="py-2 text-right tabular-nums">{formatNumber(m.calls)}</td>
+                    <td className="py-2 text-right tabular-nums">{formatNumber(m.inputTokens)}</td>
+                    <td className="py-2 text-right tabular-nums">{formatNumber(m.outputTokens)}</td>
+                    <td className="py-2 text-right tabular-nums">{formatNumber(m.cacheReadTokens)}</td>
+                    <td className="py-2 text-right tabular-nums">{formatNumber(m.cacheCreationTokens)}</td>
+                    <td className="py-2 text-right tabular-nums">{formatCredits(m.credits)}</td>
+                    <td className="py-2 text-right tabular-nums">{formatUsd(m.creditUsd)}</td>
+                    <td className="py-2 text-right tabular-nums">{formatUsd(m.officialUsd)}</td>
+                    <td className="py-2 text-right font-semibold tabular-nums">
+                      {formatDiscount(m.discountRatio)}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </CardContent>
+    </Card>
   )
 }
 
