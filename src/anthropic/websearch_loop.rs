@@ -90,7 +90,18 @@ struct RoundOutcome {
 
 impl RoundOutcome {
     /// 解析本次 provider 调用的 token 用量；精确 metadata 缺失时只回退本轮。
-    fn resolved_token_usage(&self, fallback_input_tokens: i32) -> TokenUsage {
+    ///
+    /// `cache_usage` 是本次请求按 cache_control 断点估出的缓存覆盖比例。
+    /// 从前这里硬写 `cache_read = 0` / `cache_write = 0`，等于把**整个 prompt
+    /// 都当成新鲜 token 计价**——而新鲜输入的单价是缓存读取的 10 倍。
+    /// 实测 2026-08：走这条路的 gpt-5.6-sol 有 100% 的记录是零缓存，
+    /// 而同一个模型不走这条路时零缓存率是 0.0%。差别不在客户用法，在这段代码。
+    /// 方向上是**我方多收客户的钱**，所以必须修。
+    fn resolved_token_usage(
+        &self,
+        fallback_input_tokens: i32,
+        cache_usage: &super::cache_metering::CacheUsage,
+    ) -> TokenUsage {
         if let Some(usage) = self.provider_token_usage {
             return usage.sanitized();
         }
@@ -108,14 +119,19 @@ impl RoundOutcome {
                 .map(CompletedToolUse::to_anthropic_block),
         );
 
+        let total = self
+            .context_input_tokens
+            .unwrap_or(fallback_input_tokens)
+            .max(0);
+        // 与流式路径同一个拆分函数：无缓存断点时它自然退回 (total, 0, 0)，
+        // 所以这条改动只会让**本来就有缓存**的请求不再被全额按新鲜 token 计价。
+        let (input, creation, read) = cache_usage.split_against_total(total);
+
         TokenUsage {
-            uncached_input_tokens: self
-                .context_input_tokens
-                .unwrap_or(fallback_input_tokens)
-                .max(0),
+            uncached_input_tokens: input,
             output_tokens: token::estimate_output_tokens(&output),
-            cache_read_input_tokens: 0,
-            cache_write_input_tokens: 0,
+            cache_read_input_tokens: read,
+            cache_write_input_tokens: creation,
             // 本地估算的兜底值，不是上游 payload —— present 保持 0。
             ..Default::default()
         }
@@ -378,6 +394,7 @@ async fn run_round(
     tracer: &RequestTracer,
     group: Option<&str>,
     tool_compatibility_mode: ToolCompatibilityMode,
+    cache_usage: &super::cache_metering::CacheUsage,
 ) -> Result<(RoundOutcome, u64), RoundFailure> {
     let conversion = match convert_request_with_mode(payload, tool_compatibility_mode) {
         Ok(c) => c,
@@ -469,7 +486,7 @@ async fn run_round(
     if let Some(error_message) = outcome.stream_error.take() {
         // The stream is partial and cannot re-enter the search loop, but any final metadata
         // snapshot/credits observed before the cut still belong to this real provider call.
-        let token_usage = outcome.resolved_token_usage(fallback_input_tokens);
+        let token_usage = outcome.resolved_token_usage(fallback_input_tokens, &cache_usage);
         return Err(RoundFailure {
             response: (
                 StatusCode::BAD_GATEWAY,
@@ -794,6 +811,7 @@ pub(super) async fn run_web_search_loop(
     stream_client: bool,
     group: Option<String>,
     tool_compatibility_mode: ToolCompatibilityMode,
+    cache_usage: super::cache_metering::CacheUsage,
 ) -> Response {
     let mut presentation: Vec<Value> = Vec::new();
     let mut last_credential_id: u64 = 0;
@@ -818,6 +836,7 @@ pub(super) async fn run_web_search_loop(
                 tracer.as_ref(),
                 group.as_deref(),
                 tool_compatibility_mode,
+                &cache_usage,
             )
             .await
             {
@@ -850,7 +869,9 @@ pub(super) async fn run_web_search_loop(
             };
             last_credential_id = credential_id;
             total_token_usage = total_token_usage
-                .saturating_add(round.resolved_token_usage(round_fallback_input_tokens));
+                .saturating_add(
+                    round.resolved_token_usage(round_fallback_input_tokens, &cache_usage),
+                );
             total_credits += round.credits;
             // 跨 round 保留最近一次 meteringEvent，多 round 时取最后一次
             // (clone 以避免与 empty_tool_result_disposition 后续对 round 的借用冲突)。
@@ -2206,7 +2227,8 @@ mod tests {
             cache_write_input_tokens: 4,
             ..Default::default()
         });
-        let provider_usage = provider_round.resolved_token_usage(888);
+        let cu = crate::anthropic::cache_metering::CacheUsage::default();
+        let provider_usage = provider_round.resolved_token_usage(888, &cu);
         assert_eq!(
             provider_usage,
             TokenUsage {
@@ -2220,7 +2242,7 @@ mod tests {
 
         let mut fallback_round = round_outcome("fallback output", vec![]);
         fallback_round.context_input_tokens = Some(20);
-        let fallback_usage = fallback_round.resolved_token_usage(500);
+        let fallback_usage = fallback_round.resolved_token_usage(500, &cu);
         assert_eq!(fallback_usage.uncached_input_tokens, 20);
         assert_eq!(fallback_usage.cache_write_input_tokens, 0);
         assert_eq!(fallback_usage.cache_read_input_tokens, 0);
@@ -2424,5 +2446,44 @@ mod tests {
         assert!(usage.get("credit_usage").is_none());
         assert!(usage.get("credit_unit").is_none());
         assert!(usage.get("credit_unit_plural").is_none());
+    }
+
+    /// 兜底路径从前硬写 cache_read/write = 0，把整个 prompt 按新鲜 token 计价
+    /// （单价是缓存读的 10 倍）。实测 2026-08 走这条路的 gpt-5.6-sol 有 100%
+    /// 的记录零缓存，同模型不走这条路时是 0.0% —— 差别在代码不在客户用法。
+    /// 方向是我方多收客户的钱，所以有缓存断点时必须按比例拆开。
+    #[test]
+    fn websearch_fallback_no_longer_bills_cached_prompt_as_fresh() {
+        use crate::anthropic::cache_metering::CacheUsage;
+        let mut round = round_outcome("", vec![]);
+        round.context_input_tokens = Some(10_000);
+
+        // 无缓存断点：退回全额新鲜输入（与从前一致，这条改动不影响它）
+        let none = CacheUsage::default();
+        let u = round.resolved_token_usage(0, &none);
+        assert_eq!(u.uncached_input_tokens, 10_000);
+        assert_eq!(u.cache_read_input_tokens, 0);
+
+        // 八成命中缓存：必须拆出来，不能整块按新鲜 token 计价
+        let cached = CacheUsage {
+            prompt_total_est: 10_000,
+            cache_covered_est: 8_000,
+            cache_read: 8_000,
+            ..Default::default()
+        };
+        let u = round.resolved_token_usage(0, &cached);
+        assert_eq!(
+            u.uncached_input_tokens + u.cache_read_input_tokens + u.cache_write_input_tokens,
+            10_000,
+            "三项之和必须守恒，否则总量凭空变了"
+        );
+        assert!(
+            u.cache_read_input_tokens > 0,
+            "有缓存断点却仍按零缓存计价 —— 这正是多收客户钱的那个 bug"
+        );
+        assert!(
+            u.uncached_input_tokens < 10_000,
+            "新鲜 token 应当少于总量"
+        );
     }
 }

@@ -800,6 +800,16 @@ pub async fn post_messages(
                 is_stream: payload_stream,
             },
         ));
+        // 缓存覆盖比例必须在进 websearch 分支前算好：这条路的兜底从前硬写
+        // cache_read/write = 0，把整个 prompt 当新鲜 token 计价（单价是缓存读的
+        // 10 倍），方向上是我方多收客户的钱。
+        let cache_usage = state
+            .cache_meter
+            .as_ref()
+            .map(|cache| {
+                super::cache_metering::compute_cache_usage(cache, &payload, key_ctx.key_id)
+            })
+            .unwrap_or_default();
         return super::websearch_loop::run_web_search_loop(
             provider,
             payload,
@@ -808,6 +818,7 @@ pub async fn post_messages(
             payload_stream,
             key_ctx.group.clone(),
             state.tool_compatibility_mode,
+            cache_usage,
         )
         .await;
     }
@@ -1747,6 +1758,16 @@ pub async fn post_messages_cc(
                 is_stream: payload_stream,
             },
         ));
+        // 缓存覆盖比例必须在进 websearch 分支前算好：这条路的兜底从前硬写
+        // cache_read/write = 0，把整个 prompt 当新鲜 token 计价（单价是缓存读的
+        // 10 倍），方向上是我方多收客户的钱。
+        let cache_usage = state
+            .cache_meter
+            .as_ref()
+            .map(|cache| {
+                super::cache_metering::compute_cache_usage(cache, &payload, key_ctx.key_id)
+            })
+            .unwrap_or_default();
         return super::websearch_loop::run_web_search_loop(
             provider,
             payload,
@@ -1755,6 +1776,7 @@ pub async fn post_messages_cc(
             payload_stream,
             key_ctx.group.clone(),
             state.tool_compatibility_mode,
+            cache_usage,
         )
         .await;
     }
