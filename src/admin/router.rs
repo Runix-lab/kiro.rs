@@ -28,8 +28,8 @@ use super::{
         set_log_governance_config, set_proxy_enabled, set_self_heal_config, set_update_config,
         start_idc_login, start_idc_relogin, start_social_login, start_social_relogin,
         stats_by_credential, stats_by_model, stats_overview, stats_rate, stats_timeseries,
-        test_model, trace_failure_stats, update_admin_key, update_client_key, update_credential,
-        update_group, update_refresh_token,
+        stats_tpm, test_model, trace_failure_stats, traces_summary, update_admin_key,
+        update_client_key, update_credential, update_group, update_refresh_token,
     },
     middleware::{AdminState, admin_auth_middleware},
 };
@@ -185,7 +185,9 @@ pub fn create_admin_router(state: AdminState) -> Router {
         .route("/stats/timeseries", get(stats_timeseries))
         .route("/stats/by-model", get(stats_by_model))
         .route("/stats/by-credential", get(stats_by_credential))
+        .route("/stats/tpm", get(stats_tpm))
         .route("/traces/failure-stats", get(trace_failure_stats))
+        .route("/traces/summary", get(traces_summary))
         .route("/traces", get(list_traces))
         .layer(middleware::from_fn_with_state(
             state.clone(),

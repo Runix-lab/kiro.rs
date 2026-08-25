@@ -303,6 +303,11 @@ pub struct TimeSeriesPoint {
     pub calls: u64,
     pub errors: u64,
     pub credits: f64,
+    /// 实付成本：credits × creditUsdRate。
+    pub credit_usd: f64,
+    /// 官方牌价成本（仅已配价模型计入）。`None` 表示该桶无法按模型拆分
+    /// （分组筛选路径没有 凭据×模型 维度）或桶内没有任何已配价模型。
+    pub official_usd: Option<f64>,
 }
 
 /// 模型分布
@@ -313,6 +318,16 @@ pub struct ModelDistribution {
     pub calls: u64,
     pub input_tokens: u64,
     pub output_tokens: u64,
+    pub cache_creation_tokens: u64,
+    pub cache_read_tokens: u64,
+    pub errors: u64,
+    pub credits: f64,
+    /// 实付成本：credits × creditUsdRate。
+    pub credit_usd: f64,
+    /// 官方牌价成本。`None` = 该模型未配价（≠ 免费）。
+    pub official_usd: Option<f64>,
+    /// 折扣比 = 实付 ÷ 官方（0.14 即 1.4 折）。未配价时为 `None`。
+    pub discount_ratio: Option<f64>,
 }
 
 /// 上游凭据分布
@@ -323,7 +338,12 @@ pub struct CredentialDistribution {
     pub calls: u64,
     pub input_tokens: u64,
     pub output_tokens: u64,
+    pub cache_creation_tokens: u64,
+    pub cache_read_tokens: u64,
     pub errors: u64,
+    pub credits: f64,
+    /// 实付成本：credits × creditUsdRate。
+    pub credit_usd: f64,
 }
 
 /// 概览：今日 + 累计
@@ -436,6 +456,7 @@ impl UsageAggregator {
         window: StatsQueryWindow,
         key_id: Option<u64>,
         cred_filter: Option<&std::collections::HashSet<u64>>,
+        pricing: &crate::common::pricing::PricingTable,
     ) -> Vec<TimeSeriesPoint> {
         let inner = self.inner.read();
         let buckets = select_buckets(&inner, window.granularity);
@@ -460,6 +481,12 @@ impl UsageAggregator {
                         })
                         .unwrap_or_default(),
                 };
+                // 官方口径成本要按模型逐项算（各模型单价不同），只有非分组路径
+                // 才有 模型 维度可用；分组筛选路径没有 凭据×模型 数据，标 None。
+                let official_usd = match cred_filter {
+                    None => sum_official_usd(model_group_for_key(b, key_id), pricing),
+                    Some(_) => None,
+                };
                 TimeSeriesPoint {
                     ts: ts_to_rfc3339(b.ts),
                     input_tokens: stats.input_tokens,
@@ -469,6 +496,8 @@ impl UsageAggregator {
                     calls: stats.calls,
                     errors: stats.errors,
                     credits: stats.credits,
+                    credit_usd: pricing.credit_usd(stats.credits),
+                    official_usd,
                 }
             })
             .collect();
@@ -481,6 +510,7 @@ impl UsageAggregator {
         &self,
         window: StatsQueryWindow,
         key_id: Option<u64>,
+        pricing: &crate::common::pricing::PricingTable,
     ) -> Vec<ModelDistribution> {
         let inner = self.inner.read();
         let buckets = select_buckets(&inner, window.granularity);
@@ -490,19 +520,36 @@ impl UsageAggregator {
                 continue;
             };
             for (model, stats) in group {
-                let entry = acc.entry(model.clone()).or_default();
-                entry.input_tokens += stats.input_tokens;
-                entry.output_tokens += stats.output_tokens;
-                entry.calls += stats.calls;
+                acc.entry(model.clone()).or_default().add_stats(stats);
             }
         }
         let mut out: Vec<ModelDistribution> = acc
             .into_iter()
-            .map(|(model, stats)| ModelDistribution {
-                model,
-                calls: stats.calls,
-                input_tokens: stats.input_tokens,
-                output_tokens: stats.output_tokens,
+            .map(|(model, stats)| {
+                let credit_usd = pricing.credit_usd(stats.credits);
+                let official_usd = pricing.official_usd(
+                    &model,
+                    stats.input_tokens,
+                    stats.output_tokens,
+                    stats.cache_creation_tokens,
+                    stats.cache_read_tokens,
+                );
+                ModelDistribution {
+                    calls: stats.calls,
+                    input_tokens: stats.input_tokens,
+                    output_tokens: stats.output_tokens,
+                    cache_creation_tokens: stats.cache_creation_tokens,
+                    cache_read_tokens: stats.cache_read_tokens,
+                    errors: stats.errors,
+                    credits: stats.credits,
+                    credit_usd,
+                    official_usd,
+                    discount_ratio: crate::common::pricing::discount_ratio(
+                        credit_usd,
+                        official_usd,
+                    ),
+                    model,
+                }
             })
             .collect();
         out.sort_by(|a, b| b.calls.cmp(&a.calls));
@@ -515,6 +562,7 @@ impl UsageAggregator {
         window: StatsQueryWindow,
         key_id: Option<u64>,
         cred_filter: Option<&std::collections::HashSet<u64>>,
+        pricing: &crate::common::pricing::PricingTable,
     ) -> Vec<CredentialDistribution> {
         let inner = self.inner.read();
         let buckets = select_buckets(&inner, window.granularity);
@@ -529,11 +577,7 @@ impl UsageAggregator {
                         continue;
                     }
                 }
-                let entry = acc.entry(*id).or_default();
-                entry.input_tokens += stats.input_tokens;
-                entry.output_tokens += stats.output_tokens;
-                entry.calls += stats.calls;
-                entry.errors += stats.errors;
+                acc.entry(*id).or_default().add_stats(stats);
             }
         }
         let mut out: Vec<CredentialDistribution> = acc
@@ -543,7 +587,11 @@ impl UsageAggregator {
                 calls: stats.calls,
                 input_tokens: stats.input_tokens,
                 output_tokens: stats.output_tokens,
+                cache_creation_tokens: stats.cache_creation_tokens,
+                cache_read_tokens: stats.cache_read_tokens,
                 errors: stats.errors,
+                credits: stats.credits,
+                credit_usd: pricing.credit_usd(stats.credits),
             })
             .collect();
         out.sort_by(|a, b| b.calls.cmp(&a.calls));
@@ -680,6 +728,32 @@ fn model_group_for_key(
     }
 }
 
+/// 把一个 模型→用量 分组按官方牌价折成美金后求和。
+///
+/// 只累计已配价模型；分组缺失或没有任何已配价模型时返回 `None`——
+/// 「无法计价」必须与「$0」区分开，否则未配价模型会把折扣显示成免费。
+fn sum_official_usd(
+    group: Option<&HashMap<String, BucketStats>>,
+    pricing: &crate::common::pricing::PricingTable,
+) -> Option<f64> {
+    let group = group?;
+    let mut sum = 0.0;
+    let mut priced_any = false;
+    for (model, stats) in group {
+        if let Some(usd) = pricing.official_usd(
+            model,
+            stats.input_tokens,
+            stats.output_tokens,
+            stats.cache_creation_tokens,
+            stats.cache_read_tokens,
+        ) {
+            sum += usd;
+            priced_any = true;
+        }
+    }
+    priced_any.then_some(sum)
+}
+
 fn bucket_in_window(bucket: &BucketEntry, window: StatsQueryWindow) -> bool {
     bucket.ts >= window.start_ts && bucket.ts < window.end_ts
 }
@@ -742,15 +816,16 @@ mod tests {
         assert_eq!(ov.today_input_tokens, 2000);
 
         let window = StatsQueryWindow::preset(Range::Last24h, StatsGranularity::Hour);
-        let series = agg.query_timeseries(window, None, None);
+        let pricing = crate::common::pricing::PricingTable::default();
+        let series = agg.query_timeseries(window, None, None, &pricing);
         assert!(!series.is_empty());
 
-        let by_model = agg.query_by_model(window, None);
+        let by_model = agg.query_by_model(window, None, &pricing);
         assert_eq!(by_model.len(), 1);
         assert_eq!(by_model[0].model, "claude-opus-4-7");
         assert_eq!(by_model[0].calls, 2);
 
-        let by_cred = agg.query_by_credential(window, None, None);
+        let by_cred = agg.query_by_credential(window, None, None, &pricing);
         assert_eq!(by_cred.len(), 1);
         assert_eq!(by_cred[0].credential_id, 5);
     }
@@ -789,15 +864,16 @@ mod tests {
         agg.ingest(&rec_b);
 
         let window = StatsQueryWindow::preset(Range::Last24h, StatsGranularity::Hour);
-        let series = agg.query_timeseries(window, Some(1), None);
+        let pricing = crate::common::pricing::PricingTable::default();
+        let series = agg.query_timeseries(window, Some(1), None, &pricing);
         assert_eq!(series.iter().map(|p| p.calls).sum::<u64>(), 1);
         assert_eq!(series.iter().map(|p| p.input_tokens).sum::<u64>(), 100);
 
-        let by_model = agg.query_by_model(window, Some(1));
+        let by_model = agg.query_by_model(window, Some(1), &pricing);
         assert_eq!(by_model.len(), 1);
         assert_eq!(by_model[0].model, "m-a");
 
-        let by_cred = agg.query_by_credential(window, Some(1), None);
+        let by_cred = agg.query_by_credential(window, Some(1), None, &pricing);
         assert_eq!(by_cred.len(), 1);
         assert_eq!(by_cred[0].credential_id, 5);
     }
@@ -876,11 +952,12 @@ mod tests {
             granularity: StatsGranularity::Day,
         };
 
-        let hourly = agg.query_timeseries(hour_window, None, None);
+        let pricing = crate::common::pricing::PricingTable::default();
+        let hourly = agg.query_timeseries(hour_window, None, None, &pricing);
         assert_eq!(hourly.iter().map(|p| p.calls).sum::<u64>(), 1);
         assert_eq!(hourly.iter().map(|p| p.input_tokens).sum::<u64>(), 300);
 
-        let daily = agg.query_timeseries(day_window, None, None);
+        let daily = agg.query_timeseries(day_window, None, None, &pricing);
         assert_eq!(daily.iter().map(|p| p.calls).sum::<u64>(), 1);
         assert_eq!(daily.iter().map(|p| p.output_tokens).sum::<u64>(), 40);
     }

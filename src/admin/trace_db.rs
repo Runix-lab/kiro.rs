@@ -187,10 +187,54 @@ pub struct TraceQuery {
     /// 按账号分组筛选：只返回最终凭据属于这些 id 的 trace。
     /// 由 handler 层在查询前根据 group 参数转换为凭据 id 白名单填入。
     pub credential_ids: Option<Vec<u64>>,
+    /// 时间窗口下界（Unix 秒，含）。走 `idx_traces_ts` 的范围扫描。
+    pub start_ts: Option<i64>,
+    /// 时间窗口上界（Unix 秒，不含）。
+    pub end_ts: Option<i64>,
     /// 返回条数上限
     pub limit: usize,
     /// 偏移量（分页用）
     pub offset: usize,
+}
+
+/// TPM 统计的聚合维度。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TpmDim {
+    /// 按入口客户端 Key（`key_id`）
+    Key,
+    /// 按最终命中的上游凭据（`final_credential_id`）
+    Credential,
+}
+
+/// 单实体（Key 或凭据）的分钟级速率统计。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TpmEntityStats {
+    pub entity_id: u64,
+    /// 窗口内单分钟最大 token 消耗（全口径，含缓存读）——实测承载峰值。
+    pub peak_tpm_total: u64,
+    /// 同上，计费口径（不含缓存读）。
+    pub peak_tpm_billable: u64,
+    /// 窗口内单分钟最大完成请求数。
+    pub peak_rpm: u64,
+    /// 有流量的分钟数。
+    pub active_minutes: u64,
+    /// 活跃分钟的平均 TPM（全口径）。
+    pub avg_tpm_active: u64,
+    pub total_tokens: u64,
+    pub total_calls: u64,
+}
+
+/// 单模型的用量汇总行（`summarize_by_model` 的结果）。
+#[derive(Debug, Clone, PartialEq)]
+pub struct TraceModelSummary {
+    pub model: String,
+    pub calls: u64,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cache_creation_tokens: u64,
+    pub cache_read_tokens: u64,
+    pub credits: f64,
+    pub errors: u64,
 }
 
 /// SQLite 持久化存储
@@ -402,6 +446,107 @@ impl TraceStore {
         self.query_paged(q).0
     }
 
+    /// 按模型汇总当前过滤条件下的用量（`limit`/`offset` 不参与）。
+    ///
+    /// 给「请求日志」页的汇总条用：与列表同一套 WHERE，筛选联动不会出现
+    /// 列表和汇总口径不一致的情况。USD 换算刻意留在 handler 层做——本模块
+    /// 不感知计价表。
+    pub fn summarize_by_model(&self, q: &TraceQuery) -> Vec<TraceModelSummary> {
+        let conn = self.conn.lock();
+        let (where_sql, params) = Self::build_where(q);
+        let param_refs: Vec<&dyn rusqlite::ToSql> = params.iter().map(|b| b.as_ref()).collect();
+        let sql = format!(
+            "SELECT model, COUNT(*), SUM(input_tokens), SUM(output_tokens), \
+             SUM(cache_creation_tokens), SUM(cache_read_tokens), SUM(credits), \
+             SUM(CASE WHEN final_status != 'success' THEN 1 ELSE 0 END) \
+             FROM traces {} GROUP BY model ORDER BY COUNT(*) DESC",
+            where_sql
+        );
+        let run = || -> rusqlite::Result<Vec<TraceModelSummary>> {
+            let mut stmt = conn.prepare(&sql)?;
+            let rows = stmt.query_map(param_refs.as_slice(), |row| {
+                Ok(TraceModelSummary {
+                    model: row.get(0)?,
+                    calls: row.get::<_, i64>(1)? as u64,
+                    input_tokens: row.get::<_, Option<i64>>(2)?.unwrap_or(0) as u64,
+                    output_tokens: row.get::<_, Option<i64>>(3)?.unwrap_or(0) as u64,
+                    cache_creation_tokens: row.get::<_, Option<i64>>(4)?.unwrap_or(0) as u64,
+                    cache_read_tokens: row.get::<_, Option<i64>>(5)?.unwrap_or(0) as u64,
+                    credits: row.get::<_, Option<f64>>(6)?.unwrap_or(0.0),
+                    errors: row.get::<_, Option<i64>>(7)?.unwrap_or(0) as u64,
+                })
+            })?;
+            rows.collect()
+        };
+        match run() {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!("trace 汇总查询失败: {}", e);
+                Vec::new()
+            }
+        }
+    }
+
+    /// 按维度（入口 Key / 最终凭据）统计分钟级 TPM/RPM。
+    ///
+    /// 旁路统计查询：内层按 (实体, 分钟) 聚合、外层取每实体的峰值与均值，
+    /// 一条 SQL 完成。token 记在请求**结束**的那一分钟（trace 落库时刻），
+    /// 长流式请求的产出会整体计入完成分钟——作为承载/峰值参考够用，
+    /// 不做进一步按时长摊薄。
+    ///
+    /// 「峰值 TPM」即该实体历史上单分钟消耗的最大 token 量，是"这个账号/Key
+    /// 实际承载过多少"的直接证据；配合窗口筛选可以看不同时期的承载水平。
+    pub fn tpm_stats(&self, dim: TpmDim, q: &TraceQuery) -> Vec<TpmEntityStats> {
+        let conn = self.conn.lock();
+        let (where_sql, params) = Self::build_where(q);
+        let param_refs: Vec<&dyn rusqlite::ToSql> = params.iter().map(|b| b.as_ref()).collect();
+        let entity_col = match dim {
+            TpmDim::Key => "key_id",
+            TpmDim::Credential => "final_credential_id",
+        };
+        let sql = format!(
+            "SELECT entity, MAX(total_tok), MAX(billable_tok), MAX(calls), \
+             COUNT(*), SUM(total_tok), SUM(calls) FROM ( \
+               SELECT {entity} AS entity, ts_epoch / 60 AS minute, \
+                 SUM(input_tokens + output_tokens + cache_creation_tokens + cache_read_tokens) AS total_tok, \
+                 SUM(input_tokens + output_tokens + cache_creation_tokens) AS billable_tok, \
+                 COUNT(*) AS calls \
+               FROM traces {where_sql} GROUP BY entity, minute \
+             ) GROUP BY entity ORDER BY MAX(total_tok) DESC",
+            entity = entity_col,
+            where_sql = where_sql
+        );
+        let run = || -> rusqlite::Result<Vec<TpmEntityStats>> {
+            let mut stmt = conn.prepare(&sql)?;
+            let rows = stmt.query_map(param_refs.as_slice(), |row| {
+                let active_minutes = row.get::<_, i64>(4)?.max(0) as u64;
+                let sum_total = row.get::<_, Option<i64>>(5)?.unwrap_or(0) as u64;
+                Ok(TpmEntityStats {
+                    entity_id: row.get::<_, i64>(0)? as u64,
+                    peak_tpm_total: row.get::<_, Option<i64>>(1)?.unwrap_or(0) as u64,
+                    peak_tpm_billable: row.get::<_, Option<i64>>(2)?.unwrap_or(0) as u64,
+                    peak_rpm: row.get::<_, Option<i64>>(3)?.unwrap_or(0) as u64,
+                    active_minutes,
+                    avg_tpm_active: if active_minutes > 0 {
+                        sum_total / active_minutes
+                    } else {
+                        0
+                    },
+                    total_tokens: sum_total,
+                    total_calls: row.get::<_, Option<i64>>(6)?.unwrap_or(0) as u64,
+                })
+            })?;
+            rows.collect()
+        };
+        match run() {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!("TPM 统计查询失败: {}", e);
+                Vec::new()
+            }
+        }
+    }
+
     /// 把 [`TraceQuery`] 的过滤条件拼成 WHERE 子句 + 参数（值全部参数化绑定）
     fn build_where(q: &TraceQuery) -> (String, Vec<Box<dyn rusqlite::ToSql>>) {
         let mut clauses: Vec<String> = Vec::new();
@@ -450,6 +595,14 @@ impl TraceStore {
                     params.push(Box::new(*id as i64));
                 }
             }
+        }
+        if let Some(ts) = q.start_ts {
+            clauses.push("ts_epoch >= ?".to_string());
+            params.push(Box::new(ts));
+        }
+        if let Some(ts) = q.end_ts {
+            clauses.push("ts_epoch < ?".to_string());
+            params.push(Box::new(ts));
         }
         if q.only_failed {
             clauses.push("final_status != 'success'".to_string());
@@ -787,6 +940,181 @@ mod tests {
             enabled: AtomicBool::new(true),
             retention_days: AtomicU64::new(DEFAULT_RETENTION_DAYS),
         }
+    }
+
+    /// 聚合类测试用：可控时间戳/归属/用量的最小记录。
+    struct UsageSample<'a> {
+        trace_id: &'a str,
+        ts: &'a str,
+        key_id: u64,
+        credential_id: u64,
+        model: &'a str,
+        status: &'a str,
+        input: u64,
+        output: u64,
+        cache_read: u64,
+        credits: f64,
+    }
+
+    fn usage_record(s: UsageSample<'_>) -> TraceRecord {
+        TraceRecord {
+            trace_id: s.trace_id.to_string(),
+            ts: s.ts.to_string(),
+            key_id: s.key_id,
+            key_source: TraceKeySource::ClientKey,
+            model: s.model.to_string(),
+            is_stream: false,
+            final_status: s.status.to_string(),
+            final_credential_id: s.credential_id,
+            error_type: None,
+            error_message: None,
+            total_attempts: 1,
+            duration_ms: 10,
+            interrupted_after_bytes: None,
+            input_tokens: s.input,
+            output_tokens: s.output,
+            cache_creation_tokens: 0,
+            cache_read_tokens: s.cache_read,
+            credits: s.credits,
+            first_token_ms: None,
+            attempts: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn time_window_filters_by_ts_epoch_half_open() {
+        let store = mem_store();
+        for (id, ts) in [
+            ("w1", "2026-08-20T00:00:00Z"),
+            ("w2", "2026-08-21T00:00:00Z"),
+            ("w3", "2026-08-22T00:00:00Z"),
+        ] {
+            store.insert(&usage_record(UsageSample {
+                trace_id: id,
+                ts,
+                key_id: 1,
+                credential_id: 1,
+                model: "m",
+                status: "success",
+                input: 1,
+                output: 1,
+                cache_read: 0,
+                credits: 0.0,
+            }));
+        }
+        let t = |s: &str| {
+            chrono::DateTime::parse_from_rfc3339(s)
+                .unwrap()
+                .timestamp()
+        };
+        let got = store.query(&TraceQuery {
+            start_ts: Some(t("2026-08-21T00:00:00Z")),
+            end_ts: Some(t("2026-08-22T00:00:00Z")),
+            ..Default::default()
+        });
+        assert_eq!(got.len(), 1, "窗口是 [start, end) 半开区间");
+        assert_eq!(got[0].trace_id, "w2");
+    }
+
+    #[test]
+    fn summarize_by_model_sums_under_the_same_where() {
+        let store = mem_store();
+        let rows = [
+            ("s1", 1, "model-a", "success", 100, 10, 1000, 0.5),
+            ("s2", 1, "model-a", "error", 200, 20, 0, 0.25),
+            ("s3", 2, "model-b", "success", 50, 5, 0, 0.1),
+        ];
+        for (id, key, model, status, input, output, cache_read, credits) in rows {
+            store.insert(&usage_record(UsageSample {
+                trace_id: id,
+                ts: "2026-08-21T08:00:00Z",
+                key_id: key,
+                credential_id: 1,
+                model,
+                status,
+                input,
+                output,
+                cache_read,
+                credits,
+            }));
+        }
+        let all = store.summarize_by_model(&TraceQuery::default());
+        assert_eq!(all.len(), 2);
+        let a = all.iter().find(|r| r.model == "model-a").unwrap();
+        assert_eq!(a.calls, 2);
+        assert_eq!(a.input_tokens, 300);
+        assert_eq!(a.cache_read_tokens, 1000);
+        assert_eq!(a.errors, 1);
+        assert!((a.credits - 0.75).abs() < 1e-9);
+
+        // key 过滤与列表同一套 WHERE：key=2 只剩 model-b
+        let filtered = store.summarize_by_model(&TraceQuery {
+            key_id: Some(2),
+            ..Default::default()
+        });
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].model, "model-b");
+    }
+
+    #[test]
+    fn tpm_stats_takes_per_minute_peak_not_window_sum() {
+        let store = mem_store();
+        // key 1：同一分钟两笔（应相加成峰值），另一分钟一小笔
+        let rows = [
+            ("p1", "2026-08-21T08:00:10Z", 6000),
+            ("p2", "2026-08-21T08:00:50Z", 4000),
+            ("p3", "2026-08-21T08:05:00Z", 1000),
+        ];
+        for (id, ts, input) in rows {
+            store.insert(&usage_record(UsageSample {
+                trace_id: id,
+                ts,
+                key_id: 1,
+                credential_id: 7,
+                model: "m",
+                status: "success",
+                input,
+                output: 0,
+                cache_read: 0,
+                credits: 0.0,
+            }));
+        }
+        let stats = store.tpm_stats(TpmDim::Key, &TraceQuery::default());
+        assert_eq!(stats.len(), 1);
+        let s = &stats[0];
+        assert_eq!(s.entity_id, 1);
+        assert_eq!(s.peak_tpm_total, 10_000, "峰值 = 单分钟内求和，不是窗口总量");
+        assert_eq!(s.peak_rpm, 2);
+        assert_eq!(s.active_minutes, 2);
+        assert_eq!(s.avg_tpm_active, 5_500);
+        assert_eq!(s.total_tokens, 11_000);
+        assert_eq!(s.total_calls, 3);
+
+        // 凭据维度：同一批数据归到凭据 7 名下
+        let cred = store.tpm_stats(TpmDim::Credential, &TraceQuery::default());
+        assert_eq!(cred.len(), 1);
+        assert_eq!(cred[0].entity_id, 7);
+        assert_eq!(cred[0].peak_tpm_total, 10_000);
+    }
+
+    #[test]
+    fn tpm_billable_excludes_cache_read() {
+        let store = mem_store();
+        store.insert(&usage_record(UsageSample {
+            trace_id: "b1",
+            ts: "2026-08-21T08:00:00Z",
+            key_id: 1,
+            credential_id: 1,
+            model: "m",
+            status: "success",
+            input: 100,
+            output: 50,
+            cache_read: 9000,
+            credits: 0.0,
+        }));
+        let stats = store.tpm_stats(TpmDim::Key, &TraceQuery::default());
+        assert_eq!(stats[0].peak_tpm_total, 9150);
+        assert_eq!(stats[0].peak_tpm_billable, 150);
     }
 
     #[test]

@@ -1258,9 +1258,10 @@ pub async fn stats_timeseries(
     };
     let group = parse_group_filter(&params);
     let cred_ids = group_to_cred_ids(&state, group.as_deref());
-    let points = state
-        .usage_aggregator
-        .query_timeseries(window, key_id, cred_ids.as_ref());
+    let points =
+        state
+            .usage_aggregator
+            .query_timeseries(window, key_id, cred_ids.as_ref(), &state.pricing);
     Json(points).into_response()
 }
 
@@ -1273,7 +1274,9 @@ pub async fn stats_by_model(
         Ok(parts) => parts,
         Err(message) => return stats_bad_request(message),
     };
-    let data = state.usage_aggregator.query_by_model(window, key_id);
+    let data = state
+        .usage_aggregator
+        .query_by_model(window, key_id, &state.pricing);
     Json(data).into_response()
 }
 
@@ -1303,9 +1306,10 @@ pub async fn stats_by_credential(
             .map(|c| c.id)
             .collect()
     });
-    let data = state
-        .usage_aggregator
-        .query_by_credential(window, key_id, cred_ids.as_ref());
+    let data =
+        state
+            .usage_aggregator
+            .query_by_credential(window, key_id, cred_ids.as_ref(), &state.pricing);
     let enriched: Vec<serde_json::Value> = data
         .into_iter()
         .map(|d| {
@@ -1316,7 +1320,11 @@ pub async fn stats_by_credential(
                 "calls": d.calls,
                 "inputTokens": d.input_tokens,
                 "outputTokens": d.output_tokens,
+                "cacheCreationTokens": d.cache_creation_tokens,
+                "cacheReadTokens": d.cache_read_tokens,
                 "errors": d.errors,
+                "credits": d.credits,
+                "creditUsd": d.credit_usd,
             })
         })
         .collect();
@@ -1330,48 +1338,15 @@ pub async fn stats_by_credential(
 pub async fn list_traces(
     State(state): State<AdminState>,
     Query(params): Query<std::collections::HashMap<String, String>>,
-) -> impl IntoResponse {
+) -> axum::response::Response {
     // 解析分组筛选：把 group 名转为凭据 id 白名单（先于查询执行，避免分页错位）
     let group = params
         .get("group")
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty());
-    let credential_ids: Option<Vec<u64>> = group.as_ref().map(|g| {
-        state
-            .service
-            .get_all_credentials()
-            .credentials
-            .iter()
-            .filter(|c| c.groups.iter().any(|cg| cg == g))
-            .map(|c| c.id)
-            .collect()
-    });
-
-    let query = TraceQuery {
-        status: params.get("status").filter(|s| !s.is_empty()).cloned(),
-        error_type: params.get("errorType").filter(|s| !s.is_empty()).cloned(),
-        credential_id: params
-            .get("credentialId")
-            .and_then(|s| s.parse::<u64>().ok()),
-        key_id: params.get("keyId").and_then(|s| s.parse::<u64>().ok()),
-        failed_attempt_credential_id: params
-            .get("failedAttemptCredentialId")
-            .and_then(|s| s.parse::<u64>().ok()),
-        model: params.get("model").filter(|s| !s.is_empty()).cloned(),
-        only_failed: params
-            .get("onlyFailed")
-            .map(|s| s == "true" || s == "1")
-            .unwrap_or(false),
-        credential_ids,
-        limit: params
-            .get("limit")
-            .and_then(|s| s.parse::<usize>().ok())
-            .unwrap_or(crate::admin::trace_db::DEFAULT_QUERY_LIMIT)
-            .min(1000),
-        offset: params
-            .get("offset")
-            .and_then(|s| s.parse::<usize>().ok())
-            .unwrap_or(0),
+    let query = match build_trace_query(&state, &params, group.as_deref()) {
+        Ok(q) => q,
+        Err(message) => return stats_bad_request(message),
     };
     let (records, total) = state.trace_store.query_paged(&query);
 
@@ -1442,12 +1417,263 @@ pub async fn list_traces(
                 "cacheReadTokens": r.cache_read_tokens,
                 "totalTokens": r.input_tokens + r.output_tokens + r.cache_creation_tokens + r.cache_read_tokens,
                 "credits": r.credits,
+                "creditUsd": state.pricing.credit_usd(r.credits),
+                "officialUsd": state.pricing.official_usd(
+                    &r.model,
+                    r.input_tokens,
+                    r.output_tokens,
+                    r.cache_creation_tokens,
+                    r.cache_read_tokens,
+                ),
                 "firstTokenMs": r.first_token_ms,
                 "attempts": attempts,
             })
         })
         .collect();
-    Json(serde_json::json!({ "records": enriched, "total": total }))
+    Json(serde_json::json!({ "records": enriched, "total": total })).into_response()
+}
+
+/// 从 query 参数构建 [`TraceQuery`]。
+///
+/// 列表、汇总、TPM 三个端点共用这一份解析，保证「同一组筛选参数 → 同一个
+/// WHERE」，不会出现列表和汇总口径漂移。`startDate`/`endDate`（YYYY-MM-DD，
+/// 本地时区、endDate 含当天）与 stats 系端点同一套语义。
+fn build_trace_query(
+    state: &AdminState,
+    params: &HashMap<String, String>,
+    group: Option<&str>,
+) -> Result<TraceQuery, String> {
+    let credential_ids: Option<Vec<u64>> = group.map(|g| {
+        state
+            .service
+            .get_all_credentials()
+            .credentials
+            .iter()
+            .filter(|c| c.groups.iter().any(|cg| cg == g))
+            .map(|c| c.id)
+            .collect()
+    });
+    let (start_ts, end_ts) = match (params.get("startDate"), params.get("endDate")) {
+        (Some(start), Some(end)) => {
+            let start_date = parse_stats_date(start, "startDate")?;
+            let end_date = parse_stats_date(end, "endDate")?;
+            if end_date < start_date {
+                return Err("endDate 不能早于 startDate".to_string());
+            }
+            (
+                Some(local_midnight_ts(start_date)?),
+                Some(local_midnight_ts(end_date + Duration::days(1))?),
+            )
+        }
+        (None, None) => (None, None),
+        _ => return Err("startDate 和 endDate 必须同时提供".to_string()),
+    };
+    Ok(TraceQuery {
+        status: params.get("status").filter(|s| !s.is_empty()).cloned(),
+        error_type: params.get("errorType").filter(|s| !s.is_empty()).cloned(),
+        credential_id: params
+            .get("credentialId")
+            .and_then(|s| s.parse::<u64>().ok()),
+        key_id: params.get("keyId").and_then(|s| s.parse::<u64>().ok()),
+        failed_attempt_credential_id: params
+            .get("failedAttemptCredentialId")
+            .and_then(|s| s.parse::<u64>().ok()),
+        model: params.get("model").filter(|s| !s.is_empty()).cloned(),
+        only_failed: params
+            .get("onlyFailed")
+            .map(|s| s == "true" || s == "1")
+            .unwrap_or(false),
+        credential_ids,
+        start_ts,
+        end_ts,
+        limit: params
+            .get("limit")
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(crate::admin::trace_db::DEFAULT_QUERY_LIMIT)
+            .min(1000),
+        offset: params
+            .get("offset")
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(0),
+    })
+}
+
+/// GET /api/admin/traces/summary
+/// 与 /traces 同一套筛选参数（limit/offset 不参与），按模型汇总当前筛选下的
+/// 用量与成本，另附合计行。给「请求日志」页的汇总条 + 模型折扣视图用。
+pub async fn traces_summary(
+    State(state): State<AdminState>,
+    Query(params): Query<std::collections::HashMap<String, String>>,
+) -> axum::response::Response {
+    let group = params
+        .get("group")
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    let query = match build_trace_query(&state, &params, group.as_deref()) {
+        Ok(q) => q,
+        Err(message) => return stats_bad_request(message),
+    };
+    let rows = state.trace_store.summarize_by_model(&query);
+
+    let mut total_calls = 0u64;
+    let mut total_errors = 0u64;
+    let mut total_input = 0u64;
+    let mut total_output = 0u64;
+    let mut total_cache_creation = 0u64;
+    let mut total_cache_read = 0u64;
+    let mut total_credits = 0.0f64;
+    let mut total_official = 0.0f64;
+    let mut priced_any = false;
+
+    let models: Vec<serde_json::Value> = rows
+        .iter()
+        .map(|r| {
+            let credit_usd = state.pricing.credit_usd(r.credits);
+            let official_usd = state.pricing.official_usd(
+                &r.model,
+                r.input_tokens,
+                r.output_tokens,
+                r.cache_creation_tokens,
+                r.cache_read_tokens,
+            );
+            total_calls += r.calls;
+            total_errors += r.errors;
+            total_input += r.input_tokens;
+            total_output += r.output_tokens;
+            total_cache_creation += r.cache_creation_tokens;
+            total_cache_read += r.cache_read_tokens;
+            total_credits += r.credits;
+            if let Some(usd) = official_usd {
+                total_official += usd;
+                priced_any = true;
+            }
+            serde_json::json!({
+                "model": r.model,
+                "calls": r.calls,
+                "errors": r.errors,
+                "inputTokens": r.input_tokens,
+                "outputTokens": r.output_tokens,
+                "cacheCreationTokens": r.cache_creation_tokens,
+                "cacheReadTokens": r.cache_read_tokens,
+                "credits": r.credits,
+                "creditUsd": credit_usd,
+                "officialUsd": official_usd,
+                "discountRatio": crate::common::pricing::discount_ratio(credit_usd, official_usd),
+            })
+        })
+        .collect();
+
+    let total_credit_usd = state.pricing.credit_usd(total_credits);
+    let total_official_usd = priced_any.then_some(total_official);
+    Json(serde_json::json!({
+        "models": models,
+        "totals": {
+            "calls": total_calls,
+            "errors": total_errors,
+            "inputTokens": total_input,
+            "outputTokens": total_output,
+            "cacheCreationTokens": total_cache_creation,
+            "cacheReadTokens": total_cache_read,
+            "credits": total_credits,
+            "creditUsd": total_credit_usd,
+            "officialUsd": total_official_usd,
+            "discountRatio": crate::common::pricing::discount_ratio(total_credit_usd, total_official_usd),
+        },
+        "creditUsdRate": state.pricing.credit_usd_rate(),
+    }))
+    .into_response()
+}
+
+/// GET /api/admin/stats/tpm?dim=key|credential
+/// 分维度分钟级 TPM/RPM 统计（数据源：traces.db，旁路查询）。
+/// 支持与 /traces 相同的筛选参数（startDate/endDate/keyId/group/model 等）。
+///
+/// 「峰值 TPM」= 窗口内单分钟最大 token 消耗，是每个 Key/凭据实测承载的
+/// 直接证据。trace 被关掉时这里只有历史数据，响应里带 traceEnabled 供前端提示。
+pub async fn stats_tpm(
+    State(state): State<AdminState>,
+    Query(params): Query<std::collections::HashMap<String, String>>,
+) -> axum::response::Response {
+    use crate::admin::trace_db::TpmDim;
+    let dim = match params.get("dim").map(|s| s.as_str()) {
+        Some("key") | None => TpmDim::Key,
+        Some("credential") => TpmDim::Credential,
+        Some(_) => return stats_bad_request("dim 必须是 key 或 credential".to_string()),
+    };
+    let group = params
+        .get("group")
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    let query = match build_trace_query(&state, &params, group.as_deref()) {
+        Ok(q) => q,
+        Err(message) => return stats_bad_request(message),
+    };
+    let stats = state.trace_store.tpm_stats(dim, &query);
+
+    // 实体名称解析：Key 维度用客户端 Key 名，凭据维度用 email
+    let entities: Vec<serde_json::Value> = match dim {
+        TpmDim::Key => {
+            let name_map: HashMap<u64, String> = state
+                .client_keys
+                .list()
+                .into_iter()
+                .map(|k| (k.id, k.name))
+                .collect();
+            stats
+                .iter()
+                .map(|s| {
+                    let label = name_map
+                        .get(&s.entity_id)
+                        .cloned()
+                        .unwrap_or_else(|| format!("#{}", s.entity_id));
+                    tpm_entity_json(s, label)
+                })
+                .collect()
+        }
+        TpmDim::Credential => {
+            let email_map: HashMap<u64, Option<String>> = state
+                .service
+                .get_all_credentials()
+                .credentials
+                .iter()
+                .map(|c| (c.id, c.email.clone()))
+                .collect();
+            stats
+                .iter()
+                .map(|s| {
+                    let label = email_map
+                        .get(&s.entity_id)
+                        .cloned()
+                        .flatten()
+                        .unwrap_or_else(|| format!("#{}", s.entity_id));
+                    tpm_entity_json(s, label)
+                })
+                .collect()
+        }
+    };
+    Json(serde_json::json!({
+        "dim": match dim { TpmDim::Key => "key", TpmDim::Credential => "credential" },
+        "traceEnabled": state.trace_store.is_enabled(),
+        "entities": entities,
+    }))
+    .into_response()
+}
+
+fn tpm_entity_json(
+    s: &crate::admin::trace_db::TpmEntityStats,
+    label: String,
+) -> serde_json::Value {
+    serde_json::json!({
+        "entityId": s.entity_id,
+        "label": label,
+        "peakTpmTotal": s.peak_tpm_total,
+        "peakTpmBillable": s.peak_tpm_billable,
+        "peakRpm": s.peak_rpm,
+        "activeMinutes": s.active_minutes,
+        "avgTpmActive": s.avg_tpm_active,
+        "totalTokens": s.total_tokens,
+        "totalCalls": s.total_calls,
+    })
 }
 
 /// GET /api/admin/traces/failure-stats
