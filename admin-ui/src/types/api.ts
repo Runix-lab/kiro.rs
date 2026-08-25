@@ -523,6 +523,12 @@ export interface BillingKeyRow {
   credits: number
   /** 成本 = credits × creditUsdRate，可信 */
   costUsd: number
+  /** 失败请求数（error 结果的调用数，已计入 calls） */
+  errors: number
+  /** 未配官方牌价的调用数（拉低 officialUsd 估算可信度，不影响 costUsd） */
+  unpricedCalls: number
+  /** 失败请求的成本（美金）：这些请求上游已计费但返回失败，我方承担成本，不向客户收取，不计入 receivableUsd */
+  errorCredits: number
   /** 官方牌价美金；ESTIMATED —— 上游未下发 token 明细时由本地估算补齐 */
   officialUsd: number | null
   /** 对客折扣系数（0.3 = 三折）；未配置为 null */
@@ -554,6 +560,17 @@ export interface UnpricedKey {
   reason: string
 }
 
+/**
+ * 有成功调用但上游计费 credit 为 0 的 Key —— 最危险的信号。
+ * 若上游重命名了计费事件（meteringEvent），每一笔账都会静默变成 $0，
+ * 页面看起来完全正常。月结前必须优先核实这份清单。
+ */
+export interface ZeroCreditKey {
+  keyId: number
+  name: string | null
+  calls: number
+}
+
 /** GET /api/admin/billing 响应 */
 export interface BillingResponse {
   windowStart: string | null
@@ -562,6 +579,10 @@ export interface BillingResponse {
   totals: BillingTotals
   /** 月结前需要人工处理的"漏收"清单 */
   unpricedKeys: UnpricedKey[]
+  /** 有成功调用但 credit 计费为 0 的 Key，见 ZeroCreditKey 注释 */
+  zeroCreditKeys: ZeroCreditKey[]
+  /** 账期内无法解析的用量日志行数；这些请求的金额未知且不可恢复 */
+  malformedLines: number
   /** 账期内没有日志文件的日期。"那天没日志" ≠ "那天没消费"，月结时必须区分 */
   missingDays: string[]
   /** 账期时区，固定 Asia/Shanghai */

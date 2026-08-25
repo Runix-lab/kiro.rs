@@ -1695,7 +1695,9 @@ pub async fn billing_export(
             // 失败请求不按牌价收钱：它 credits=0（我方无成本），而 token 是估算的。
             let receivable = match price_per_credit {
                 Some(p) => Some(credits * p),
-                None if rec.status != "success" => Some(0.0),
+                // 只在折扣口径下把失败行记 0。完全没配定价的 Key 不该出现
+                // "一半空白一半 0.000000"的列——客户会问 0 是免费还是没算。
+                None if discount.is_some() && rec.status != "success" => Some(0.0),
                 None => discount.and_then(|d| {
                     state
                         .pricing
@@ -1754,9 +1756,11 @@ pub async fn billing_export(
 
     let scanned = scan.scanned;
     let missing = scan.missing_days;
+    // 口径判定要和总账一致：配了折扣但当期全部流量都落在未配价模型上时，
+    // 总账判 "无法计价"，导出这边不能自称 discount 还给个 0.0。
     let basis = if price_per_credit.is_some() {
         "perCredit"
-    } else if discount.is_some() {
+    } else if discount.is_some() && total_receivable > 0.0 {
         "discount"
     } else {
         "none"
@@ -1796,6 +1800,18 @@ pub async fn billing_export(
         }
     );
 
+    // 缺口要写在客户拿到的那份文件里，不能只放在响应头——客户看到的是 CSV
+    if !missing.is_empty() {
+        let _ = writeln!(csv, "\"以下日期无用量日志（非零消费）\",\"{}\"", missing.join(" "));
+    }
+    if scan.malformed > 0 {
+        let _ = writeln!(
+            csv,
+            "\"注：本期有 {} 行日志无法解析，金额未计入以上合计\",",
+            scan.malformed
+        );
+    }
+
     let filename = format!(
         "billing-{}-{}.csv",
         if key_name.is_empty() {
@@ -1826,6 +1842,11 @@ pub async fn billing_export(
     if !missing.is_empty() {
         if let Ok(v) = axum::http::HeaderValue::from_str(&missing.join(",")) {
             headers.insert("x-missing-days", v);
+        }
+    }
+    if scan.malformed > 0 {
+        if let Ok(v) = axum::http::HeaderValue::from_str(&scan.malformed.to_string()) {
+            headers.insert("x-malformed-lines", v);
         }
     }
     resp
@@ -2030,6 +2051,7 @@ pub async fn billing_summary(
                 "name": name_map.get(&r.key_id),
                 "calls": r.calls,
                 "errors": r.errors,
+                "errorCredits": r.error_credits,
                 "unpricedCalls": r.unpriced_calls,
                 "inputTokens": r.input_tokens,
                 "outputTokens": r.output_tokens,
@@ -2069,12 +2091,15 @@ pub async fn billing_summary(
     // 连 unpricedKeys 都不响（它的条件是成本 > 0）。必须单独兜住。
     let zero_credit_keys: Vec<serde_json::Value> = rows
         .iter()
-        .filter(|r| r.calls > r.errors && r.credits <= 0.0)
+        // upstream_calls 已剔除本地 WebSearch（不走上游、credits 恒 0），
+        // 否则一个只跑 websearch 的 Key 会每月稳定误报，把这条唯一的
+        // 红色告警训练成"忽略项"。
+        .filter(|r| r.upstream_calls > 0 && r.credits <= 0.0)
         .map(|r| {
             serde_json::json!({
                 "keyId": r.key_id,
                 "name": name_map.get(&r.key_id),
-                "calls": r.calls - r.errors,
+                "calls": r.upstream_calls,
             })
         })
         .collect();

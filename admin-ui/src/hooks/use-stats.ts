@@ -95,6 +95,8 @@ export function useBilling(month: string) {
  * 每个调用方各自持有一份 mutation 状态（不共享 queryKey），因此表格里逐行调用本 hook
  * 即可拿到互不干扰的按钮 pending 态。成功后直接触发浏览器下载；若服务端标出了缺日志的
  * 日期，额外弹一条提示——"当天无日志"和"当天无消耗"是两回事，对账时不能混为一谈。
+ * 服务端标出了本期无法解析的日志行数时同样弹一条提示——这些请求的金额未知，导出的
+ * CSV 里没有它们。
  */
 export function useExportBilling() {
   return useMutation({
@@ -111,6 +113,9 @@ export function useExportBilling() {
       URL.revokeObjectURL(url)
       if (result.missingDays && result.missingDays.length > 0) {
         toast.info(`以下日期无日志：${result.missingDays.join('、')}`)
+      }
+      if (result.malformedLines && result.malformedLines > 0) {
+        toast.info(`导出的对账单中有 ${result.malformedLines} 行日志无法解析，金额未计入`)
       }
     },
     onError: (err) => {

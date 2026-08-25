@@ -112,6 +112,8 @@ export interface BillingExportResult {
   filename?: string
   /** X-Missing-Days 响应头解析出的日期清单；"无日志" 不等于 "无消耗"，需要单独提示 */
   missingDays?: string[]
+  /** X-Malformed-Lines 响应头解析出的无法解析日志行数；这些请求的金额未计入导出的 CSV */
+  malformedLines?: number
 }
 
 /** 从 Content-Disposition 中解出文件名，优先 RFC 5987 的 UTF-8 编码形式，再退回普通 filename= */
@@ -133,7 +135,8 @@ function parseContentDispositionFilename(header?: string): string | undefined {
  * 导出单个客户端 Key 指定月份的请求明细 CSV，用于逐行对账。
  *
  * 服务端已含 UTF-8 BOM，这里只透传 blob；`X-Missing-Days` 标出"该日无日志文件"的日期——
- * 这与"该日无消耗"是两回事，调用方需要单独提示，不能当作 0 消耗处理。
+ * 这与"该日无消耗"是两回事，调用方需要单独提示，不能当作 0 消耗处理。`X-Malformed-Lines`
+ * 标出本期无法解析的日志行数——这些请求的金额未知，导出的 CSV 里不含它们，同样需要单独提示。
  */
 export async function exportBilling(keyId: number, month: string): Promise<BillingExportResult> {
   const res = await api.get('/billing/export', {
@@ -145,5 +148,8 @@ export async function exportBilling(keyId: number, month: string): Promise<Billi
   const missingDays = missingDaysHeader
     ? missingDaysHeader.split(',').map((s) => s.trim()).filter(Boolean)
     : undefined
-  return { blob: res.data as Blob, filename, missingDays }
+  const malformedLinesHeader: string | undefined = res.headers['x-malformed-lines']
+  const malformedLinesParsed = malformedLinesHeader ? Number.parseInt(malformedLinesHeader, 10) : NaN
+  const malformedLines = Number.isFinite(malformedLinesParsed) ? malformedLinesParsed : undefined
+  return { blob: res.data as Blob, filename, missingDays, malformedLines }
 }

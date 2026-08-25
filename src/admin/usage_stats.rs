@@ -317,6 +317,8 @@ pub fn billing_from_logs(
     struct Acc {
         calls: u64,
         errors: u64,
+        upstream_calls: u64,
+        error_credits: f64,
         input: u64,
         output: u64,
         cache_write: u64,
@@ -336,6 +338,7 @@ pub fn billing_from_logs(
         acc.calls += 1;
         if !success {
             acc.errors += 1;
+            acc.error_credits += sane_credits(rec.credits);
         }
         acc.credits += sane_credits(rec.credits);
         acc.input += rec.input_tokens;
@@ -343,6 +346,9 @@ pub fn billing_from_logs(
         acc.cache_write += rec.cache_creation_tokens;
         acc.cache_read += rec.cache_read_tokens;
 
+        if success && rec.credential_id != 0 {
+            acc.upstream_calls += 1;
+        }
         if success {
             let m = per_key_model
                 .entry((rec.key_id, rec.model.clone()))
@@ -398,6 +404,8 @@ pub fn billing_from_logs(
                 key_id,
                 calls: s.calls,
                 errors: s.errors,
+                upstream_calls: s.upstream_calls,
+                error_credits: pricing.credit_usd(s.error_credits),
                 unpriced_calls,
                 unpriced_credits,
                 input_tokens: s.input,
@@ -599,6 +607,12 @@ pub struct KeyBillingRow {
     pub calls: u64,
     /// 其中失败的次数（失败请求不参与官方牌价换算，但成本照记）
     pub errors: u64,
+    /// 真正打到上游的成功调用数（剔除本地 WebSearch —— 那类请求不走上游、
+    /// credits 恒为 0）。判"credits 全零是不是上游协议变了"只能用这个数。
+    pub upstream_calls: u64,
+    /// 失败请求携带的 credits 折算成本。上游已计费但请求失败 —— 这笔钱我方承担、
+    /// 不向客户收取，所以它不在应收里；但必须能看见，否则毛利凭空少一块没人知道。
+    pub error_credits: f64,
     /// 落在**未配官方价**模型上的调用数。>0 且走 discount 口径 = 这部分静默漏收
     pub unpriced_calls: u64,
     /// 同上，对应的 credits
@@ -954,6 +968,8 @@ impl UsageAggregator {
                     calls: s.calls,
                     // 聚合器路径已弃用，不再计算这些告警口径
                     errors: 0,
+                    upstream_calls: 0,
+                    error_credits: 0.0,
                     unpriced_calls: 0,
                     unpriced_credits: 0.0,
                     input_tokens: s.input_tokens,
@@ -1374,6 +1390,78 @@ mod tests {
         assert!(row.official_usd.is_some(), "有配价模型，官方价应为部分和");
         assert_eq!(row.unpriced_calls, 1, "未配价的那条必须被计出来");
         assert_eq!(row.unpriced_credits, 9.0);
+    }
+
+    /// 本地 WebSearch 请求不走上游、credits 恒为 0。它们不能算进 upstream_calls，
+    /// 否则一个只跑 websearch 的 Key 会每月稳定触发"credits 全零"红色告警，
+    /// 把唯一那条能救命的告警训练成"忽略项"。
+    #[test]
+    fn local_websearch_calls_do_not_trip_the_zero_credit_alarm() {
+        let dir = temp_dir("websearch");
+        let d = dir.as_path();
+        let path = d.join("usage_log.2026-08-10.jsonl");
+        std::fs::write(
+            &path,
+            concat!(
+                // credentialId=0 = 本地 WebSearch，没走上游
+                r#"{"ts":"2026-08-10T01:00:00+00:00","keyId":1,"credentialId":0,"model":"claude-opus-4-5","inputTokens":100,"outputTokens":0,"credits":0.0,"status":"success"}"#, "\n",
+                r#"{"ts":"2026-08-10T02:00:00+00:00","keyId":1,"credentialId":0,"model":"claude-opus-4-5","inputTokens":100,"outputTokens":0,"credits":0.0,"status":"success"}"#, "\n",
+            ),
+        )
+        .unwrap();
+
+        let pricing = crate::common::pricing::PricingTable::from_config(
+            &crate::common::pricing::PricingConfig::default(),
+        );
+        let (rows, _) = billing_from_logs(
+            d,
+            NaiveDate::from_ymd_opt(2026, 8, 10).unwrap(),
+            NaiveDate::from_ymd_opt(2026, 8, 11).unwrap(),
+            &pricing,
+            &|_| (None, None),
+        );
+        let row = rows.iter().find(|r| r.key_id == 1).unwrap();
+        assert_eq!(row.calls, 2);
+        assert_eq!(row.upstream_calls, 0, "本地请求不该算成上游调用");
+    }
+
+    /// 失败请求携带的 credits 是我方实付、不向客户收取的成本。
+    /// 它必须能被单独看到，否则毛利凭空少一块而没人知道少在哪。
+    #[test]
+    fn error_credits_are_tracked_separately_from_receivable() {
+        let dir = temp_dir("errcredits");
+        let d = dir.as_path();
+        let path = d.join("usage_log.2026-08-10.jsonl");
+        std::fs::write(
+            &path,
+            concat!(
+                r#"{"ts":"2026-08-10T01:00:00+00:00","keyId":1,"credentialId":2,"model":"claude-opus-4-5","inputTokens":100,"outputTokens":10,"credits":4.0,"status":"error"}"#, "\n",
+                r#"{"ts":"2026-08-10T02:00:00+00:00","keyId":1,"credentialId":2,"model":"claude-opus-4-5","inputTokens":100,"outputTokens":10,"credits":6.0,"status":"success"}"#, "\n",
+            ),
+        )
+        .unwrap();
+
+        let pricing = crate::common::pricing::PricingTable::from_config(
+            &crate::common::pricing::PricingConfig::default(),
+        );
+        let (rows, _) = billing_from_logs(
+            d,
+            NaiveDate::from_ymd_opt(2026, 8, 10).unwrap(),
+            NaiveDate::from_ymd_opt(2026, 8, 11).unwrap(),
+            &pricing,
+            &|_| (None, Some(0.05)),
+        );
+        let row = rows.iter().find(|r| r.key_id == 1).unwrap();
+        // 成本含失败请求：10 credits 全算
+        assert_eq!(row.credits, 10.0, "失败请求的成本必须照记");
+        // 其中失败那部分单独可见
+        assert!(
+            (row.error_credits - pricing.credit_usd(4.0)).abs() < 1e-9,
+            "失败成本没有被单独计出来: {}",
+            row.error_credits
+        );
+        // 单价口径下应收按全部 credits 算（口径统一，导出侧也是这么算的）
+        assert!((row.receivable_usd.unwrap() - 10.0 * 0.05).abs() < 1e-9);
     }
 
     /// 损坏的行（负 credits / NaN）不能污染账单，也不能让整个导出失败。

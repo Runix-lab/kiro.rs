@@ -141,8 +141,15 @@ impl PricingTable {
         }
     }
 
+    /// credit → USD 汇率。配置里显式写 0 或负数会让"对客单价上界"算成 0，
+    /// 从而拒绝任何合法定价、把操作员锁死；成本也会算成 0 或负数。
+    /// 这里兜底回默认值，不接受非正汇率。
     pub fn credit_usd_rate(&self) -> f64 {
-        self.credit_usd_rate
+        if self.credit_usd_rate.is_finite() && self.credit_usd_rate > 0.0 {
+            self.credit_usd_rate
+        } else {
+            default_credit_usd_rate()
+        }
     }
 
     /// credit → 实付美金。
@@ -249,7 +256,12 @@ fn is_date_snapshot(rest: &str) -> bool {
     }
     match head.len() {
         8 => true,                       // 20260514
-        4 => head.starts_with('0'),      // 0520（MMDD）；2026 这种年份不算
+        // MMDD：月份 01-12。只判首位为 0 的话，1015 / 1120 / 1231 这三个月的
+        // 快照会被当成版本号踢掉，模型静默掉进"未配价"。
+        4 => matches!(
+            &head[..2],
+            "01" | "02" | "03" | "04" | "05" | "06" | "07" | "08" | "09" | "10" | "11" | "12"
+        ),
         _ => false,
     }
 }

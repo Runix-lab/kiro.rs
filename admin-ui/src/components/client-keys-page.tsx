@@ -115,7 +115,29 @@ function BillingCells({ row }: { row: BillingKeyRow | undefined }) {
   return (
     <>
       <td className="border-l border-border/60 px-4 py-3 text-right tabular-nums">
-        {formatNumber(row.calls)}
+        <div>{formatNumber(row.calls)}</div>
+        {(row.errors > 0 || row.unpricedCalls > 0) && (
+          <div className="mt-0.5 flex flex-col items-end gap-0.5">
+            {row.errors > 0 && (
+              <span className="text-[11px] font-normal tabular-nums text-muted-foreground">
+                {row.errors} 失败
+              </span>
+            )}
+            {row.unpricedCalls > 0 && (
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <Badge
+                    variant="warning"
+                    className="cursor-help px-1.5 py-0 text-[10px] font-normal tabular-nums"
+                  >
+                    {row.unpricedCalls} 未计价
+                  </Badge>
+                </TooltipTrigger>
+                <TooltipContent>这些调用的模型未配官方价，未计入应收</TooltipContent>
+              </Tooltip>
+            )}
+          </div>
+        )}
       </td>
       <td className="px-4 py-3 text-right tabular-nums">{formatCredits(row.credits)}</td>
       <td className="px-4 py-3 text-right tabular-nums">{formatUsd(row.costUsd)}</td>
