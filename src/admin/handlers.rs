@@ -1722,14 +1722,26 @@ pub async fn billing_export(
                         })
                         .unwrap_or(1.0);
                     let up = |v: u64| if scale == 1.0 { v } else { (v as f64 * scale) as u64 };
+                    // 与总账共用同一条 websearch 缓存还原，否则明细加不平合计
+                    let ts_secs = chrono::DateTime::parse_from_rfc3339(&rec.ts)
+                        .map(|t| t.timestamp())
+                        .unwrap_or(i64::MAX);
+                    let (input_tokens, cache_read_tokens) =
+                        crate::common::pricing::websearch_cache_correction(
+                            &rec.model,
+                            ts_secs,
+                            rec.input_tokens,
+                            rec.cache_creation_tokens,
+                            rec.cache_read_tokens,
+                        );
                     state
                         .pricing
                         .official_usd(
                             &rec.model,
-                            up(rec.input_tokens),
+                            up(input_tokens),
                             rec.output_tokens,
                             up(rec.cache_creation_tokens),
-                            up(rec.cache_read_tokens),
+                            up(cache_read_tokens),
                         )
                         .map(|o| o * d)
                 }),

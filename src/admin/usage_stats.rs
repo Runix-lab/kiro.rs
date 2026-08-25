@@ -363,15 +363,30 @@ pub fn billing_from_logs(
                 .unwrap_or(1.0);
             let up = |v: u64| if scale == 1.0 { v } else { (v as f64 * scale) as u64 };
 
+            // websearch 兜底曾把整个 prompt 记成新鲜输入（缓存两项硬写 0），
+            // 而新鲜输入的牌价是缓存读取的 10 倍——方向是我方多收客户的钱。
+            // 根因已修，但已落盘的历史改不动，只能在读取侧按估算比例还原。
+            let ts_secs = chrono::DateTime::parse_from_rfc3339(&rec.ts)
+                .map(|t| t.timestamp())
+                .unwrap_or(i64::MAX);
+            let (input_tokens, cache_read_tokens) =
+                crate::common::pricing::websearch_cache_correction(
+                    &rec.model,
+                    ts_secs,
+                    rec.input_tokens,
+                    rec.cache_creation_tokens,
+                    rec.cache_read_tokens,
+                );
+
             let m = per_key_model
                 .entry((rec.key_id, rec.model.clone()))
                 .or_default();
             m.calls += 1;
             m.credits += sane_credits(rec.credits);
-            m.input += up(rec.input_tokens);
+            m.input += up(input_tokens);
             m.output += rec.output_tokens;
             m.cache_write += up(rec.cache_creation_tokens);
-            m.cache_read += up(rec.cache_read_tokens);
+            m.cache_read += up(cache_read_tokens);
         }
     });
 

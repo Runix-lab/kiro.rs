@@ -314,6 +314,59 @@ pub fn historical_token_scale(model: &str, ts_epoch_secs: i64) -> f64 {
     }
 }
 
+/// websearch 缓存归零修复上线的时刻（Unix 秒，2026-08-25T11:04:56Z）。
+const WEBSEARCH_CACHE_FIX_TS: i64 = 1_787_655_896;
+
+/// 该 bug 期间被误记为"新鲜输入"的部分里，实际命中缓存的比例。
+///
+/// 我们从未记录过真实命中率（那两个字段被硬写成 0 了），所以这是估算。
+/// 三条独立推导收敛在 0.78~0.90：低并发对照切片 0.78~0.88、放宽链估计
+/// 0.87~0.90、用上游 credits 反推 0.79。取中值 0.85。
+///
+/// **过错在我方**（是我们的兜底代码写死了 0，不是上游没给数据——同样拿不到
+/// 明细，正常路径会估算），所以取值偏向客户一侧是应该的，不是让步。
+pub const WEBSEARCH_CACHED_FRACTION: f64 = 0.85;
+
+/// 走 websearch 兜底、且被误记成全新鲜输入的记录，其真实的 (input, cache_read) 拆分。
+///
+/// # 判据
+///
+/// 只在**同时满足**三个条件时才修正，任一不满足就原样返回：
+/// 1. 时间早于修复上线（之后的数据落盘时就是对的）
+/// 2. 模型是走 websearch 那条路的 gpt-5.6 系
+/// 3. 缓存两项**都是 0** —— 这正是 bug 的指纹
+///
+/// 第 3 条让判据自我筛选：正常路径的 gpt 记录零缓存率只有 0~1%，几乎不会被误伤；
+/// 而受影响的切片是 100% 命中。宁可漏掉几条真·零缓存请求，也不要把修正扩大到
+/// 判不准的记录上——方向上漏掉 = 少修正 = 对客户不利那一侧更保守。
+///
+/// # 日落
+///
+/// 与 [`historical_token_scale`] 同理，这是一次性历史补偿。根因已修
+/// （`websearch_loop.rs` 的兜底改为调 `split_against_total`），
+/// 不要再往这里加分支。
+pub fn websearch_cache_correction(
+    model: &str,
+    ts_epoch_secs: i64,
+    input_tokens: u64,
+    cache_write: u64,
+    cache_read: u64,
+) -> (u64, u64) {
+    if ts_epoch_secs >= WEBSEARCH_CACHE_FIX_TS
+        || cache_write != 0
+        || cache_read != 0
+        || input_tokens == 0
+    {
+        return (input_tokens, cache_read);
+    }
+    if !normalize_model(model).starts_with("gpt-5-6") {
+        return (input_tokens, cache_read);
+    }
+    let cached = (input_tokens as f64 * WEBSEARCH_CACHED_FRACTION).round() as u64;
+    let cached = cached.min(input_tokens);
+    (input_tokens - cached, cached)
+}
+
 /// 折扣比：实付 ÷ 官方。官方价缺失或为 0 时返回 `None`。
 pub fn discount_ratio(credit_usd: f64, official_usd: Option<f64>) -> Option<f64> {
     match official_usd {
@@ -511,6 +564,58 @@ mod historical_scale_tests {
             let got = historical_token_scale("claude-opus-5", ts);
             let want = if delta < 0 { 5.0 } else { 1.0 };
             assert_eq!(got, want, "ts 偏移 {} 秒时系数应为 {}", delta, want);
+        }
+    }
+}
+
+#[cfg(test)]
+mod websearch_correction_tests {
+    use super::*;
+
+    const BEFORE: i64 = WEBSEARCH_CACHE_FIX_TS - 1;
+    const AFTER: i64 = WEBSEARCH_CACHE_FIX_TS;
+
+    /// bug 指纹命中：修复前 + gpt-5.6 + 缓存两项全 0 → 按 85% 重新归类
+    #[test]
+    fn zero_cache_gpt_before_fix_is_reclassified() {
+        let (input, read) = websearch_cache_correction("gpt-5.6-sol", BEFORE, 10_000, 0, 0);
+        assert_eq!(read, 8_500, "85% 应归为缓存读取");
+        assert_eq!(input, 1_500);
+        assert_eq!(input + read, 10_000, "总量必须守恒");
+    }
+
+    /// 修复之后的数据落盘时就是对的，绝不能再修一次（那会变成少收）
+    #[test]
+    fn records_after_the_fix_are_left_alone() {
+        assert_eq!(
+            websearch_cache_correction("gpt-5.6-sol", AFTER, 10_000, 0, 0),
+            (10_000, 0)
+        );
+    }
+
+    /// 已经带缓存的记录说明它没走那条兜底，动它就是凭空少收
+    #[test]
+    fn records_that_already_carry_cache_are_untouched() {
+        assert_eq!(
+            websearch_cache_correction("gpt-5.6-sol", BEFORE, 10_000, 0, 500),
+            (10_000, 500)
+        );
+        assert_eq!(
+            websearch_cache_correction("gpt-5.6-sol", BEFORE, 10_000, 200, 0),
+            (10_000, 0)
+        );
+    }
+
+    /// Claude 系不走 websearch 兜底，修正它等于凭空少收
+    #[test]
+    fn non_gpt_models_are_never_corrected() {
+        for m in ["claude-opus-5", "claude-sonnet-5", "claude-opus-4-8"] {
+            assert_eq!(
+                websearch_cache_correction(m, BEFORE, 10_000, 0, 0),
+                (10_000, 0),
+                "{} 不该被修正",
+                m
+            );
         }
     }
 }
