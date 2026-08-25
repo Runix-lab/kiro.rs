@@ -2,8 +2,8 @@ import { useMemo, useState } from 'react'
 import { Card, CardContent } from '@/components/ui/card'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
-import { Activity, Calendar, Coins, Cpu, Database, KeyRound, Server } from 'lucide-react'
-import { useByCredential, useByModel, useOverview, useTimeSeries } from '@/hooks/use-stats'
+import { Activity, Calendar, Coins, Cpu, Database, Server } from 'lucide-react'
+import { useByCredential, useByModel, useTimeSeries } from '@/hooks/use-stats'
 import { useClientKeys } from '@/hooks/use-client-keys'
 import { useGroupOptions } from '@/hooks/use-groups'
 import type {
@@ -79,7 +79,6 @@ function timeLabel(filter: StatsTimeFilter): string {
 
 export function OverviewPage() {
   const filters = useOverviewFilters()
-  const { data: overview } = useOverview()
   const { data: keysData } = useClientKeys()
   const groupOptions = useGroupOptions()
   const { data: series } = useTimeSeries(filters.timeFilter, filters.statsFilter)
@@ -95,12 +94,7 @@ export function OverviewPage() {
   return (
     <div>
       <PageHeader />
-      <StatsCards
-        activeCredentials={overview?.activeCredentials ?? 0}
-        activeKeys={overview?.activeClientKeys ?? 0}
-        stats={rangeStats}
-        timeText={timeLabel(filters.timeFilter)}
-      />
+      <StatsCards stats={rangeStats} timeText={timeLabel(filters.timeFilter)} />
       <KeyFilterCard
         keyFilter={filters.keyFilter}
         keys={keysData?.keys ?? []}
@@ -250,13 +244,9 @@ function aggregateSeries(data: TimeSeriesPoint[]): RangeStats {
 }
 
 function StatsCards({
-  activeCredentials,
-  activeKeys,
   stats,
   timeText,
 }: {
-  activeCredentials: number
-  activeKeys: number
   stats: RangeStats
   timeText: string
 }) {
@@ -265,6 +255,7 @@ function StatsCards({
   const discount =
     stats.officialUsd != null && stats.officialUsd > 0 ? stats.creditUsd / stats.officialUsd : null
 
+  // 两行三列：第一行 调用/成本/Credit，第二行 输入/输出/缓存（与 lg:grid-cols-3 对应）
   const cards = [
     {
       icon: <Activity className="h-4 w-4" />,
@@ -273,6 +264,22 @@ function StatsCards({
       extra: stats.errors > 0 ? (
         <Badge variant="destructive">异常 {formatNumber(stats.errors)}</Badge>
       ) : null,
+    },
+    {
+      icon: <Coins className="h-4 w-4" />,
+      label: '成本',
+      value: formatUsd(stats.creditUsd),
+      extra: (
+        <span className="text-[11px] text-muted-foreground">
+          官方 {formatUsd(stats.officialUsd)} · {formatDiscount(discount)}
+        </span>
+      ),
+    },
+    {
+      icon: <Coins className="h-4 w-4" />,
+      label: 'Credit',
+      value: formatCredits(stats.credits),
+      extra: <span className="text-[11px] text-muted-foreground">上游计费量</span>,
     },
     { icon: <Cpu className="h-4 w-4" />, label: '输入 Token', value: formatNumber(stats.inputTokens) },
     { icon: <Cpu className="h-4 w-4" />, label: '输出 Token', value: formatNumber(stats.outputTokens) },
@@ -286,38 +293,12 @@ function StatsCards({
         </span>
       ),
     },
-    {
-      icon: <Coins className="h-4 w-4" />,
-      label: '成本',
-      value: formatUsd(stats.creditUsd),
-      extra: (
-        <div className="text-right leading-tight">
-          <div className="text-[11px] text-muted-foreground">
-            官方 {formatUsd(stats.officialUsd)} · {formatDiscount(discount)}
-          </div>
-          <div className="text-[10px] text-muted-foreground/70">
-            {formatCredits(stats.credits)} credit
-          </div>
-        </div>
-      ),
-    },
-    {
-      icon: <KeyRound className="h-4 w-4" />,
-      label: '启用的客户端 Key',
-      meta: '当前可用入口',
-      value: formatNumber(activeKeys),
-      extra: (
-        <span className="text-[11px] text-muted-foreground">
-          上游 {formatNumber(activeCredentials)}
-        </span>
-      ),
-    },
   ]
 
   return (
     <div className="mb-6 grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-3">
       {cards.map((card) => (
-        <StatCard key={card.label} meta={card.meta ?? timeText} {...card} />
+        <StatCard key={card.label} meta={timeText} {...card} />
       ))}
     </div>
   )
