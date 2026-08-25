@@ -778,8 +778,9 @@ impl AdminService {
 
     /// 设置凭据优先级
     pub fn set_priority(&self, id: u64, priority: u32) -> Result<(), AdminServiceError> {
+        // 人工设置即接管：清除自动降级备注，避免月初"恢复原值"把人工意图覆盖掉
         self.token_manager
-            .set_priority(id, priority)
+            .set_priority_with_memo(id, priority, None)
             .map_err(|e| self.classify_error(e, id))
     }
 
@@ -1054,6 +1055,76 @@ impl AdminService {
         (success, failure)
     }
 
+    /// 跑一轮凭据调度自动化：额度守卫 + 首选层保护 + 调度取向。
+    ///
+    /// 输入取自「凭据快照 + 余额缓存」，决策由纯函数
+    /// [`crate::admin::scheduling::plan_changes`] 产出，本函数只负责落地。
+    /// 拿不到余额的凭据不参与降级判断——那等于把"不知道"当"快用完了"。
+    ///
+    /// 返回实际执行的调整条数。
+    pub fn run_scheduling_pass(&self) -> Vec<crate::admin::scheduling::PriorityChange> {
+        use crate::admin::scheduling::{CredentialSchedulingInput, plan_changes};
+        let cfg = self.scheduling_config();
+        if !cfg.enabled {
+            return Vec::new();
+        }
+        let snapshot = self.token_manager.snapshot();
+        let balances = self.balance_cache.lock();
+        let inputs: Vec<CredentialSchedulingInput> = snapshot
+            .entries
+            .iter()
+            .map(|e| {
+                let bal = balances.get(&e.id).map(|c| &c.data);
+                CredentialSchedulingInput {
+                    id: e.id,
+                    priority: e.priority,
+                    disabled: e.disabled,
+                    usage_pct: bal.map(|b| b.usage_percentage),
+                    remaining: bal.map(|b| b.remaining),
+                    auto_demoted_from: e.auto_demoted_from,
+                }
+            })
+            .collect();
+        drop(balances);
+
+        let changes = plan_changes(&cfg, &inputs);
+        let mut applied = Vec::new();
+        for ch in changes {
+            match self
+                .token_manager
+                .set_priority_with_memo(ch.id, ch.to, ch.auto_demoted_from)
+            {
+                Ok(()) => {
+                    tracing::info!(
+                        "调度: 凭据 #{} 优先级 {} → {}（{:?}）",
+                        ch.id,
+                        ch.from,
+                        ch.to,
+                        ch.reason
+                    );
+                    applied.push(ch);
+                }
+                Err(e) => tracing::warn!("调度: 凭据 #{} 调整优先级失败: {}", ch.id, e),
+            }
+        }
+        applied
+    }
+
+    /// 写入调度配置（校验由 handler 层做）。
+    pub fn set_scheduling_config(
+        &self,
+        cfg: crate::admin::scheduling::SchedulingConfig,
+    ) -> Result<(), AdminServiceError> {
+        let to_write = cfg.clone();
+        self.update_config_file(move |c| c.scheduling = to_write.clone());
+        Ok(())
+    }
+
+    /// 当前调度配置（从 config.json 读取，运行时可改）
+    pub fn scheduling_config(&self) -> crate::admin::scheduling::SchedulingConfig {
+        self.token_manager.config().scheduling.clone()
+    }
+
     /// 启动余额后台刷新调度器
     ///
     /// - 启动后立刻执行一次刷新
@@ -1067,6 +1138,11 @@ impl AdminService {
             loop {
                 let started = std::time::Instant::now();
                 let (ok, err) = svc.refresh_all_balances().await;
+                // 紧接余额刷新跑调度：此刻用量数据最新，决策不会基于过期余额
+                let applied = svc.run_scheduling_pass();
+                if !applied.is_empty() {
+                    tracing::info!("调度自动化：本轮调整 {} 个凭据优先级", applied.len());
+                }
                 tracing::info!(
                     "余额后台刷新完成：成功 {}，失败 {}，耗时 {:.1}s",
                     ok,
@@ -1261,6 +1337,7 @@ impl AdminService {
         let email = req.email.clone();
         let new_cred = KiroCredentials {
             id: None,
+            auto_demoted_from: None,
             access_token: req.access_token,
             refresh_token: req.refresh_token,
             profile_arn: req.profile_arn,
@@ -3424,6 +3501,7 @@ mod tests {
 
         let first = KiroCredentials {
             priority: 0,
+            auto_demoted_from: None,
             ..KiroCredentials::default()
         };
         let second = KiroCredentials {
@@ -3448,6 +3526,7 @@ mod tests {
 
         let first = KiroCredentials {
             priority: 0,
+            auto_demoted_from: None,
             ..KiroCredentials::default()
         };
         let second = KiroCredentials {

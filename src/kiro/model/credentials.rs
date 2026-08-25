@@ -82,6 +82,10 @@ pub struct KiroCredentials {
     #[serde(default)]
     #[serde(skip_serializing_if = "is_zero")]
     pub priority: u32,
+    /// 被额度守卫自动降级前的原优先级；`None` 表示当前不是自动降级状态。
+    /// 恢复时写回它而不是基线，以免抹掉运营手工排的意图（见 admin::scheduling）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_demoted_from: Option<u32>,
 
     /// 凭据级 Region 配置（用于 OIDC token 刷新）
     /// 未配置时回退到 config.json 的全局 region
@@ -644,6 +648,7 @@ mod tests {
             issuer_url: None,
             scopes: None,
             priority: 0,
+            auto_demoted_from: None,
             region: None,
             auth_region: None,
             api_region: None,
@@ -869,6 +874,7 @@ mod tests {
             issuer_url: None,
             scopes: None,
             priority: 0,
+            auto_demoted_from: None,
             region: Some("eu-west-1".to_string()),
             auth_region: None,
             api_region: None,
@@ -913,6 +919,7 @@ mod tests {
             issuer_url: None,
             scopes: None,
             priority: 0,
+            auto_demoted_from: None,
             region: None,
             auth_region: None,
             api_region: None,
@@ -1027,6 +1034,7 @@ mod tests {
         // 测试序列化和反序列化的往返一致性
         let original = KiroCredentials {
             id: Some(42),
+            auto_demoted_from: None,
             access_token: Some("token".to_string()),
             refresh_token: Some("refresh".to_string()),
             profile_arn: None,

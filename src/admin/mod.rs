@@ -26,6 +26,7 @@ pub mod types;
 mod binary_update;
 pub mod client_keys;
 pub mod groups;
+pub mod scheduling;
 pub mod usage_stats;
 pub mod trace_db;
 

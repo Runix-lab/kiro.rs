@@ -274,6 +274,10 @@ pub struct Config {
     #[serde(default)]
     pub custom_models: Vec<CustomModel>,
 
+    /// 凭据调度自动化（额度守卫 + 首选层保护 + 调度取向）。默认关闭。
+    #[serde(default)]
+    pub scheduling: crate::admin::scheduling::SchedulingConfig,
+
     /// 计价配置：credit→USD 汇率 + 模型官方牌价覆盖表。
     ///
     /// 只在启动时读取一次（解析成只读 [`crate::common::pricing::PricingTable`]），
@@ -430,6 +434,7 @@ impl Default for Config {
             usage_log_retention_days: default_usage_log_retention_days(),
             endpoints: HashMap::new(),
             custom_models: Vec::new(),
+            scheduling: crate::admin::scheduling::SchedulingConfig::default(),
             pricing: crate::common::pricing::PricingConfig::default(),
             config_path: None,
         }

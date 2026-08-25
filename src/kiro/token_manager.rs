@@ -1044,6 +1044,8 @@ pub struct CredentialEntrySnapshot {
     pub id: u64,
     /// 优先级
     pub priority: u32,
+    /// 自动降级前的原优先级（`None` = 非自动降级状态）
+    pub auto_demoted_from: Option<u32>,
     /// 是否被禁用
     pub disabled: bool,
     /// 连续失败次数
@@ -3062,6 +3064,7 @@ impl MultiTokenManager {
                 .map(|e| CredentialEntrySnapshot {
                     id: e.id,
                     priority: e.credentials.priority,
+                    auto_demoted_from: e.credentials.auto_demoted_from,
                     disabled: e.disabled,
                     failure_count: e.failure_count,
                     total_failure_count: e.total_failure_count,
@@ -3236,6 +3239,29 @@ impl MultiTokenManager {
     ///
     /// 修改优先级后会立即按新优先级重新选择当前凭据。
     /// 即使持久化失败，内存中的优先级和当前凭据选择也会生效。
+    /// 设置优先级并同时写入/清除自动降级备注。
+    ///
+    /// 供调度器使用：降级时记下原值，恢复时清除。人工改优先级走 [`Self::set_priority`]，
+    /// 它会**清除**备注——人工接管后不该再被自动恢复覆盖。
+    pub fn set_priority_with_memo(
+        &self,
+        id: u64,
+        priority: u32,
+        auto_demoted_from: Option<u32>,
+    ) -> anyhow::Result<()> {
+        self.set_priority(id, priority)?;
+        {
+            let mut entries = self.entries.lock();
+            if let Some(entry) = entries.iter_mut().find(|e| e.id == id) {
+                entry.credentials.auto_demoted_from = auto_demoted_from;
+            }
+        }
+        if let Err(e) = self.persist_credentials() {
+            tracing::warn!("降级备注持久化失败（内存态已生效）: {}", e);
+        }
+        Ok(())
+    }
+
     pub fn set_priority(&self, id: u64, priority: u32) -> anyhow::Result<()> {
         {
             let mut entries = self.entries.lock();

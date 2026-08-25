@@ -1593,6 +1593,59 @@ pub async fn traces_summary(
     .into_response()
 }
 
+/// GET /api/admin/config/scheduling —— 读取凭据调度自动化配置
+pub async fn get_scheduling_config(State(state): State<AdminState>) -> impl IntoResponse {
+    Json(state.service.scheduling_config())
+}
+
+/// PUT /api/admin/config/scheduling —— 更新配置
+pub async fn set_scheduling_config(
+    State(state): State<AdminState>,
+    Json(payload): Json<crate::admin::scheduling::SchedulingConfig>,
+) -> axum::response::Response {
+    if !(0.0..=100.0).contains(&payload.demote_threshold_pct) {
+        return stats_bad_request("demoteThresholdPct 必须在 0-100 之间".to_string());
+    }
+    // 降级目标必须真的把凭据推到二线，否则"降级"是个空操作
+    if payload.demote_to <= crate::admin::scheduling::PRIORITY_BASELINE {
+        return stats_bad_request(format!(
+            "demoteTo 必须大于基线 {}，否则降级后仍在主力位置",
+            crate::admin::scheduling::PRIORITY_BASELINE
+        ));
+    }
+    match state.service.set_scheduling_config(payload.clone()) {
+        Ok(()) => Json(serde_json::json!({
+            "success": true,
+            "message": "调度配置已更新",
+            "config": payload,
+        }))
+        .into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// POST /api/admin/config/scheduling/run —— 立即跑一轮调度（不等下个周期）
+///
+/// 返回本轮实际执行的调整，便于在 UI 上直接看到"改了谁、从几改到几、为什么"。
+pub async fn run_scheduling_now(State(state): State<AdminState>) -> impl IntoResponse {
+    let applied = state.service.run_scheduling_pass();
+    let items: Vec<serde_json::Value> = applied
+        .iter()
+        .map(|c| {
+            serde_json::json!({
+                "id": c.id,
+                "from": c.from,
+                "to": c.to,
+                "reason": c.reason,
+            })
+        })
+        .collect();
+    Json(serde_json::json!({
+        "applied": items.len(),
+        "changes": items,
+    }))
+}
+
 /// GET /api/admin/billing?month=YYYY-MM（或 startDate/endDate）
 ///
 /// 月度总账：每个入口 Key 的成本、官方牌价、按其对客折扣算出的应收与毛利，外加合计。
