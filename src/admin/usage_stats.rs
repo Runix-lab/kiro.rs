@@ -170,6 +170,18 @@ impl UsageRecorder {
     }
 }
 
+/// 账单里能接受的 credits 值。负数 / NaN / 无穷只可能来自损坏的行，一律计 0。
+///
+/// **总账和明细必须共用这一个函数**——一边清洗一边不清洗，客户把明细加起来
+/// 就对不上总账，而"总账与明细由构造保证一致"是这套对账的立身之本。
+pub fn sane_credits(v: f64) -> f64 {
+    if v.is_finite() && v > 0.0 {
+        v
+    } else {
+        0.0
+    }
+}
+
 /// 结算时区：北京时间。中国 1991 年后不再有夏令时，固定 +08:00 与 Asia/Shanghai
 /// 在任何我们会结算的日期上都完全等价，所以用固定偏移而不引入 tzdata 依赖。
 pub const SETTLEMENT_OFFSET_SECS: i32 = 8 * 3600;
@@ -199,25 +211,26 @@ pub fn scan_usage_records(
     start: NaiveDate,
     end_exclusive: NaiveDate,
     key_id: Option<u64>,
-    mut sink: impl FnMut(&UsageRecord),
-) -> (u64, Vec<String>) {
+    sink: impl FnMut(&UsageRecord),
+) -> ScanOutcome {
+    let mut sink = sink;
     let tz = settlement_offset();
     let Some(window_start) = start.and_hms_opt(0, 0, 0).map(|t| t.and_local_timezone(tz)) else {
-        return (0, Vec::new());
+        return ScanOutcome::default();
     };
     let Some(window_end) = end_exclusive
         .and_hms_opt(0, 0, 0)
         .map(|t| t.and_local_timezone(tz))
     else {
-        return (0, Vec::new());
+        return ScanOutcome::default();
     };
-    let (Some(window_start), Some(window_end)) =
-        (window_start.single(), window_end.single())
+    let (Some(window_start), Some(window_end)) = (window_start.single(), window_end.single())
     else {
-        return (0, Vec::new());
+        return ScanOutcome::default();
     };
 
     let mut scanned = 0u64;
+    let mut malformed = 0u64;
     let mut missing_days: Vec<String> = Vec::new();
     // 前后各多扫一天，覆盖时区偏移把记录挤到相邻文件里的情况。
     let mut day = start.pred_opt().unwrap_or(start);
@@ -234,6 +247,9 @@ pub fn scan_usage_records(
                         continue;
                     }
                     let Ok(rec) = serde_json::from_str::<UsageRecord>(line) else {
+                        // 半截行 / 撕裂行 / 溢出数值。金额未知且不可知，
+                        // 所以必须计数报出去，不能装作这个月是干净的。
+                        malformed += 1;
                         continue;
                     };
                     if key_id.is_some_and(|k| rec.key_id != k) {
@@ -242,6 +258,7 @@ pub fn scan_usage_records(
                     // 账期归属只认记录自身的时间戳。解析不出来的行宁可漏掉也不能
                     // 错记到别的月份——对账单里多一条不属于本期的记录比少一条更难解释。
                     let Ok(ts) = chrono::DateTime::parse_from_rfc3339(&rec.ts) else {
+                        malformed += 1;
                         continue;
                     };
                     if ts < window_start || ts >= window_end {
@@ -261,7 +278,23 @@ pub fn scan_usage_records(
             None => break,
         };
     }
-    (scanned, missing_days)
+    ScanOutcome {
+        scanned,
+        missing_days,
+        malformed,
+    }
+}
+
+/// 一次扫描的结果。`missing_days` / `malformed` 都必须一路透到界面上——
+/// 它们是"这张账单可能不完整"的唯一信号。
+#[derive(Debug, Default, Clone)]
+pub struct ScanOutcome {
+    /// 落在账期内、通过过滤的记录数
+    pub scanned: u64,
+    /// 账期内没有日志文件的日期
+    pub missing_days: Vec<String>,
+    /// 解析失败的行数
+    pub malformed: u64,
 }
 
 /// 按北京自然日区间，从用量日志直接算出每个 Key 的月结账目。
@@ -271,18 +304,19 @@ pub fn scan_usage_records(
 /// 它和导出明细是两个数据源，客户把明细加起来对不上总账就没法对账了。
 /// 这里和 [`scan_usage_records`] 走同一条流式路径，总账与明细**由构造保证一致**。
 ///
-/// 返回 `(账目行, 缺失日期)`。缺失日期必须一路透传到界面——"那天没日志"和
-/// "那天没消费"是两回事，月结时必须能分辨。
+/// 返回 `(账目行, 扫描结果)`。扫描结果里的缺失日期与坏行数必须一路透传到界面——
+/// "那天没日志"和"那天没消费"是两回事，月结时必须能分辨。
 pub fn billing_from_logs(
     dir: &Path,
     start: NaiveDate,
     end_exclusive: NaiveDate,
     pricing: &crate::common::pricing::PricingTable,
     pricing_of: &dyn Fn(u64) -> (Option<f64>, Option<f64>),
-) -> (Vec<KeyBillingRow>, Vec<String>) {
+) -> (Vec<KeyBillingRow>, ScanOutcome) {
     #[derive(Default)]
     struct Acc {
         calls: u64,
+        errors: u64,
         input: u64,
         output: u64,
         cache_write: u64,
@@ -291,38 +325,55 @@ pub fn billing_from_logs(
     }
 
     let mut per_key: HashMap<u64, Acc> = HashMap::new();
+    // 只有成功的请求参与官方牌价换算：失败请求的 token 是本地估算的、上游
+    // credits 为 0（我方无成本），按牌价打折收钱等于凭空多收——而客户对账时
+    // 一眼就能看到那行状态是 error。
     let mut per_key_model: HashMap<(u64, String), Acc> = HashMap::new();
 
-    let (_, missing) = scan_usage_records(dir, start, end_exclusive, None, |rec| {
-        for acc in [
-            per_key.entry(rec.key_id).or_default(),
-            per_key_model
+    let outcome = scan_usage_records(dir, start, end_exclusive, None, |rec| {
+        let success = rec.status == "success";
+        let acc = per_key.entry(rec.key_id).or_default();
+        acc.calls += 1;
+        if !success {
+            acc.errors += 1;
+        }
+        acc.credits += sane_credits(rec.credits);
+        acc.input += rec.input_tokens;
+        acc.output += rec.output_tokens;
+        acc.cache_write += rec.cache_creation_tokens;
+        acc.cache_read += rec.cache_read_tokens;
+
+        if success {
+            let m = per_key_model
                 .entry((rec.key_id, rec.model.clone()))
-                .or_default(),
-        ] {
-            acc.calls += 1;
-            acc.input += rec.input_tokens;
-            acc.output += rec.output_tokens;
-            acc.cache_write += rec.cache_creation_tokens;
-            acc.cache_read += rec.cache_read_tokens;
-            acc.credits += if rec.credits.is_finite() && rec.credits > 0.0 {
-                rec.credits
-            } else {
-                // 负数/NaN 只可能来自损坏的行。计 0 而不是让它污染整张账单。
-                0.0
-            };
+                .or_default();
+            m.calls += 1;
+            m.credits += sane_credits(rec.credits);
+            m.input += rec.input_tokens;
+            m.output += rec.output_tokens;
+            m.cache_write += rec.cache_creation_tokens;
+            m.cache_read += rec.cache_read_tokens;
         }
     });
 
-    // 官方牌价按模型算，再按 Key 汇总
+    // 官方牌价按模型算，再按 Key 汇总。
+    // 同时记下**落在未配价模型上的量**：只要该 Key 还有别的模型配了价，
+    // official_usd 就是 Some(部分和)，看起来完全正常——这些请求会静默地
+    // 从应收里消失。必须单独计出来报警。
     let mut official: HashMap<u64, (f64, bool)> = HashMap::new();
+    let mut unpriced: HashMap<u64, (u64, f64)> = HashMap::new();
     for ((key_id, model), a) in &per_key_model {
-        if let Some(usd) =
-            pricing.official_usd(model, a.input, a.output, a.cache_write, a.cache_read)
-        {
-            let e = official.entry(*key_id).or_insert((0.0, false));
-            e.0 += usd;
-            e.1 = true;
+        match pricing.official_usd(model, a.input, a.output, a.cache_write, a.cache_read) {
+            Some(usd) => {
+                let e = official.entry(*key_id).or_insert((0.0, false));
+                e.0 += usd;
+                e.1 = true;
+            }
+            None => {
+                let e = unpriced.entry(*key_id).or_insert((0, 0.0));
+                e.0 += a.calls;
+                e.1 += a.credits;
+            }
         }
     }
 
@@ -341,9 +392,14 @@ pub fn billing_from_logs(
                     _ => (None, None),
                 },
             };
+            let (unpriced_calls, unpriced_credits) =
+                unpriced.get(&key_id).copied().unwrap_or((0, 0.0));
             KeyBillingRow {
                 key_id,
                 calls: s.calls,
+                errors: s.errors,
+                unpriced_calls,
+                unpriced_credits,
                 input_tokens: s.input,
                 output_tokens: s.output,
                 cache_creation_tokens: s.cache_write,
@@ -360,7 +416,7 @@ pub fn billing_from_logs(
         })
         .collect();
     rows.sort_by(|a, b| b.credit_usd.total_cmp(&a.credit_usd));
-    (rows, missing)
+    (rows, outcome)
 }
 
 fn parse_usage_log_filename(name: &str) -> Option<NaiveDate> {
@@ -541,6 +597,12 @@ pub struct ModelDistribution {
 pub struct KeyBillingRow {
     pub key_id: u64,
     pub calls: u64,
+    /// 其中失败的次数（失败请求不参与官方牌价换算，但成本照记）
+    pub errors: u64,
+    /// 落在**未配官方价**模型上的调用数。>0 且走 discount 口径 = 这部分静默漏收
+    pub unpriced_calls: u64,
+    /// 同上，对应的 credits
+    pub unpriced_credits: f64,
     pub input_tokens: u64,
     pub output_tokens: u64,
     pub cache_creation_tokens: u64,
@@ -835,6 +897,9 @@ impl UsageAggregator {
     /// 乘任何单一价都是错的。`by_key_model` 正好提供这个维度。
     ///
     /// `discount_of` 由调用方提供（读 ClientKeyManager），本模块不感知 Key 的配置。
+    #[deprecated(
+        note = "月结走 billing_from_logs：本函数只保留 31 个日桶，9 月初结 8 月账会把月初几天静默算成零消费"
+    )]
     pub fn query_billing(
         &self,
         window: StatsQueryWindow,
@@ -887,6 +952,10 @@ impl UsageAggregator {
                 KeyBillingRow {
                     key_id,
                     calls: s.calls,
+                    // 聚合器路径已弃用，不再计算这些告警口径
+                    errors: 0,
+                    unpriced_calls: 0,
+                    unpriced_credits: 0.0,
                     input_tokens: s.input_tokens,
                     output_tokens: s.output_tokens,
                     cache_creation_tokens: s.cache_creation_tokens,
@@ -1152,7 +1221,7 @@ mod tests {
         );
 
         let mut credits = 0.0;
-        let (scanned, _) = scan_usage_records(
+        let out = scan_usage_records(
             d,
             NaiveDate::from_ymd_opt(2026, 8, 1).unwrap(),
             NaiveDate::from_ymd_opt(2026, 9, 1).unwrap(),
@@ -1160,7 +1229,7 @@ mod tests {
             |r| credits += r.credits,
         );
 
-        assert_eq!(scanned, 2, "8 月应当只收进跨界的那两条");
+        assert_eq!(out.scanned, 2, "8 月应当只收进跨界的那两条");
         assert_eq!(
             credits, 18.0,
             "7+11：北京 7-31 23:59 那条和北京 9-01 00:00 那条都不该进 8 月账"
@@ -1176,7 +1245,7 @@ mod tests {
         write_log(d, "2026-08-01", &[("2026-08-01T02:00:00+00:00", 1, 5.0)]);
         // 8-02 故意不写
 
-        let (_, missing) = scan_usage_records(
+        let out = scan_usage_records(
             d,
             NaiveDate::from_ymd_opt(2026, 8, 1).unwrap(),
             NaiveDate::from_ymd_opt(2026, 8, 4).unwrap(),
@@ -1184,9 +1253,9 @@ mod tests {
             |_| {},
         );
         assert!(
-            missing.contains(&"2026-08-02".to_string()),
+            out.missing_days.contains(&"2026-08-02".to_string()),
             "缺失日期没报出来: {:?}",
-            missing
+            out.missing_days
         );
     }
 
@@ -1229,6 +1298,82 @@ mod tests {
         let row7 = rows.iter().find(|r| r.key_id == 7).expect("key 7 应在账目里");
         assert_eq!(row7.credits, detail, "总账与明细不一致");
         assert_eq!(row7.calls, 2);
+    }
+
+    /// 失败的请求不能按官方牌价收钱：它 credits=0（我方无成本），
+    /// 而 token 是本地估算的。按牌价打折 = 凭空多收，且客户在明细里
+    /// 一眼就看到那行状态是 error。
+    #[test]
+    fn failed_requests_do_not_generate_receivable() {
+        let dir = temp_dir("errors");
+        let d = dir.as_path();
+        let path = d.join("usage_log.2026-08-10.jsonl");
+        std::fs::write(
+            &path,
+            concat!(
+                r#"{"ts":"2026-08-10T01:00:00+00:00","keyId":1,"credentialId":1,"model":"claude-opus-4-5","inputTokens":1000000,"outputTokens":0,"credits":0.0,"status":"error"}"#, "\n",
+                r#"{"ts":"2026-08-10T02:00:00+00:00","keyId":1,"credentialId":1,"model":"claude-opus-4-5","inputTokens":1000000,"outputTokens":0,"credits":10.0,"status":"success"}"#, "\n",
+            ),
+        )
+        .unwrap();
+
+        let pricing = crate::common::pricing::PricingTable::from_config(
+            &crate::common::pricing::PricingConfig::default(),
+        );
+        let (rows, _) = billing_from_logs(
+            d,
+            NaiveDate::from_ymd_opt(2026, 8, 10).unwrap(),
+            NaiveDate::from_ymd_opt(2026, 8, 11).unwrap(),
+            &pricing,
+            &|_| (Some(0.5), None),
+        );
+        let row = rows.iter().find(|r| r.key_id == 1).unwrap();
+        assert_eq!(row.calls, 2);
+        assert_eq!(row.errors, 1);
+        // 官方牌价只算成功那一条：两条 input 相同，若把失败那条也算进去
+        // official 会正好翻倍
+        let one_call_official = pricing
+            .official_usd("claude-opus-4-5", 1_000_000, 0, 0, 0)
+            .expect("opus-4-5 必须已配价");
+        assert!(
+            (row.official_usd.unwrap() - one_call_official).abs() < 1e-9,
+            "失败请求被算进了官方牌价: {:?} vs {}",
+            row.official_usd,
+            one_call_official
+        );
+    }
+
+    /// 混合流量里的未配价模型必须被单独计出来。只要该 Key 还有别的模型
+    /// 配了价，official_usd 就是 Some(部分和)，看上去完全正常——
+    /// 这部分请求已经静默地从应收里消失了。
+    #[test]
+    fn partially_unpriced_traffic_is_counted_for_alerting() {
+        let dir = temp_dir("mixed");
+        let d = dir.as_path();
+        let path = d.join("usage_log.2026-08-10.jsonl");
+        std::fs::write(
+            &path,
+            concat!(
+                r#"{"ts":"2026-08-10T01:00:00+00:00","keyId":1,"credentialId":1,"model":"claude-opus-4-5","inputTokens":1000,"outputTokens":100,"credits":1.0,"status":"success"}"#, "\n",
+                r#"{"ts":"2026-08-10T02:00:00+00:00","keyId":1,"credentialId":1,"model":"deepseek-3.2","inputTokens":9000,"outputTokens":900,"credits":9.0,"status":"success"}"#, "\n",
+            ),
+        )
+        .unwrap();
+
+        let pricing = crate::common::pricing::PricingTable::from_config(
+            &crate::common::pricing::PricingConfig::default(),
+        );
+        let (rows, _) = billing_from_logs(
+            d,
+            NaiveDate::from_ymd_opt(2026, 8, 10).unwrap(),
+            NaiveDate::from_ymd_opt(2026, 8, 11).unwrap(),
+            &pricing,
+            &|_| (Some(0.5), None),
+        );
+        let row = rows.iter().find(|r| r.key_id == 1).unwrap();
+        assert!(row.official_usd.is_some(), "有配价模型，官方价应为部分和");
+        assert_eq!(row.unpriced_calls, 1, "未配价的那条必须被计出来");
+        assert_eq!(row.unpriced_credits, 9.0);
     }
 
     /// 损坏的行（负 credits / NaN）不能污染账单，也不能让整个导出失败。

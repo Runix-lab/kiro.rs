@@ -32,7 +32,18 @@ pub struct MeteringEvent {
 
 impl EventPayload for MeteringEvent {
     fn from_frame(frame: &Frame) -> ParseResult<Self> {
-        frame.payload_as_json()
+        let ev: Self = frame.payload_as_json()?;
+        // 计费字段全是 #[serde(default)]，上游把 `usage` 改名的话这里会静默拿到
+        // 0.0，一路传到账单上——成本和应收会一起显示 $0，看不出任何异常。
+        // 单位对不上就是协议变了，宁可告警也不要静默计零。
+        if !ev.unit.is_empty() && ev.unit != "credit" {
+            tracing::warn!(
+                unit = %ev.unit,
+                usage = ev.usage,
+                "meteringEvent 计费单位不是 credit，计费口径可能已变更"
+            );
+        }
+        Ok(ev)
     }
 }
 

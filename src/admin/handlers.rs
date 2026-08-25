@@ -995,10 +995,33 @@ pub async fn update_client_key(
         }
     });
     // 折扣：>0 生效，<=0 视为清除定价（Option<Option<f64>>：外层"是否改动"，内层"设成什么"）
+    //
+    // 上界不能省。中文里"6 折"和折扣系数 0.6 差 10 倍、和 0.06 差 100 倍，
+    // 输入框里一个数字填错量级，客户当月账单就是 10~100 倍——而毛利率会显示
+    // 99%，看起来一切正常。宁可 400 拒绝，也不能让它静默进账单。
+    const MAX_DISCOUNT: f64 = 1.0; // 卖价高于官方牌价在本业务里不存在
     let billing_discount = payload.billing_discount.map(|v| (v > 0.0).then_some(v));
+    if let Some(Some(v)) = billing_discount {
+        if !v.is_finite() || v > MAX_DISCOUNT {
+            return stats_bad_request(format!(
+                "折扣系数须在 (0, {}] 之间，收到 {}。注意：折扣系数不是「几折」——6 折应填 0.6，0.6 折应填 0.006。",
+                MAX_DISCOUNT, v
+            ));
+        }
+    }
+    // 对客单价上界取成本单价的 20 倍：正常差价在个位数倍数，20 倍以上必是量级填错
+    let max_price_per_credit = state.pricing.credit_usd_rate() * 20.0;
     let price_per_credit = payload
         .billing_price_per_credit
         .map(|v| (v > 0.0).then_some(v));
+    if let Some(Some(v)) = price_per_credit {
+        if !v.is_finite() || v > max_price_per_credit {
+            return stats_bad_request(format!(
+                "对客单价须在 (0, {:.4}] 美元/credit 之间，收到 {}。我方成本是 {:.4} 美元/credit，超过 20 倍多半是小数点填错了。",
+                max_price_per_credit, v, state.pricing.credit_usd_rate()
+            ));
+        }
+    }
     if state.client_keys.update_meta(
         id,
         payload.name,
@@ -1650,7 +1673,7 @@ pub async fn billing_export(
     let mut total_receivable = 0.0f64;
     let want_json = params.get("format").map(|f| f == "json").unwrap_or(false);
 
-    let (scanned, missing) = crate::admin::usage_stats::scan_usage_records(
+    let scan = crate::admin::usage_stats::scan_usage_records(
         recorder.dir(),
         start,
         end,
@@ -1665,10 +1688,14 @@ pub async fn billing_export(
                         .to_string()
                 })
                 .unwrap_or_else(|_| rec.ts.clone());
-            let cost = state.pricing.credit_usd(rec.credits);
+            // 与总账共用同一个清洗函数，否则两边会对不上（总账清洗、明细不清洗）
+            let credits = crate::admin::usage_stats::sane_credits(rec.credits);
+            let cost = state.pricing.credit_usd(credits);
             // 单价口径可靠（credits 是上游真值）；折扣口径的分母依赖 token 估算。
+            // 失败请求不按牌价收钱：它 credits=0（我方无成本），而 token 是估算的。
             let receivable = match price_per_credit {
-                Some(p) => Some(rec.credits * p),
+                Some(p) => Some(credits * p),
+                None if rec.status != "success" => Some(0.0),
                 None => discount.and_then(|d| {
                     state
                         .pricing
@@ -1684,7 +1711,7 @@ pub async fn billing_export(
             };
             // 合计必须由**打印出去的那些数**加出来。若合计用未舍入值、行用舍入值，
             // 客户把一列加一遍就会对不上——对账单里最经不起的就是这个。
-            total_credits += round6(rec.credits);
+            total_credits += round6(credits);
             total_cost += round6(cost);
             total_receivable += receivable.map(round6).unwrap_or(0.0);
 
@@ -1696,7 +1723,7 @@ pub async fn billing_export(
                     "outputTokens": rec.output_tokens,
                     "cacheCreationTokens": rec.cache_creation_tokens,
                     "cacheReadTokens": rec.cache_read_tokens,
-                    "credits": rec.credits,
+                    "credits": credits,
                     "costUsd": cost,
                     "receivableUsd": receivable,
                     "status": rec.status,
@@ -1706,23 +1733,27 @@ pub async fn billing_export(
                 let _ = writeln!(
                     csv,
                     "{},{},{},{},{},{},{:.6},{:.6},{},{}",
-                    ts_local,
-                    rec.model,
+                    csv_field(&ts_local),
+                    // model 是客户端原样传进来的，不转义就能用一个逗号把后面
+                    // 每一列右移一位——应收数值会落进「状态」列
+                    csv_field(&rec.model),
                     rec.input_tokens,
                     rec.output_tokens,
                     rec.cache_creation_tokens,
                     rec.cache_read_tokens,
-                    rec.credits,
+                    credits,
                     cost,
                     receivable
                         .map(|v| format!("{:.6}", v))
                         .unwrap_or_else(|| "".to_string()),
-                    rec.status,
+                    csv_field(&rec.status),
                 );
             }
         },
     );
 
+    let scanned = scan.scanned;
+    let missing = scan.missing_days;
     let basis = if price_per_credit.is_some() {
         "perCredit"
     } else if discount.is_some() {
@@ -1737,6 +1768,7 @@ pub async fn billing_export(
             "keyName": key_name,
             "month": params.get("month"),
             "rows": rows,
+            "malformedLines": scan.malformed,
             "totals": {
                 "records": scanned,
                 "credits": total_credits,
@@ -1753,7 +1785,7 @@ pub async fn billing_export(
     use std::fmt::Write as _;
     let _ = writeln!(
         csv,
-        "合计,{} 条,,,,,{:.6},{:.6},{},",
+        "\"合计\",\"{} 条\",,,,,{:.6},{:.6},{},",
         scanned,
         total_credits,
         total_cost,
@@ -1797,6 +1829,20 @@ pub async fn billing_export(
         }
     }
     resp
+}
+
+/// CSV 字段转义（RFC4180）+ 防 Excel 公式注入。
+///
+/// model / status 都可能带客户端可控内容，不转义会顶歪整行的列对齐——
+/// 客户把应收那一列加一遍就和合计对不上，对账单最经不起这个。
+fn csv_field(v: &str) -> String {
+    let needs_prefix = v.starts_with(['=', '+', '-', '@']);
+    let escaped = v.replace('"', "\"\"");
+    if needs_prefix {
+        format!("\"'{}\"", escaped)
+    } else {
+        format!("\"{}\"", escaped)
+    }
 }
 
 /// 舍入到 6 位小数——CSV 里打印几位，合计就按几位加，保证客户能把列加平。
@@ -1930,7 +1976,7 @@ pub async fn billing_summary(
     // 账目直接从用量日志算，和导出明细同源——客户把导出的每一条加起来，必须等于
     // 这里给出的总数。走内存聚合器会同时踩两个坑：只有 31 个日桶（月初几天会被
     // 静默算成零消费），且与明细是两份数据。
-    let (rows, missing_days) = match state.service.usage_recorder() {
+    let (rows, scan) = match state.service.usage_recorder() {
         Some(recorder) => crate::admin::usage_stats::billing_from_logs(
             recorder.dir(),
             window_start_date,
@@ -1938,7 +1984,10 @@ pub async fn billing_summary(
             &state.pricing,
             &|id| pricing_map.get(&id).copied().unwrap_or((None, None)),
         ),
-        None => (Vec::new(), Vec::new()),
+        None => (
+            Vec::new(),
+            crate::admin::usage_stats::ScanOutcome::default(),
+        ),
     };
 
     let mut total_cost = 0.0f64;
@@ -1980,6 +2029,8 @@ pub async fn billing_summary(
                 "keyId": r.key_id,
                 "name": name_map.get(&r.key_id),
                 "calls": r.calls,
+                "errors": r.errors,
+                "unpricedCalls": r.unpriced_calls,
                 "inputTokens": r.input_tokens,
                 "outputTokens": r.output_tokens,
                 "cacheCreationTokens": r.cache_creation_tokens,
@@ -1992,6 +2043,38 @@ pub async fn billing_summary(
                 "receivableUsd": r.receivable_usd,
                 "receivableBasis": r.receivable_basis,
                 "marginUsd": r.margin_usd,
+            })
+        })
+        .collect();
+
+    // 只要该 Key 还有别的模型配了价，official_usd 就是 Some(部分和)，
+    // 上面的 unpriced_keys 完全抓不到——但落在未配价模型上的那部分请求
+    // 已经静默地从应收里消失了。混合流量必须单独报出来。
+    for r in &rows {
+        if r.unpriced_calls > 0 && r.receivable_basis == Some("discount") {
+            unpriced_keys.push(serde_json::json!({
+                "keyId": r.key_id,
+                "name": name_map.get(&r.key_id),
+                "costUsd": state.pricing.credit_usd(r.unpriced_credits),
+                "reason": format!(
+                    "{} 次调用的模型未配官方价，这部分未计入应收",
+                    r.unpriced_calls
+                ),
+            }));
+        }
+    }
+
+    // 有调用但 credits 全是 0：上游改了 meteringEvent 的事件名或字段名时会长这样。
+    // 这是全套账里唯一"错了没有指纹"的情形——成本和应收会一起显示 $0，
+    // 连 unpricedKeys 都不响（它的条件是成本 > 0）。必须单独兜住。
+    let zero_credit_keys: Vec<serde_json::Value> = rows
+        .iter()
+        .filter(|r| r.calls > r.errors && r.credits <= 0.0)
+        .map(|r| {
+            serde_json::json!({
+                "keyId": r.key_id,
+                "name": name_map.get(&r.key_id),
+                "calls": r.calls - r.errors,
             })
         })
         .collect();
@@ -2013,9 +2096,13 @@ pub async fn billing_summary(
         },
         // 有成本但收不出钱的 Key：月结前应当逐个处理，不能让它们静默进毛利
         "unpricedKeys": unpriced_keys,
+        // 有成功调用但 credits 为 0 的 Key：上游计费事件可能已经变了协议
+        "zeroCreditKeys": zero_credit_keys,
         "creditUsdRate": state.pricing.credit_usd_rate(),
         // 缺失日期必须露出来：那天没日志 ≠ 那天没消费，月结时要能分辨
-        "missingDays": missing_days,
+        "missingDays": scan.missing_days,
+        // 解析不出来的行：金额未知且不可知，>0 就说明这张账单可能不完整
+        "malformedLines": scan.malformed,
         "note": "账期按北京时间自然日；数据源为用量日志（保留期见配置），更早的月份查不到",
         // 成本（credits）来自上游 meteringEvent，是真值；官方牌价靠 token 明细换算，
         // 而 token 明细在上游不下发时由本地估算补齐（ARCHITECTURE.md §4.1.1）。

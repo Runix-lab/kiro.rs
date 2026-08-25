@@ -34,7 +34,12 @@ impl EventType {
             "metadataEvent" => Self::Metadata,
             "contextUsageEvent" => Self::ContextUsage,
             "reasoningContentEvent" => Self::ReasoningContent,
-            _ => Self::Unknown,
+            other => {
+                // 上游给 meteringEvent 改名的话，这里静默吞掉 = 整月 credits 归零
+                // 而账面看不出异常。至少留一条日志。
+                tracing::debug!(event = %other, "未识别的上游事件类型");
+                Self::Unknown
+            }
         }
     }
 

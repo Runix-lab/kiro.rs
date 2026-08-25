@@ -205,12 +205,52 @@ fn is_variant_of(candidate: &str, key: &str) -> bool {
     let Some(rest) = rest.strip_prefix('-') else {
         return false; // 必须落在段边界上，避免 gpt-5-6 命中 gpt-5
     };
+    if is_date_snapshot(rest) {
+        return true;
+    }
     let head = rest.split('-').next().unwrap_or("");
     if head.chars().all(|c| c.is_ascii_digit()) {
-        // 纯数字段：8 位视为日期快照（同款），其余视为新版本号（不同款）
-        head.len() == 8
-    } else {
-        true
+        // 纯数字段一律当新版本号（不同款）。日期快照已在上面放行。
+        return false;
+    }
+    // 非数字后缀只放行已知的同价变体。
+    //
+    // 从前这里是无条件 true，但那是单向不安全的：上游哪天出个
+    // `claude-opus-4-5-pro`（更贵的同族档），会静默继承便宜价 → 漏收。
+    // 收成白名单后，未知后缀落到"未配价"，而未配价现在会在月结页报警——
+    // 宁可多响一次，不可静默少收。
+    const SAME_PRICE_SUFFIXES: [&str; 3] = ["thinking", "latest", "preview"];
+    let head_lower = head.to_ascii_lowercase();
+    SAME_PRICE_SUFFIXES.contains(&head_lower.as_str())
+}
+
+/// 是不是日期快照后缀。各家约定不同，都得认，否则真实模型 id 会掉进未配价：
+/// - Anthropic：`-20260514`（8 位连写）
+/// - OpenAI / Qwen：`-2026-08-22`（ISO 分段）
+/// - 智谱：`-0520`（MMDD，4 位且首位为 0）
+fn is_date_snapshot(rest: &str) -> bool {
+    let segs: Vec<&str> = rest.split('-').collect();
+    let all_digits = |s: &str| !s.is_empty() && s.chars().all(|c| c.is_ascii_digit());
+
+    // YYYY-MM-DD 整段结尾
+    if segs.len() == 3
+        && all_digits(segs[0])
+        && all_digits(segs[1])
+        && all_digits(segs[2])
+        && segs[0].len() == 4
+        && segs[1].len() == 2
+        && segs[2].len() == 2
+    {
+        return true;
+    }
+    let head = segs[0];
+    if !all_digits(head) {
+        return false;
+    }
+    match head.len() {
+        8 => true,                       // 20260514
+        4 => head.starts_with('0'),      // 0520（MMDD）；2026 这种年份不算
+        _ => false,
     }
 }
 
@@ -340,5 +380,37 @@ mod tests {
         let cfg: PricingConfig = serde_json::from_str("{}").unwrap();
         assert!((cfg.credit_usd_rate - 0.02).abs() < 1e-12);
         assert!(cfg.models.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod variant_tests {
+    use super::*;
+
+    /// 各家的日期快照约定都得认，否则真实模型 id 会掉进"未配价"→ 静默漏收。
+    #[test]
+    fn date_snapshots_of_every_vendor_match_their_family() {
+        assert!(is_variant_of("claude-opus-4-5-20260514", "claude-opus-4-5"));
+        assert!(is_variant_of("gpt-5-6-sol-2026-08-22", "gpt-5-6-sol"));
+        assert!(is_variant_of("qwen3-coder-next-2025-07-22", "qwen3-coder-next"));
+        assert!(is_variant_of("glm-5-0520", "glm-5"), "智谱用 MMDD");
+    }
+
+    /// 版本号不是日期，不能当同款——glm-5-2 的官方价比 glm-5 贵。
+    #[test]
+    fn version_bumps_do_not_inherit_the_cheaper_price() {
+        assert!(!is_variant_of("glm-5-2", "glm-5"));
+        assert!(!is_variant_of("gpt-5-6", "gpt-5-5"));
+        assert!(!is_variant_of("claude-opus-4-5", "claude-opus-4"));
+        assert!(!is_variant_of("glm-5-2026", "glm-5"), "2026 是年份不是 MMDD");
+    }
+
+    /// 未知后缀必须落到"未配价"而不是静默继承便宜价。
+    /// 上游出个 -pro / -max 档时，宁可在月结页报警，也不要少收钱。
+    #[test]
+    fn unknown_suffixes_fall_through_to_unpriced() {
+        assert!(is_variant_of("claude-opus-4-5-thinking", "claude-opus-4-5"));
+        assert!(!is_variant_of("claude-opus-4-5-pro", "claude-opus-4-5"));
+        assert!(!is_variant_of("claude-opus-4-5-max", "claude-opus-4-5"));
     }
 }
