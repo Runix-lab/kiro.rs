@@ -1659,7 +1659,31 @@ pub async fn stats_tpm(
     };
     // 全系统合计：按分钟合并全部实体后再取峰值。各实体峰值相加会得到一个
     // 从未真实发生过的数（峰值多半落在不同分钟）。
-    let totals = state.trace_store.tpm_totals(&query);
+    let mut totals = state.trace_store.tpm_totals(&query);
+    // 逐模型 token 明细从各实体汇总而来——这样合计行的折扣与各行同源，
+    // 不会出现"每行都是 0.6 折、合计却是别的数"这种自相矛盾。
+    let mut merged: std::collections::HashMap<String, crate::admin::trace_db::ModelTokenSums> =
+        std::collections::HashMap::new();
+    for s in &stats {
+        for m in &s.model_tokens {
+            let e = merged
+                .entry(m.model.clone())
+                .or_insert_with(|| crate::admin::trace_db::ModelTokenSums {
+                    model: m.model.clone(),
+                    calls: 0,
+                    input_tokens: 0,
+                    output_tokens: 0,
+                    cache_creation_tokens: 0,
+                    cache_read_tokens: 0,
+                });
+            e.calls += m.calls;
+            e.input_tokens += m.input_tokens;
+            e.output_tokens += m.output_tokens;
+            e.cache_creation_tokens += m.cache_creation_tokens;
+            e.cache_read_tokens += m.cache_read_tokens;
+        }
+    }
+    totals.model_tokens = merged.into_values().collect();
     Json(serde_json::json!({
         "dim": match dim { TpmDim::Key => "key", TpmDim::Credential => "credential" },
         "traceEnabled": state.trace_store.is_enabled(),
@@ -1675,6 +1699,24 @@ fn tpm_entity_json(
     pricing: &crate::common::pricing::PricingTable,
 ) -> serde_json::Value {
     let success = s.total_calls.saturating_sub(s.errors);
+    // 官方成本必须按模型逐项算（各模型单价不同）；只累计已配价模型，
+    // 一个都算不出来时给 None，前端显示"—"而不是把折扣算成免费。
+    let mut official = 0.0f64;
+    let mut priced_any = false;
+    for m in &s.model_tokens {
+        if let Some(usd) = pricing.official_usd(
+            &m.model,
+            m.input_tokens,
+            m.output_tokens,
+            m.cache_creation_tokens,
+            m.cache_read_tokens,
+        ) {
+            official += usd;
+            priced_any = true;
+        }
+    }
+    let official_usd = priced_any.then_some(official);
+    let credit_usd = pricing.credit_usd(s.credits);
     serde_json::json!({
         "entityId": s.entity_id,
         "label": label,
@@ -1693,7 +1735,9 @@ fn tpm_entity_json(
             0.0
         },
         "credits": s.credits,
-        "creditUsd": pricing.credit_usd(s.credits),
+        "creditUsd": credit_usd,
+        "officialUsd": official_usd,
+        "discountRatio": crate::common::pricing::discount_ratio(credit_usd, official_usd),
         "topModel": s.top_model,
         "topModelShare": s.top_model_share,
     })

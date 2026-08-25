@@ -2,7 +2,7 @@ import { useState } from 'react'
 import { Card, CardContent } from '@/components/ui/card'
 import { Button } from '@/components/ui/button'
 import { useTpm } from '@/hooks/use-stats'
-import { formatCredits, formatNumber, formatUsd } from '@/lib/utils'
+import { formatCredits, formatDiscount, formatNumber, formatUsd } from '@/lib/utils'
 import type { StatsFilter, StatsTimeFilter, TpmDim, TpmEntityStats } from '@/types/api'
 
 const DIM_OPTIONS: { label: string; value: TpmDim }[] = [
@@ -73,7 +73,7 @@ export function TpmPanel({
           </div>
         ) : (
           <div className="overflow-x-auto text-sm">
-            <table className="w-full min-w-[1080px]">
+            <table className="w-full min-w-[1260px]">
               <thead className="text-muted-foreground">
                 <tr>
                   <th className="pb-2.5 text-left font-medium">
@@ -90,6 +90,8 @@ export function TpmPanel({
                   <th className="pb-2.5 pl-3 text-right font-medium">成功率</th>
                   <th className="pb-2.5 pl-3 text-right font-medium">Credit</th>
                   <th className="pb-2.5 pl-3 text-right font-medium">实付$</th>
+                  <th className="pb-2.5 pl-3 text-right font-medium">官方$</th>
+                  <th className="pb-2.5 pl-3 text-right font-medium">折扣</th>
                 </tr>
               </thead>
               <tbody>
@@ -130,6 +132,12 @@ export function TpmPanel({
                     <td className="py-2.5 pl-3 text-right tabular-nums">
                       {formatUsd(totals.creditUsd)}
                     </td>
+                    <td className="py-2.5 pl-3 text-right tabular-nums">
+                      {formatUsd(totals.officialUsd)}
+                    </td>
+                    <td className="py-2.5 pl-3 text-right tabular-nums">
+                      {formatDiscount(totals.discountRatio)}
+                    </td>
                   </tr>
                 )}
               </tbody>
@@ -151,9 +159,10 @@ function TotalsStrip({ totals }: { totals: TpmEntityStats }) {
     { label: '均值 RPM', value: formatNumber(totals.avgRpmActive), hint: '活跃分钟平均' },
     { label: '成功率', value: `${totals.successRate.toFixed(1)}%`, hint: `异常 ${formatNumber(totals.errors)} 次` },
     { label: '实付', value: formatUsd(totals.creditUsd), hint: `${formatCredits(totals.credits)} credit` },
+    { label: '折扣', value: formatDiscount(totals.discountRatio), hint: `官方 ${formatUsd(totals.officialUsd)}` },
   ]
   return (
-    <div className="mb-4 grid grid-cols-2 gap-3 rounded-lg border border-border/60 bg-muted/30 p-3 sm:grid-cols-4 lg:grid-cols-7">
+    <div className="mb-4 grid grid-cols-2 gap-3 rounded-lg border border-border/60 bg-muted/30 p-3 sm:grid-cols-4 lg:grid-cols-8">
       {items.map((it) => (
         <div key={it.label} title={it.hint}>
           <div className="text-[11px] text-muted-foreground">{it.label}</div>
@@ -201,6 +210,10 @@ function EntityRow({ e }: { e: TpmEntityStats }) {
       </td>
       <td className="py-2.5 pl-3 text-right tabular-nums">{formatCredits(e.credits)}</td>
       <td className="py-2.5 pl-3 text-right tabular-nums">{formatUsd(e.creditUsd)}</td>
+      <td className="py-2.5 pl-3 text-right tabular-nums">{formatUsd(e.officialUsd)}</td>
+      <td className="py-2.5 pl-3 text-right font-semibold tabular-nums">
+        {formatDiscount(e.discountRatio)}
+      </td>
     </tr>
   )
 }

@@ -26,8 +26,8 @@ export function RatePanel() {
   )
 
   return (
-    <Card className="mt-4">
-      <CardContent className="p-4">
+    <Card className="mt-4 mb-6">
+      <CardContent className="p-4 sm:p-5">
         <PanelTitle windowMinutes={snapshot?.windowMinutes} />
         {unavailable ? (
           <EmptyNote text="速率采集层未启用（后端未注入速率环）" />

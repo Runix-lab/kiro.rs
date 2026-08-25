@@ -631,6 +631,10 @@ export interface TpmEntityStats {
   successRate: number
   credits: number
   creditUsd: number
+  /** 官方牌价成本；该实体全部模型都未配价时为 null */
+  officialUsd: number | null
+  /** 折扣比 = 实付 ÷ 官方（单用户视角） */
+  discountRatio: number | null
   /** 调用量最大的模型；窗口内无数据时为 null */
   topModel: string | null
   /** 该模型占该实体调用量的百分比（0-100） */

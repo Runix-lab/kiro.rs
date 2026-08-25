@@ -274,7 +274,7 @@ function FeeCell({ rec }: { rec: TraceRecord }) {
   )
 }
 
-function TraceRow({ rec }: { rec: TraceRecord }) {
+function TraceRow({ rec, showErrorColumn }: { rec: TraceRecord; showErrorColumn: boolean }) {
   const [open, setOpen] = useState(false)
   const errStyle = rec.errorType ? outcomeStyle(rec.errorType) : null
   return (
@@ -311,11 +311,13 @@ function TraceRow({ rec }: { rec: TraceRecord }) {
           <FeeCell rec={rec} />
         </td>
         <td className="py-2.5 pr-3 text-[13px] tabular-nums text-muted-foreground">
-          {rec.firstTokenMs != null ? formatDuration(rec.firstTokenMs) : '—'}
+          {(rec.credits ?? 0) > 0 ? (rec.credits ?? 0).toFixed(4) : '—'}
         </td>
-        <td className="py-2.5 pr-3">
-          {errStyle ? <Badge variant={errStyle.variant}>{errStyle.label}</Badge> : '—'}
-        </td>
+        {showErrorColumn && (
+          <td className="py-2.5 pr-3">
+            {errStyle ? <Badge variant={errStyle.variant}>{errStyle.label}</Badge> : '—'}
+          </td>
+        )}
         <td className="py-2.5 pr-3 text-[13px] tabular-nums">
           {Math.max(0, rec.totalAttempts - 1)}
         </td>
@@ -698,6 +700,8 @@ export function TraceLogPage() {
   const { data, isLoading, isFetching, refetch } = useTraces(query)
   const { data: summary } = useTraceSummary(filterParams)
   const records = data?.records ?? []
+  // 错误类型列只在当前页真有错误时才出现——全成功时它整列都是"—"，纯占宽度
+  const hasErrors = records.some((r) => r.errorType)
   const total = data?.total ?? 0
   const totalPages = Math.max(1, Math.ceil(total / PAGE_SIZE))
 
@@ -779,15 +783,15 @@ export function TraceLogPage() {
                     <th className="py-2 pr-3 font-medium">最终凭据</th>
                     <th className="py-2 pr-3 font-medium">Token</th>
                     <th className="py-2 pr-3 font-medium">费用</th>
-                    <th className="py-2 pr-3 font-medium">首Token</th>
-                    <th className="py-2 pr-3 font-medium">错误类型</th>
+                    <th className="py-2 pr-3 font-medium">Credit</th>
+                    {hasErrors && <th className="py-2 pr-3 font-medium">错误类型</th>}
                     <th className="py-2 pr-3 font-medium">重试</th>
                     <th className="py-2 pr-3 font-medium">耗时</th>
                   </tr>
                 </thead>
                 <tbody>
                   {records.map((rec) => (
-                    <TraceRow key={rec.traceId} rec={rec} />
+                    <TraceRow key={rec.traceId} rec={rec} showErrorColumn={hasErrors} />
                   ))}
                 </tbody>
               </table>

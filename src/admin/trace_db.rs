@@ -206,6 +206,18 @@ pub enum TpmDim {
     Credential,
 }
 
+/// 某实体在某个模型上的用量小计——给上层按模型单价折算官方成本用。
+/// 计价刻意不在本模块做：trace_db 只提供聚合数字。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModelTokenSums {
+    pub model: String,
+    pub calls: u64,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cache_creation_tokens: u64,
+    pub cache_read_tokens: u64,
+}
+
 /// 单实体（Key 或凭据）的分钟级速率统计 + 使用情况画像。
 #[derive(Debug, Clone, PartialEq)]
 pub struct TpmEntityStats {
@@ -231,6 +243,8 @@ pub struct TpmEntityStats {
     /// 调用量最大的模型及其占比（0-100）。窗口内无数据时为 `None`。
     pub top_model: Option<String>,
     pub top_model_share: f64,
+    /// 逐模型 token 小计，供上层按各模型官方单价折算官方成本与折扣。
+    pub model_tokens: Vec<ModelTokenSums>,
 }
 
 /// 单模型的用量汇总行（`summarize_by_model` 的结果）。
@@ -530,30 +544,44 @@ impl TraceStore {
         // 每个实体调用量最大的模型：单独一条按 (实体, 模型) 的聚合，Rust 侧取最大。
         // 放进主查询要么开窗函数要么相关子查询，两者都比多跑一条便宜的 GROUP BY 更重。
         let model_sql = format!(
-            "SELECT {entity} AS entity, model, COUNT(*) c FROM traces {where_sql} GROUP BY entity, model",
+            "SELECT {entity} AS entity, model, COUNT(*) c, \
+             SUM(input_tokens), SUM(output_tokens), SUM(cache_creation_tokens), SUM(cache_read_tokens) \
+             FROM traces {where_sql} GROUP BY entity, model",
             entity = entity_col,
             where_sql = where_sql
         );
         let run = || -> rusqlite::Result<Vec<TpmEntityStats>> {
-            let mut top: std::collections::HashMap<u64, (String, u64, u64)> =
+            // entity -> (最常用模型, 该模型调用数, 总调用数, 逐模型 token 明细)
+            let mut top: std::collections::HashMap<u64, (String, u64, u64, Vec<ModelTokenSums>)> =
                 std::collections::HashMap::new();
             {
                 let mut stmt = conn.prepare(&model_sql)?;
                 let rows = stmt.query_map(param_refs.as_slice(), |row| {
                     Ok((
                         row.get::<_, i64>(0)? as u64,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, i64>(2)?.max(0) as u64,
+                        ModelTokenSums {
+                            model: row.get::<_, String>(1)?,
+                            calls: row.get::<_, i64>(2)?.max(0) as u64,
+                            input_tokens: row.get::<_, Option<i64>>(3)?.unwrap_or(0).max(0) as u64,
+                            output_tokens: row.get::<_, Option<i64>>(4)?.unwrap_or(0).max(0) as u64,
+                            cache_creation_tokens: row.get::<_, Option<i64>>(5)?.unwrap_or(0).max(0)
+                                as u64,
+                            cache_read_tokens: row.get::<_, Option<i64>>(6)?.unwrap_or(0).max(0)
+                                as u64,
+                        },
                     ))
                 })?;
                 for r in rows {
-                    let (entity, model, c) = r?;
-                    let e = top.entry(entity).or_insert_with(|| (model.clone(), 0, 0));
-                    e.2 += c;
-                    if c > e.1 {
-                        e.0 = model;
-                        e.1 = c;
+                    let (entity, m) = r?;
+                    let e = top
+                        .entry(entity)
+                        .or_insert_with(|| (m.model.clone(), 0, 0, Vec::new()));
+                    e.2 += m.calls;
+                    if m.calls > e.1 {
+                        e.0 = m.model.clone();
+                        e.1 = m.calls;
                     }
+                    e.3.push(m);
                 }
             }
 
@@ -563,11 +591,13 @@ impl TraceStore {
                 let active_minutes = row.get::<_, i64>(4)?.max(0) as u64;
                 let sum_total = row.get::<_, Option<i64>>(5)?.unwrap_or(0) as u64;
                 let total_calls = row.get::<_, Option<i64>>(6)?.unwrap_or(0) as u64;
-                let (top_model, top_share) = match top.get(&entity_id) {
-                    Some((m, c, all)) if *all > 0 => {
-                        (Some(m.clone()), *c as f64 / *all as f64 * 100.0)
-                    }
-                    _ => (None, 0.0),
+                let (top_model, top_share, model_tokens) = match top.get(&entity_id) {
+                    Some((m, c, all, per_model)) if *all > 0 => (
+                        Some(m.clone()),
+                        *c as f64 / *all as f64 * 100.0,
+                        per_model.clone(),
+                    ),
+                    _ => (None, 0.0, Vec::new()),
                 };
                 Ok(TpmEntityStats {
                     entity_id,
@@ -591,6 +621,7 @@ impl TraceStore {
                     credits: row.get::<_, Option<f64>>(8)?.unwrap_or(0.0),
                     top_model,
                     top_model_share: top_share,
+                    model_tokens,
                 })
             })?;
             rows.collect()
@@ -653,6 +684,7 @@ impl TraceStore {
                     credits: row.get::<_, Option<f64>>(7)?.unwrap_or(0.0),
                     top_model: None,
                     top_model_share: 0.0,
+                    model_tokens: Vec::new(),
                 })
             })
         };
@@ -672,6 +704,7 @@ impl TraceStore {
                 credits: 0.0,
                 top_model: None,
                 top_model_share: 0.0,
+                model_tokens: Vec::new(),
             }
         })
     }
