@@ -470,17 +470,33 @@ fn rest_api_region_candidates(sso_region: &str) -> [&'static str; 2] {
     }
 }
 
-fn usage_limits_url(host: &str, _credentials: &KiroCredentials) -> String {
-    // Kiro 0.9.2 accepts these REST calls without profileArn. A resolved ARN is
-    // only for the streaming endpoint and makes this legacy request malformed.
+/// 真实 profileArn 的查询串（BuilderID 占位符被 `effective_profile_arn` 跳过）。
+///
+/// Enterprise/IdC token 归属于某个 Q Developer profile：不带 ARN 时这组 REST 接口
+/// 返回 `403 {"message":"User is not authorized to make this call."}`（2026-08-25
+/// 用 5 个 IdC 凭据直连实测，双区域一致；同一 token 带 ARN 即 200）。social 凭据
+/// 带不带 ARN 均 200，所以有真实 ARN 就带是两类账号的公共安全解。
+fn profile_arn_query(credentials: &KiroCredentials) -> String {
+    credentials
+        .effective_profile_arn()
+        .map(|arn| format!("&profileArn={}", urlencoding::encode(arn)))
+        .unwrap_or_default()
+}
+
+fn usage_limits_url(host: &str, credentials: &KiroCredentials) -> String {
     format!(
-        "https://{}/getUsageLimits?origin=AI_EDITOR&resourceType=AGENTIC_REQUEST&isEmailRequired=true",
-        host
+        "https://{}/getUsageLimits?origin=AI_EDITOR&resourceType=AGENTIC_REQUEST&isEmailRequired=true{}",
+        host,
+        profile_arn_query(credentials)
     )
 }
 
-fn available_models_url(host: &str, _credentials: &KiroCredentials) -> String {
-    format!("https://{}/ListAvailableModels?origin=AI_EDITOR", host)
+fn available_models_url(host: &str, credentials: &KiroCredentials) -> String {
+    format!(
+        "https://{}/ListAvailableModels?origin=AI_EDITOR{}",
+        host,
+        profile_arn_query(credentials)
+    )
 }
 
 /// 获取使用额度信息
@@ -6081,7 +6097,10 @@ mod tests {
     }
 
     #[test]
-    fn test_usage_rest_urls_omit_resolved_profile_arn() {
+    fn test_usage_rest_urls_carry_resolved_profile_arn() {
+        // Enterprise/IdC：无 ARN 上游回 403 "User is not authorized to make this
+        // call."，带 ARN 即 200（2026-08-25 五个 IdC 凭据直连实测）。此前一版
+        // 断言"不带 ARN"，那对 social 成立、对 IdC 是长期 502 的根因。
         let credentials = KiroCredentials {
             profile_arn: Some(
                 "arn:aws:codewhisperer:us-east-1:123456789012:profile/REAL123".to_string(),
@@ -6092,12 +6111,28 @@ mod tests {
 
         assert_eq!(
             usage_limits_url(host, &credentials),
-            "https://q.us-east-1.amazonaws.com/getUsageLimits?origin=AI_EDITOR&resourceType=AGENTIC_REQUEST&isEmailRequired=true"
+            "https://q.us-east-1.amazonaws.com/getUsageLimits?origin=AI_EDITOR&resourceType=AGENTIC_REQUEST&isEmailRequired=true&profileArn=arn%3Aaws%3Acodewhisperer%3Aus-east-1%3A123456789012%3Aprofile%2FREAL123"
         );
         assert_eq!(
             available_models_url(host, &credentials),
-            "https://q.us-east-1.amazonaws.com/ListAvailableModels?origin=AI_EDITOR"
+            "https://q.us-east-1.amazonaws.com/ListAvailableModels?origin=AI_EDITOR&profileArn=arn%3Aaws%3Acodewhisperer%3Aus-east-1%3A123456789012%3Aprofile%2FREAL123"
         );
+    }
+
+    #[test]
+    fn test_usage_rest_urls_skip_placeholder_or_missing_arn() {
+        // BuilderID 占位符与缺失 ARN 都不拼查询串——social/BuilderID 账号不带 ARN
+        // 也 200，占位共享 ARN 不该发给用量接口。
+        let placeholder = KiroCredentials {
+            profile_arn: Some(crate::kiro::model::credentials::BUILDER_ID_PROFILE_ARN.to_string()),
+            ..Default::default()
+        };
+        let missing = KiroCredentials::default();
+        let host = "q.us-east-1.amazonaws.com";
+        for c in [&placeholder, &missing] {
+            assert!(!usage_limits_url(host, c).contains("profileArn="));
+            assert!(!available_models_url(host, c).contains("profileArn="));
+        }
     }
 
     #[test]
