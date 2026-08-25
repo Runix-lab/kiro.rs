@@ -49,7 +49,44 @@ pub fn build_client(
     timeout_secs: u64,
     tls_backend: TlsBackend,
 ) -> anyhow::Result<Client> {
-    let mut builder = Client::builder().timeout(Duration::from_secs(timeout_secs));
+    build_client_inner(proxy, Timeout::Whole(timeout_secs), tls_backend)
+}
+
+/// 流式上游调用专用：用**读空闲**超时替代整请求超时。
+///
+/// `Client::builder().timeout()` 是整个请求的墙钟上限，且一直作用到 body 读取结束——
+/// 对流式接口意味着我们会在第 N 秒亲手掐断一条正在正常产出的流。实测：三条已推送
+/// 690-843 KB、1.2 万 output token 的 opus-5 请求在 720.04 秒被切成 `interrupted`，
+/// 而终止性的 `meteringEvent` 恰好在流末尾，于是这些请求全部记 0 credit。
+///
+/// 改用 `read_timeout`（两次数据之间的最大间隔）后语义与 nginx 的 `proxy_read_timeout`
+/// 一致：只要上游还在吐数据就不打断，真死掉的连接仍会被回收。
+pub fn build_streaming_client(
+    proxy: Option<&ProxyConfig>,
+    idle_timeout_secs: u64,
+    tls_backend: TlsBackend,
+) -> anyhow::Result<Client> {
+    build_client_inner(proxy, Timeout::Idle(idle_timeout_secs), tls_backend)
+}
+
+enum Timeout {
+    /// 整请求墙钟上限（含 body）
+    Whole(u64),
+    /// 两次读取之间的最大间隔
+    Idle(u64),
+}
+
+fn build_client_inner(
+    proxy: Option<&ProxyConfig>,
+    timeout: Timeout,
+    tls_backend: TlsBackend,
+) -> anyhow::Result<Client> {
+    let mut builder = match timeout {
+        Timeout::Whole(secs) => Client::builder().timeout(Duration::from_secs(secs)),
+        Timeout::Idle(secs) => Client::builder()
+            .read_timeout(Duration::from_secs(secs))
+            .connect_timeout(Duration::from_secs(30)),
+    };
 
     match tls_backend {
         TlsBackend::Rustls => {

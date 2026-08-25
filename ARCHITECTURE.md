@@ -37,7 +37,8 @@ config.json + credentials.json
 
 **动机**：Anthropic 协议要求 `message_start` 里的 `input_tokens` 是准确值，而 Kiro 只有流跑完才给得出这个数。
 
-**代价**：完全牺牲 TTFB。客户端拿到第一个字节前要空等整轮生成完成，长输出是数十秒到数分钟，期间只有 ping 保活（`PING_INTERVAL_SECS = 25`）。上游读取有 **720s 硬上限**（`build_client(.., 720, ..)`，reqwest 的 `timeout()` 覆盖 response body）。
+**代价**：完全牺牲 TTFB。客户端拿到第一个字节前要空等整轮生成完成，长输出是数十秒到数分钟，期间只有 ping 保活（`PING_INTERVAL_SECS = 25`）。上游连接用**读空闲**超时（`build_streaming_client(.., UPSTREAM_IDLE_TIMEOUT_SECS=300, ..)`，reqwest 的 `read_timeout()`，与 nginx `proxy_read_timeout` 同语义）。
+> ⚠️ 曾经是 `timeout(720)` 整请求上限——它一路作用到 body 读取，会把正在正常产出的长流掐断：实测三条已推送 690-843 KB、1.2 万 output token 的 opus-5 请求在 720.04s 被切成 `interrupted`，而终止性的 `meteringEvent` 在流末尾，于是这些请求全部记 0 credit（2026-08-25 修）。
 
 断流时的处理见 §5.2——那里有个曾经会对客户谎报的坑。
 

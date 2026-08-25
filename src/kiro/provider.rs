@@ -12,7 +12,14 @@ use std::time::{Duration, Instant};
 use tokio::time::sleep;
 
 use crate::admin::trace_db::{TraceAttempt, TraceSink, outcome, truncate_snippet};
-use crate::http_client::{ProxyConfig, build_client};
+use crate::http_client::{ProxyConfig, build_streaming_client};
+
+/// 上游连接的**读空闲**上限：两次数据之间超过这个时长才判定连接已死。
+///
+/// 不是整请求墙钟上限——那样会掐断正常产出的长流（旧值 720s 曾把已推送
+/// 12k output token 的请求切成 interrupted 且记 0 credit）。与 nginx 的
+/// `proxy_read_timeout 900s` 同语义，取更小值以便我们先于 nginx 感知。
+const UPSTREAM_IDLE_TIMEOUT_SECS: u64 = 300;
 use crate::kiro::endpoint::{KiroEndpoint, RequestContext};
 use crate::kiro::error::UpstreamRateLimitError;
 use crate::kiro::machine_id;
@@ -176,8 +183,9 @@ impl KiroProvider {
         );
         let tls_backend = token_manager.config().tls_backend;
         // 预热：构建全局代理对应的 Client（作为受保护的常驻条目）
-        let initial_client = build_client(proxy.as_ref(), 720, tls_backend)
-            .expect("创建 HTTP 客户端失败");
+        let initial_client =
+            build_streaming_client(proxy.as_ref(), UPSTREAM_IDLE_TIMEOUT_SECS, tls_backend)
+                .expect("创建 HTTP 客户端失败");
         let client_cache = ClientCache::new(proxy.clone(), initial_client, CLIENT_CACHE_CAP);
 
         Self {
@@ -199,7 +207,8 @@ impl KiroProvider {
         if let Some(client) = cache.get(&effective) {
             return Ok(client);
         }
-        let client = build_client(effective.as_ref(), 720, self.tls_backend)?;
+        let client =
+            build_streaming_client(effective.as_ref(), UPSTREAM_IDLE_TIMEOUT_SECS, self.tls_backend)?;
         cache.insert(effective, client.clone());
         Ok(client)
     }
