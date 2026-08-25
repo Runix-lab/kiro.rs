@@ -1587,6 +1587,13 @@ impl StreamContext {
             Event::ContextUsage(context_usage) => {
                 // 从上下文使用百分比计算实际的 input_tokens
                 let window_size = get_context_window_size(&self.model);
+                // 自诊断：窗口常量配小了，这里会长期收到 100%。漏配一个 1M 模型
+                // 会把它整个 prompt 计量压小 5 倍（2026-08 opus-5 真踩过，两周没人发现）。
+                crate::anthropic::context_window_guard::observe(
+                    &self.model,
+                    context_usage.context_usage_percentage,
+                    window_size,
+                );
                 let actual_input_tokens =
                     (context_usage.context_usage_percentage * (window_size as f64) / 100.0) as i32;
                 self.context_input_tokens = Some(actual_input_tokens);

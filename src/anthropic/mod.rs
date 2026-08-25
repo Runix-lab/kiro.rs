@@ -22,6 +22,7 @@
 //! axum::serve(listener, app).await?;
 //! ```
 
+pub mod context_window_guard;
 pub mod cache_metering;
 mod converter;
 mod handlers;
