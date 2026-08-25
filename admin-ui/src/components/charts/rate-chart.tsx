@@ -58,32 +58,34 @@ export const RateChart = memo(function RateChart({ data }: Props) {
   const interval = useMemo(() => Math.max(0, Math.floor(rows.length / 8) - 1), [rows.length])
 
   return (
-    <div className="h-64 w-full">
+    <div className="h-[420px] w-full">
       <ResponsiveContainer width="100%" height="100%">
-        <LineChart data={rows} margin={{ top: 16, right: 6, left: -12, bottom: 0 }}>
+        <LineChart data={rows} margin={{ top: 16, right: 8, left: 0, bottom: 8 }}>
           <CartesianGrid strokeDasharray="3 3" className="stroke-border/50" />
           <XAxis
             dataKey="label"
-            tick={{ fontSize: 11 }}
+            tick={{ fontSize: 12 }}
             className="fill-muted-foreground"
             interval={interval}
           />
           <YAxis
             yAxisId="rpm"
-            tick={{ fontSize: 11 }}
-            className="fill-muted-foreground"
-            tickFormatter={(v: number) => formatNumber(v)}
-            width={48}
-            allowDecimals={false}
-          />
-          <YAxis
-            yAxisId="tpm"
-            orientation="right"
-            tick={{ fontSize: 11 }}
+            tick={{ fontSize: 12 }}
             className="fill-muted-foreground"
             tickFormatter={(v: number) => formatNumber(v)}
             width={56}
             allowDecimals={false}
+            label={{ value: 'RPM', angle: -90, position: 'insideLeft', fontSize: 11, offset: 8 }}
+          />
+          <YAxis
+            yAxisId="tpm"
+            orientation="right"
+            tick={{ fontSize: 12 }}
+            className="fill-muted-foreground"
+            tickFormatter={(v: number) => formatNumber(v)}
+            width={68}
+            allowDecimals={false}
+            label={{ value: 'TPM', angle: 90, position: 'insideRight', fontSize: 11, offset: 8 }}
           />
           <Tooltip
             cursor={tooltipCursorStyle}

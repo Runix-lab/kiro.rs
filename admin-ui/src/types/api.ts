@@ -622,8 +622,19 @@ export interface TpmEntityStats {
   activeMinutes: number
   /** 活跃分钟平均 TPM */
   avgTpmActive: number
+  /** 活跃分钟平均 RPM */
+  avgRpmActive: number
   totalTokens: number
   totalCalls: number
+  errors: number
+  /** 成功率百分比（0-100） */
+  successRate: number
+  credits: number
+  creditUsd: number
+  /** 调用量最大的模型；窗口内无数据时为 null */
+  topModel: string | null
+  /** 该模型占该实体调用量的百分比（0-100） */
+  topModelShare: number
 }
 
 /** GET /stats/tpm 响应 */
@@ -632,6 +643,11 @@ export interface TpmStats {
   /** 请求日志（trace）当前是否启用；false 时仅剩历史数据 */
   traceEnabled: boolean
   entities: TpmEntityStats[]
+  /**
+   * 全系统合计。峰值是"按分钟合并所有实体后取最大"，不是各实体峰值相加
+   * （各自峰值多半落在不同分钟，相加得到的是从未发生过的数）。
+   */
+  totals: TpmEntityStats
 }
 
 /** 单凭据失败分类计数（鉴权 / 账号风控 / 其他） */

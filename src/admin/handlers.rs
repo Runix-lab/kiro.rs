@@ -1632,7 +1632,7 @@ pub async fn stats_tpm(
                         .get(&s.entity_id)
                         .cloned()
                         .unwrap_or_else(|| format!("#{}", s.entity_id));
-                    tpm_entity_json(s, label)
+                    tpm_entity_json(s, label, &state.pricing)
                 })
                 .collect()
         }
@@ -1652,15 +1652,19 @@ pub async fn stats_tpm(
                         .cloned()
                         .flatten()
                         .unwrap_or_else(|| format!("#{}", s.entity_id));
-                    tpm_entity_json(s, label)
+                    tpm_entity_json(s, label, &state.pricing)
                 })
                 .collect()
         }
     };
+    // 全系统合计：按分钟合并全部实体后再取峰值。各实体峰值相加会得到一个
+    // 从未真实发生过的数（峰值多半落在不同分钟）。
+    let totals = state.trace_store.tpm_totals(&query);
     Json(serde_json::json!({
         "dim": match dim { TpmDim::Key => "key", TpmDim::Credential => "credential" },
         "traceEnabled": state.trace_store.is_enabled(),
         "entities": entities,
+        "totals": tpm_entity_json(&totals, "全系统".to_string(), &state.pricing),
     }))
     .into_response()
 }
@@ -1668,7 +1672,9 @@ pub async fn stats_tpm(
 fn tpm_entity_json(
     s: &crate::admin::trace_db::TpmEntityStats,
     label: String,
+    pricing: &crate::common::pricing::PricingTable,
 ) -> serde_json::Value {
+    let success = s.total_calls.saturating_sub(s.errors);
     serde_json::json!({
         "entityId": s.entity_id,
         "label": label,
@@ -1677,8 +1683,19 @@ fn tpm_entity_json(
         "peakRpm": s.peak_rpm,
         "activeMinutes": s.active_minutes,
         "avgTpmActive": s.avg_tpm_active,
+        "avgRpmActive": s.avg_rpm_active,
         "totalTokens": s.total_tokens,
         "totalCalls": s.total_calls,
+        "errors": s.errors,
+        "successRate": if s.total_calls > 0 {
+            success as f64 / s.total_calls as f64 * 100.0
+        } else {
+            0.0
+        },
+        "credits": s.credits,
+        "creditUsd": pricing.credit_usd(s.credits),
+        "topModel": s.top_model,
+        "topModelShare": s.top_model_share,
     })
 }
 

@@ -206,8 +206,8 @@ pub enum TpmDim {
     Credential,
 }
 
-/// 单实体（Key 或凭据）的分钟级速率统计。
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// 单实体（Key 或凭据）的分钟级速率统计 + 使用情况画像。
+#[derive(Debug, Clone, PartialEq)]
 pub struct TpmEntityStats {
     pub entity_id: u64,
     /// 窗口内单分钟最大 token 消耗（全口径，含缓存读）——实测承载峰值。
@@ -220,8 +220,17 @@ pub struct TpmEntityStats {
     pub active_minutes: u64,
     /// 活跃分钟的平均 TPM（全口径）。
     pub avg_tpm_active: u64,
+    /// 活跃分钟的平均 RPM。
+    pub avg_rpm_active: u64,
     pub total_tokens: u64,
     pub total_calls: u64,
+    /// 非 success 的请求数。
+    pub errors: u64,
+    /// 消耗的 credit 合计。
+    pub credits: f64,
+    /// 调用量最大的模型及其占比（0-100）。窗口内无数据时为 `None`。
+    pub top_model: Option<String>,
+    pub top_model_share: f64,
 }
 
 /// 单模型的用量汇总行（`summarize_by_model` 的结果）。
@@ -506,23 +515,62 @@ impl TraceStore {
         };
         let sql = format!(
             "SELECT entity, MAX(total_tok), MAX(billable_tok), MAX(calls), \
-             COUNT(*), SUM(total_tok), SUM(calls) FROM ( \
+             COUNT(*), SUM(total_tok), SUM(calls), SUM(errs), SUM(cr) FROM ( \
                SELECT {entity} AS entity, ts_epoch / 60 AS minute, \
                  SUM(input_tokens + output_tokens + cache_creation_tokens + cache_read_tokens) AS total_tok, \
                  SUM(input_tokens + output_tokens + cache_creation_tokens) AS billable_tok, \
-                 COUNT(*) AS calls \
+                 COUNT(*) AS calls, \
+                 SUM(CASE WHEN final_status != 'success' THEN 1 ELSE 0 END) AS errs, \
+                 SUM(credits) AS cr \
                FROM traces {where_sql} GROUP BY entity, minute \
              ) GROUP BY entity ORDER BY MAX(total_tok) DESC",
             entity = entity_col,
             where_sql = where_sql
         );
+        // 每个实体调用量最大的模型：单独一条按 (实体, 模型) 的聚合，Rust 侧取最大。
+        // 放进主查询要么开窗函数要么相关子查询，两者都比多跑一条便宜的 GROUP BY 更重。
+        let model_sql = format!(
+            "SELECT {entity} AS entity, model, COUNT(*) c FROM traces {where_sql} GROUP BY entity, model",
+            entity = entity_col,
+            where_sql = where_sql
+        );
         let run = || -> rusqlite::Result<Vec<TpmEntityStats>> {
+            let mut top: std::collections::HashMap<u64, (String, u64, u64)> =
+                std::collections::HashMap::new();
+            {
+                let mut stmt = conn.prepare(&model_sql)?;
+                let rows = stmt.query_map(param_refs.as_slice(), |row| {
+                    Ok((
+                        row.get::<_, i64>(0)? as u64,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, i64>(2)?.max(0) as u64,
+                    ))
+                })?;
+                for r in rows {
+                    let (entity, model, c) = r?;
+                    let e = top.entry(entity).or_insert_with(|| (model.clone(), 0, 0));
+                    e.2 += c;
+                    if c > e.1 {
+                        e.0 = model;
+                        e.1 = c;
+                    }
+                }
+            }
+
             let mut stmt = conn.prepare(&sql)?;
             let rows = stmt.query_map(param_refs.as_slice(), |row| {
+                let entity_id = row.get::<_, i64>(0)? as u64;
                 let active_minutes = row.get::<_, i64>(4)?.max(0) as u64;
                 let sum_total = row.get::<_, Option<i64>>(5)?.unwrap_or(0) as u64;
+                let total_calls = row.get::<_, Option<i64>>(6)?.unwrap_or(0) as u64;
+                let (top_model, top_share) = match top.get(&entity_id) {
+                    Some((m, c, all)) if *all > 0 => {
+                        (Some(m.clone()), *c as f64 / *all as f64 * 100.0)
+                    }
+                    _ => (None, 0.0),
+                };
                 Ok(TpmEntityStats {
-                    entity_id: row.get::<_, i64>(0)? as u64,
+                    entity_id,
                     peak_tpm_total: row.get::<_, Option<i64>>(1)?.unwrap_or(0) as u64,
                     peak_tpm_billable: row.get::<_, Option<i64>>(2)?.unwrap_or(0) as u64,
                     peak_rpm: row.get::<_, Option<i64>>(3)?.unwrap_or(0) as u64,
@@ -532,8 +580,17 @@ impl TraceStore {
                     } else {
                         0
                     },
+                    avg_rpm_active: if active_minutes > 0 {
+                        total_calls / active_minutes
+                    } else {
+                        0
+                    },
                     total_tokens: sum_total,
-                    total_calls: row.get::<_, Option<i64>>(6)?.unwrap_or(0) as u64,
+                    total_calls,
+                    errors: row.get::<_, Option<i64>>(7)?.unwrap_or(0) as u64,
+                    credits: row.get::<_, Option<f64>>(8)?.unwrap_or(0.0),
+                    top_model,
+                    top_model_share: top_share,
                 })
             })?;
             rows.collect()
@@ -545,6 +602,78 @@ impl TraceStore {
                 Vec::new()
             }
         }
+    }
+
+    /// 全系统（不分实体）的分钟级承载合计。
+    ///
+    /// **不能把各实体的峰值相加**——各自的峰值多半落在不同分钟，相加会得到一个
+    /// 从未真实发生过的数。这里按分钟先合并全部实体再取峰值，得到的是系统在
+    /// 同一分钟内真实扛过的最大量。
+    pub fn tpm_totals(&self, q: &TraceQuery) -> TpmEntityStats {
+        let conn = self.conn.lock();
+        let (where_sql, params) = Self::build_where(q);
+        let param_refs: Vec<&dyn rusqlite::ToSql> = params.iter().map(|b| b.as_ref()).collect();
+        let sql = format!(
+            "SELECT MAX(total_tok), MAX(billable_tok), MAX(calls), COUNT(*), \
+             SUM(total_tok), SUM(calls), SUM(errs), SUM(cr) FROM ( \
+               SELECT ts_epoch / 60 AS minute, \
+                 SUM(input_tokens + output_tokens + cache_creation_tokens + cache_read_tokens) AS total_tok, \
+                 SUM(input_tokens + output_tokens + cache_creation_tokens) AS billable_tok, \
+                 COUNT(*) AS calls, \
+                 SUM(CASE WHEN final_status != 'success' THEN 1 ELSE 0 END) AS errs, \
+                 SUM(credits) AS cr \
+               FROM traces {where_sql} GROUP BY minute \
+             )",
+            where_sql = where_sql
+        );
+        let run = || -> rusqlite::Result<TpmEntityStats> {
+            conn.query_row(&sql, param_refs.as_slice(), |row| {
+                let active_minutes = row.get::<_, Option<i64>>(3)?.unwrap_or(0).max(0) as u64;
+                let sum_total = row.get::<_, Option<i64>>(4)?.unwrap_or(0) as u64;
+                let total_calls = row.get::<_, Option<i64>>(5)?.unwrap_or(0) as u64;
+                Ok(TpmEntityStats {
+                    entity_id: 0,
+                    peak_tpm_total: row.get::<_, Option<i64>>(0)?.unwrap_or(0) as u64,
+                    peak_tpm_billable: row.get::<_, Option<i64>>(1)?.unwrap_or(0) as u64,
+                    peak_rpm: row.get::<_, Option<i64>>(2)?.unwrap_or(0) as u64,
+                    active_minutes,
+                    avg_tpm_active: if active_minutes > 0 {
+                        sum_total / active_minutes
+                    } else {
+                        0
+                    },
+                    avg_rpm_active: if active_minutes > 0 {
+                        total_calls / active_minutes
+                    } else {
+                        0
+                    },
+                    total_tokens: sum_total,
+                    total_calls,
+                    errors: row.get::<_, Option<i64>>(6)?.unwrap_or(0) as u64,
+                    credits: row.get::<_, Option<f64>>(7)?.unwrap_or(0.0),
+                    top_model: None,
+                    top_model_share: 0.0,
+                })
+            })
+        };
+        run().unwrap_or_else(|e| {
+            tracing::warn!("TPM 合计查询失败: {}", e);
+            TpmEntityStats {
+                entity_id: 0,
+                peak_tpm_total: 0,
+                peak_tpm_billable: 0,
+                peak_rpm: 0,
+                active_minutes: 0,
+                avg_tpm_active: 0,
+                avg_rpm_active: 0,
+                total_tokens: 0,
+                total_calls: 0,
+                errors: 0,
+                credits: 0.0,
+                top_model: None,
+                top_model_share: 0.0,
+            }
+        })
     }
 
     /// 把 [`TraceQuery`] 的过滤条件拼成 WHERE 子句 + 参数（值全部参数化绑定）
@@ -1087,14 +1216,80 @@ mod tests {
         assert_eq!(s.peak_rpm, 2);
         assert_eq!(s.active_minutes, 2);
         assert_eq!(s.avg_tpm_active, 5_500);
+        assert_eq!(s.avg_rpm_active, 1); // 3 次调用 / 2 个活跃分钟，整数向下取整
         assert_eq!(s.total_tokens, 11_000);
         assert_eq!(s.total_calls, 3);
+        assert_eq!(s.errors, 0);
+        assert_eq!(s.top_model.as_deref(), Some("m"));
 
         // 凭据维度：同一批数据归到凭据 7 名下
         let cred = store.tpm_stats(TpmDim::Credential, &TraceQuery::default());
         assert_eq!(cred.len(), 1);
         assert_eq!(cred[0].entity_id, 7);
         assert_eq!(cred[0].peak_tpm_total, 10_000);
+    }
+
+    #[test]
+    fn tpm_totals_merge_the_minute_before_taking_the_peak() {
+        let store = mem_store();
+        // 两个 Key 各自的峰值落在不同分钟：合计峰值必须是"同一分钟内相加"的最大值，
+        // 而不是两个实体峰值之和（那是一个从未发生过的数）
+        let rows = [
+            ("t1", "2026-08-21T08:00:00Z", 1u64, 9000u64),
+            ("t2", "2026-08-21T08:00:30Z", 2, 1000),
+            ("t3", "2026-08-21T08:05:00Z", 2, 8000),
+        ];
+        for (id, ts, key, input) in rows {
+            store.insert(&usage_record(UsageSample {
+                trace_id: id,
+                ts,
+                key_id: key,
+                credential_id: 1,
+                model: "m",
+                status: "success",
+                input,
+                output: 0,
+                cache_read: 0,
+                credits: 1.0,
+            }));
+        }
+        let per_key = store.tpm_stats(TpmDim::Key, &TraceQuery::default());
+        let sum_of_peaks: u64 = per_key.iter().map(|s| s.peak_tpm_total).sum();
+        assert_eq!(sum_of_peaks, 9000 + 8000, "各实体峰值之和");
+
+        let totals = store.tpm_totals(&TraceQuery::default());
+        assert_eq!(
+            totals.peak_tpm_total, 10_000,
+            "合计峰值 = 08:00 这一分钟两个 Key 相加，不是 17000"
+        );
+        assert_eq!(totals.peak_rpm, 2);
+        assert_eq!(totals.total_calls, 3);
+        assert_eq!(totals.active_minutes, 2);
+        assert!((totals.credits - 3.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn tpm_entity_picks_the_most_used_model_with_its_share() {
+        let store = mem_store();
+        for (id, model) in [("m1", "a"), ("m2", "a"), ("m3", "a"), ("m4", "b")] {
+            store.insert(&usage_record(UsageSample {
+                trace_id: id,
+                ts: "2026-08-21T08:00:00Z",
+                key_id: 1,
+                credential_id: 1,
+                model,
+                status: if id == "m4" { "error" } else { "success" },
+                input: 10,
+                output: 1,
+                cache_read: 0,
+                credits: 0.0,
+            }));
+        }
+        let s = &store.tpm_stats(TpmDim::Key, &TraceQuery::default())[0];
+        assert_eq!(s.top_model.as_deref(), Some("a"));
+        assert!((s.top_model_share - 75.0).abs() < 1e-9);
+        assert_eq!(s.errors, 1);
+        assert_eq!(s.total_calls, 4);
     }
 
     #[test]
