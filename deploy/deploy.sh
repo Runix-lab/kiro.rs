@@ -105,4 +105,21 @@ if [ -z "$ok" ]; then
   die "deploy failed; rolled back to $PREV_IMAGE"
 fi
 log "live healthy on $IMAGE (swap window ${SWAP_T1}-${SWAP_T0}s wall: $((SWAP_T1-SWAP_T0))s)"
+
+# ---------- 6. relay reachability (non-fatal) ----------
+# 东京中转 jp.kiro.runixcloud.io 是另一台机器上的纯 nginx 反代，不参与部署——
+# 它自动跟随本机。但正因为它从不被部署，坏了也不会有人发现：日本用户会静默
+# 退回到"首跳慢 260ms"，或者更糟，直接 502。所以每次部署顺手探一下。
+# 探测失败只警告不回滚：本机是健康的，中转是独立故障域。
+RELAY_URL="https://jp.kiro.runixcloud.io/health"
+relay_code="$(curl -s -o /dev/null -m 15 -w '%{http_code}' "$RELAY_URL" 2>/dev/null || echo 000)"
+if [ "$relay_code" = "200" ]; then
+  relay_tls="$(curl -s -o /dev/null -m 15 -w '%{time_appconnect}' "$RELAY_URL" 2>/dev/null || echo '?')"
+  log "tokyo relay ok (health=200, tls handshake ${relay_tls}s)"
+else
+  log "WARNING: tokyo relay check failed (health=$relay_code) — japanese users may be degraded."
+  log "         relay host 35.200.53.131: check 'sudo nginx -t' and /var/log/nginx/error.log there."
+  log "         this does NOT affect the deploy just completed; the relay is a separate host."
+fi
+
 log "done. previous image kept: $PREV_IMAGE (rollback: edit compose + docker compose up -d)"
