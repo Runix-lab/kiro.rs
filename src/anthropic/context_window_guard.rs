@@ -63,6 +63,17 @@ pub fn observe(model: &str, percentage: f64, window: i32) {
     if stat.total < MIN_SAMPLES {
         return;
     }
+    // 刚够样本时留一条 INFO：否则"守卫没告警"和"守卫根本没在跑"长得一模一样，
+    // 而这个守卫的全部价值就在于它平时不出声。
+    if stat.total == MIN_SAMPLES {
+        tracing::info!(
+            model = %model,
+            assumed_window = window,
+            pinned = stat.pinned,
+            total = stat.total,
+            "上下文窗口守卫已开始监测该模型"
+        );
+    }
     let ratio = stat.pinned as f64 / stat.total as f64;
     if ratio < SUSPICIOUS_RATIO {
         return;

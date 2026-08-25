@@ -638,6 +638,14 @@ function ModelUsageCard({
             <p className="text-[12px] text-muted-foreground">
               折扣 = 实付 ÷ 官方牌价 · 未配价模型显示 —
             </p>
+            {/* 2026-08 实测：上游只回报上下文占用百分比，token 拆分是本地按
+                窗口常量还原的。opus-5 曾因窗口配小 5 倍，折扣从 1.3 折被算成
+                5.4 折（官方牌价低估 $1,917~$2,197）。分子（实付）可信、
+                分母（官方牌价）是估算——这句话必须写在看的人眼前。 */}
+            <p className="mt-0.5 text-[11px] text-muted-foreground/80">
+              实付来自上游真值；官方牌价按 token 明细换算，而 token 拆分在上游不下发时由本地估算补齐 ——
+              <span className="font-medium">折扣仅供参考，开票请用单价口径</span>
+            </p>
           </div>
           <span className="text-[11px] text-muted-foreground">{timeText}</span>
         </div>
