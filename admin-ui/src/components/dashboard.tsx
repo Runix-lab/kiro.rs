@@ -57,6 +57,7 @@ import { toast } from "sonner";
 import { storage, type CredentialView } from "@/lib/storage";
 import { Card, CardContent } from "@/components/ui/card";
 import { QuotaBurndownCard } from "@/components/quota-burndown-card";
+import { MonthlySettlementCard } from "@/components/monthly-settlement-card";
 import { SchedulingPanel } from "@/components/scheduling-panel";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
@@ -1450,6 +1451,7 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
         </div>
 
         <QuotaBurndownCard credentials={data?.credentials ?? []} />
+        <MonthlySettlementCard />
 
         {/* 工具栏 */}
         <div className="mb-5 flex flex-col gap-3">

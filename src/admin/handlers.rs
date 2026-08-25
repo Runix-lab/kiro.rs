@@ -1593,6 +1593,239 @@ pub async fn traces_summary(
     .into_response()
 }
 
+/// GET /api/admin/billing/export?keyId=N&month=YYYY-MM[&format=csv]
+///
+/// 导出某个客户端 Key 的月度请求明细，用于和客户逐条对账。
+///
+/// 每行是一次真实请求：时间、模型、四类 token、credit、成本、按该 Key 的对客定价
+/// 算出的应收。默认 CSV（Excel 直接打开），`format=json` 给程序化对账用。
+///
+/// 数据源是 `usage_log.*.jsonl`（保留 31 天），逐行流式读取。缺失的日期会在
+/// 响应头 `X-Missing-Days` 里列出——"那天没有日志"和"那天没有消费"是两回事，
+/// 对账时必须能区分。
+pub async fn billing_export(
+    State(state): State<AdminState>,
+    Query(params): Query<std::collections::HashMap<String, String>>,
+) -> axum::response::Response {
+    let Some(key_id) = params.get("keyId").and_then(|s| s.parse::<u64>().ok()) else {
+        return stats_bad_request("keyId 必须提供且为数字".to_string());
+    };
+    let (start, end) = match params.get("month") {
+        Some(m) => match month_dates(m) {
+            Ok(v) => v,
+            Err(message) => return stats_bad_request(message),
+        },
+        None => {
+            let today = Local::now().date_naive();
+            let first = today.with_day(1).unwrap_or(today);
+            let next = first
+                .checked_add_months(chrono::Months::new(1))
+                .unwrap_or(today);
+            (first, next)
+        }
+    };
+
+    let Some(recorder) = state.service.usage_recorder() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(super::types::AdminErrorResponse::invalid_request(
+                "用量日志未启用，无法导出",
+            )),
+        )
+            .into_response();
+    };
+
+    let keys = state.client_keys.list();
+    let key = keys.iter().find(|k| k.id == key_id);
+    let key_name = key.map(|k| k.name.clone()).unwrap_or_default();
+    let discount = key.and_then(|k| k.billing_discount);
+    let price_per_credit = key.and_then(|k| k.billing_price_per_credit);
+
+    let mut rows: Vec<serde_json::Value> = Vec::new();
+    let mut csv = String::from(
+        "时间(北京),模型,输入token,输出token,缓存写token,缓存读token,credit,成本USD,应收USD,状态\n",
+    );
+    let mut total_credits = 0.0f64;
+    let mut total_cost = 0.0f64;
+    let mut total_receivable = 0.0f64;
+    let want_json = params.get("format").map(|f| f == "json").unwrap_or(false);
+
+    let (scanned, missing) = crate::admin::usage_stats::scan_usage_records(
+        recorder.dir(),
+        start,
+        end,
+        Some(key_id),
+        |rec| {
+            // 明细行的时间按北京时间显示——账期是北京时间算的，明细也必须是，
+            // 否则客户按自己那边的日期筛选会发现月头月尾对不上。
+            let ts_local = chrono::DateTime::parse_from_rfc3339(&rec.ts)
+                .map(|t| {
+                    t.with_timezone(&crate::admin::usage_stats::settlement_tz())
+                        .format("%Y-%m-%d %H:%M:%S")
+                        .to_string()
+                })
+                .unwrap_or_else(|_| rec.ts.clone());
+            let cost = state.pricing.credit_usd(rec.credits);
+            // 单价口径可靠（credits 是上游真值）；折扣口径的分母依赖 token 估算。
+            let receivable = match price_per_credit {
+                Some(p) => Some(rec.credits * p),
+                None => discount.and_then(|d| {
+                    state
+                        .pricing
+                        .official_usd(
+                            &rec.model,
+                            rec.input_tokens,
+                            rec.output_tokens,
+                            rec.cache_creation_tokens,
+                            rec.cache_read_tokens,
+                        )
+                        .map(|o| o * d)
+                }),
+            };
+            // 合计必须由**打印出去的那些数**加出来。若合计用未舍入值、行用舍入值，
+            // 客户把一列加一遍就会对不上——对账单里最经不起的就是这个。
+            total_credits += round6(rec.credits);
+            total_cost += round6(cost);
+            total_receivable += receivable.map(round6).unwrap_or(0.0);
+
+            if want_json {
+                rows.push(serde_json::json!({
+                    "ts": ts_local,
+                    "model": rec.model,
+                    "inputTokens": rec.input_tokens,
+                    "outputTokens": rec.output_tokens,
+                    "cacheCreationTokens": rec.cache_creation_tokens,
+                    "cacheReadTokens": rec.cache_read_tokens,
+                    "credits": rec.credits,
+                    "costUsd": cost,
+                    "receivableUsd": receivable,
+                    "status": rec.status,
+                }));
+            } else {
+                use std::fmt::Write as _;
+                let _ = writeln!(
+                    csv,
+                    "{},{},{},{},{},{},{:.6},{:.6},{},{}",
+                    ts_local,
+                    rec.model,
+                    rec.input_tokens,
+                    rec.output_tokens,
+                    rec.cache_creation_tokens,
+                    rec.cache_read_tokens,
+                    rec.credits,
+                    cost,
+                    receivable
+                        .map(|v| format!("{:.6}", v))
+                        .unwrap_or_else(|| "".to_string()),
+                    rec.status,
+                );
+            }
+        },
+    );
+
+    let basis = if price_per_credit.is_some() {
+        "perCredit"
+    } else if discount.is_some() {
+        "discount"
+    } else {
+        "none"
+    };
+
+    if want_json {
+        return Json(serde_json::json!({
+            "keyId": key_id,
+            "keyName": key_name,
+            "month": params.get("month"),
+            "rows": rows,
+            "totals": {
+                "records": scanned,
+                "credits": total_credits,
+                "costUsd": total_cost,
+                "receivableUsd": (basis != "none").then_some(total_receivable),
+            },
+            "receivableBasis": basis,
+            "missingDays": missing,
+        }))
+        .into_response();
+    }
+
+    // 汇总行随表一起给出去，客户拿到的就是一张能直接核的账
+    use std::fmt::Write as _;
+    let _ = writeln!(
+        csv,
+        "合计,{} 条,,,,,{:.6},{:.6},{},",
+        scanned,
+        total_credits,
+        total_cost,
+        if basis != "none" {
+            format!("{:.6}", total_receivable)
+        } else {
+            String::new()
+        }
+    );
+
+    let filename = format!(
+        "billing-{}-{}.csv",
+        if key_name.is_empty() {
+            format!("key{}", key_id)
+        } else {
+            key_name.replace(['/', ' ', '\\'], "_")
+        },
+        params
+            .get("month")
+            .cloned()
+            .unwrap_or_else(|| start.format("%Y-%m").to_string())
+    );
+
+    // BOM：没有它 Excel 会把中文表头显示成乱码
+    let body = format!("\u{feff}{}", csv);
+    let mut resp = body.into_response();
+    let headers = resp.headers_mut();
+    headers.insert(
+        axum::http::header::CONTENT_TYPE,
+        axum::http::HeaderValue::from_static("text/csv; charset=utf-8"),
+    );
+    if let Ok(v) = axum::http::HeaderValue::from_str(&format!(
+        "attachment; filename*=UTF-8''{}",
+        urlencoding::encode(&filename)
+    )) {
+        headers.insert(axum::http::header::CONTENT_DISPOSITION, v);
+    }
+    if !missing.is_empty() {
+        if let Ok(v) = axum::http::HeaderValue::from_str(&missing.join(",")) {
+            headers.insert("x-missing-days", v);
+        }
+    }
+    resp
+}
+
+/// 舍入到 6 位小数——CSV 里打印几位，合计就按几位加，保证客户能把列加平。
+fn round6(v: f64) -> f64 {
+    if v.is_finite() {
+        (v * 1e6).round() / 1e6
+    } else {
+        0.0
+    }
+}
+
+/// `YYYY-MM` → (月初, 次月初) 两个日期
+fn month_dates(month: &str) -> Result<(NaiveDate, NaiveDate), String> {
+    let parts: Vec<&str> = month.split('-').collect();
+    if parts.len() != 2 {
+        return Err("month 必须是 YYYY-MM 格式".to_string());
+    }
+    let year: i32 = parts[0].parse().map_err(|_| "month 年份无效".to_string())?;
+    let mon: u32 = parts[1].parse().map_err(|_| "month 月份无效".to_string())?;
+    let first = NaiveDate::from_ymd_opt(year, mon, 1).ok_or("month 无效".to_string())?;
+    let next = if mon == 12 {
+        NaiveDate::from_ymd_opt(year + 1, 1, 1)
+    } else {
+        NaiveDate::from_ymd_opt(year, mon + 1, 1)
+    }
+    .ok_or("month 无效".to_string())?;
+    Ok((first, next))
+}
+
 /// GET /api/admin/config/scheduling —— 读取凭据调度自动化配置
 pub async fn get_scheduling_config(State(state): State<AdminState>) -> impl IntoResponse {
     Json(state.service.scheduling_config())
@@ -1656,30 +1889,33 @@ pub async fn billing_summary(
     State(state): State<AdminState>,
     Query(params): Query<std::collections::HashMap<String, String>>,
 ) -> axum::response::Response {
-    // month=YYYY-MM 是月结的常用写法；也接受与 stats 系一致的 startDate/endDate
-    let window = if let Some(month) = params.get("month") {
-        match month_window(month) {
-            Ok(w) => w,
+    // month=YYYY-MM 是月结的常用写法；也接受与 stats 系一致的 startDate/endDate。
+    // 账期一律按**北京时间自然日**——月结口径以此为准。
+    let (window_start_date, window_end_date) = if let Some(month) = params.get("month") {
+        match month_dates(month) {
+            Ok(v) => v,
             Err(message) => return stats_bad_request(message),
         }
     } else {
         match (params.get("startDate"), params.get("endDate")) {
-            (Some(s), Some(e)) => match custom_stats_window(s, e, StatsGranularity::Day) {
-                Ok(w) => w,
-                Err(message) => return stats_bad_request(message),
-            },
+            (Some(s), Some(e)) => {
+                let (Ok(sd), Ok(ed)) = (
+                    NaiveDate::parse_from_str(s, "%Y-%m-%d"),
+                    NaiveDate::parse_from_str(e, "%Y-%m-%d"),
+                ) else {
+                    return stats_bad_request("startDate/endDate 需为 YYYY-MM-DD".to_string());
+                };
+                if ed < sd {
+                    return stats_bad_request("endDate 不能早于 startDate".to_string());
+                }
+                // endDate 是闭区间的最后一天，转成开区间
+                (sd, ed.succ_opt().unwrap_or(ed))
+            }
             _ => {
-                // 缺省：当前自然月至今
+                // 缺省：当前自然月至今（含今天）
                 let today = Local::now().date_naive();
                 let first = today.with_day(1).unwrap_or(today);
-                match custom_stats_window(
-                    &first.format("%Y-%m-%d").to_string(),
-                    &today.format("%Y-%m-%d").to_string(),
-                    StatsGranularity::Day,
-                ) {
-                    Ok(w) => w,
-                    Err(message) => return stats_bad_request(message),
-                }
+                (first, today.succ_opt().unwrap_or(today))
             }
         }
     };
@@ -1691,9 +1927,19 @@ pub async fn billing_summary(
         .collect();
     let name_map: HashMap<u64, String> = keys.iter().map(|k| (k.id, k.name.clone())).collect();
 
-    let rows = state.usage_aggregator.query_billing(window, &state.pricing, &|id| {
-        pricing_map.get(&id).copied().unwrap_or((None, None))
-    });
+    // 账目直接从用量日志算，和导出明细同源——客户把导出的每一条加起来，必须等于
+    // 这里给出的总数。走内存聚合器会同时踩两个坑：只有 31 个日桶（月初几天会被
+    // 静默算成零消费），且与明细是两份数据。
+    let (rows, missing_days) = match state.service.usage_recorder() {
+        Some(recorder) => crate::admin::usage_stats::billing_from_logs(
+            recorder.dir(),
+            window_start_date,
+            window_end_date,
+            &state.pricing,
+            &|id| pricing_map.get(&id).copied().unwrap_or((None, None)),
+        ),
+        None => (Vec::new(), Vec::new()),
+    };
 
     let mut total_cost = 0.0f64;
     let mut total_official = 0.0f64;
@@ -1752,8 +1998,9 @@ pub async fn billing_summary(
 
     let receivable = receivable_any.then_some(total_receivable);
     Json(serde_json::json!({
-        "windowStart": chrono::DateTime::from_timestamp(window.start_ts, 0).map(|d| d.to_rfc3339()),
-        "windowEnd": chrono::DateTime::from_timestamp(window.end_ts, 0).map(|d| d.to_rfc3339()),
+        "windowStart": window_start_date.format("%Y-%m-%d").to_string(),
+        "windowEnd": window_end_date.format("%Y-%m-%d").to_string(),
+        "timezone": "Asia/Shanghai",
         "keys": items,
         "totals": {
             "costUsd": total_cost,
@@ -1767,7 +2014,9 @@ pub async fn billing_summary(
         // 有成本但收不出钱的 Key：月结前应当逐个处理，不能让它们静默进毛利
         "unpricedKeys": unpriced_keys,
         "creditUsdRate": state.pricing.credit_usd_rate(),
-        "note": "数据源为用量聚合器天桶，保留 31 天；更早的月份查不到",
+        // 缺失日期必须露出来：那天没日志 ≠ 那天没消费，月结时要能分辨
+        "missingDays": missing_days,
+        "note": "账期按北京时间自然日；数据源为用量日志（保留期见配置），更早的月份查不到",
         // 成本（credits）来自上游 meteringEvent，是真值；官方牌价靠 token 明细换算，
         // 而 token 明细在上游不下发时由本地估算补齐（ARCHITECTURE.md §4.1.1）。
         // 因此按单价计费（perCredit）可靠，按官方价打折（discount）只应作参考。
@@ -1775,28 +2024,6 @@ pub async fn billing_summary(
         "officialUsdEstimated": true,
     }))
     .into_response()
-}
-
-/// `YYYY-MM` → 该自然月的 [月初, 次月初) 窗口。
-fn month_window(month: &str) -> Result<StatsQueryWindow, String> {
-    let parts: Vec<&str> = month.split('-').collect();
-    if parts.len() != 2 {
-        return Err("month 必须是 YYYY-MM 格式".to_string());
-    }
-    let year: i32 = parts[0].parse().map_err(|_| "month 年份无效".to_string())?;
-    let mon: u32 = parts[1].parse().map_err(|_| "month 月份无效".to_string())?;
-    let first = NaiveDate::from_ymd_opt(year, mon, 1).ok_or("month 无效".to_string())?;
-    let next = if mon == 12 {
-        NaiveDate::from_ymd_opt(year + 1, 1, 1)
-    } else {
-        NaiveDate::from_ymd_opt(year, mon + 1, 1)
-    }
-    .ok_or("month 无效".to_string())?;
-    Ok(StatsQueryWindow {
-        start_ts: local_midnight_ts(first)?,
-        end_ts: local_midnight_ts(next)?,
-        granularity: StatsGranularity::Day,
-    })
 }
 
 /// GET /api/admin/stats/tpm?dim=key|credential

@@ -104,3 +104,46 @@ export async function getBilling(params: { month?: string }): Promise<BillingRes
   const { data } = await api.get<BillingResponse>('/billing', { params })
   return data
 }
+
+/** 单 Key 月度对账单导出结果：CSV blob + 服务端建议的文件名 + 缺日志的日期清单 */
+export interface BillingExportResult {
+  blob: Blob
+  /** 从 Content-Disposition 解出的文件名；服务端未下发时为 undefined，由调用方兜底 */
+  filename?: string
+  /** X-Missing-Days 响应头解析出的日期清单；"无日志" 不等于 "无消耗"，需要单独提示 */
+  missingDays?: string[]
+}
+
+/** 从 Content-Disposition 中解出文件名，优先 RFC 5987 的 UTF-8 编码形式，再退回普通 filename= */
+function parseContentDispositionFilename(header?: string): string | undefined {
+  if (!header) return undefined
+  const utf8Match = header.match(/filename\*=UTF-8''([^;]+)/i)
+  if (utf8Match) {
+    try {
+      return decodeURIComponent(utf8Match[1])
+    } catch {
+      // 解码失败则继续尝试普通形式
+    }
+  }
+  const plainMatch = header.match(/filename="?([^";]+)"?/i)
+  return plainMatch ? plainMatch[1] : undefined
+}
+
+/**
+ * 导出单个客户端 Key 指定月份的请求明细 CSV，用于逐行对账。
+ *
+ * 服务端已含 UTF-8 BOM，这里只透传 blob；`X-Missing-Days` 标出"该日无日志文件"的日期——
+ * 这与"该日无消耗"是两回事，调用方需要单独提示，不能当作 0 消耗处理。
+ */
+export async function exportBilling(keyId: number, month: string): Promise<BillingExportResult> {
+  const res = await api.get('/billing/export', {
+    params: { keyId, month },
+    responseType: 'blob',
+  })
+  const filename = parseContentDispositionFilename(res.headers['content-disposition'])
+  const missingDaysHeader: string | undefined = res.headers['x-missing-days']
+  const missingDays = missingDaysHeader
+    ? missingDaysHeader.split(',').map((s) => s.trim()).filter(Boolean)
+    : undefined
+  return { blob: res.data as Blob, filename, missingDays }
+}

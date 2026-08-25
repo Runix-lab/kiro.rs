@@ -1,12 +1,14 @@
-import { useState } from 'react'
+import { useMemo, useState } from 'react'
 import { toast } from 'sonner'
 import {
   Plus, KeyRound, Trash2, Copy, Eye, EyeOff, Power, RotateCcw, Pencil, RefreshCw, Coins,
+  Calendar, Download, Loader2,
 } from 'lucide-react'
 import { Card, CardContent } from '@/components/ui/card'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
 import { Input } from '@/components/ui/input'
+import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@/components/ui/tooltip'
 import {
   DropdownMenu, DropdownMenuTrigger, DropdownMenuContent, DropdownMenuItem,
 } from '@/components/ui/dropdown-menu'
@@ -18,13 +20,145 @@ import {
   useSetClientKeyDisabled, useResetClientKeyStats, useUpdateClientKey,
   useRotateClientKey,
 } from '@/hooks/use-client-keys'
+import { useBilling, useExportBilling } from '@/hooks/use-stats'
 import { useGroupOptions } from '@/hooks/use-groups'
 import { GroupSingleSelect } from '@/components/group-select'
-import type { ClientKeyItem, CreateClientKeyResponse, UpdateClientKeyRequest } from '@/types/api'
-import { extractErrorMessage, formatDiscount, formatUsd } from '@/lib/utils'
+import type { BillingKeyRow, ClientKeyItem, CreateClientKeyResponse, UpdateClientKeyRequest } from '@/types/api'
+import { extractErrorMessage, formatCredits, formatDiscount, formatNumber, formatUsd } from '@/lib/utils'
 import { useConfirm } from '@/components/ui/confirm-dialog'
 
 type PricingMode = 'perCredit' | 'discount' | 'clear'
+
+const ESTIMATED_HINT =
+  '官方牌价依赖 token 明细，上游未下发时由本地估算补齐，此应收为参考值'
+
+function currentMonthValue(): string {
+  const d = new Date()
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`
+}
+
+function shiftMonth(month: string, delta: number): string {
+  const [y, m] = month.split('-').map(Number)
+  const d = new Date(y, m - 1 + delta, 1)
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`
+}
+
+function MonthPicker({
+  month,
+  onChange,
+}: {
+  month: string
+  onChange: (value: string) => void
+}) {
+  const thisMonth = useMemo(() => currentMonthValue(), [])
+  const lastMonth = useMemo(() => shiftMonth(thisMonth, -1), [thisMonth])
+  return (
+    <div className="flex items-center gap-2">
+      <div className="relative min-w-0">
+        <Calendar className="pointer-events-none absolute left-2.5 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-muted-foreground" />
+        <Input
+          type="month"
+          value={month}
+          onChange={(e) => e.target.value && onChange(e.target.value)}
+          className="h-8 w-[150px] rounded-md pl-8 text-xs"
+        />
+      </div>
+      <div className="flex items-center gap-1 rounded-md border border-border/60 p-0.5">
+        <Button
+          size="sm"
+          variant={month === thisMonth ? 'default' : 'ghost'}
+          className="h-7 rounded-md px-2.5 text-xs"
+          onClick={() => onChange(thisMonth)}
+        >
+          本月
+        </Button>
+        <Button
+          size="sm"
+          variant={month === lastMonth ? 'default' : 'ghost'}
+          className="h-7 rounded-md px-2.5 text-xs"
+          onClick={() => onChange(lastMonth)}
+        >
+          上月
+        </Button>
+      </div>
+    </div>
+  )
+}
+
+function EstimatedMark() {
+  return (
+    <Tooltip>
+      <TooltipTrigger asChild>
+        <sup className="ml-0.5 cursor-help font-semibold text-amber-600">*</sup>
+      </TooltipTrigger>
+      <TooltipContent>{ESTIMATED_HINT}</TooltipContent>
+    </Tooltip>
+  )
+}
+
+/** 「调用 / Credit / 成本$ / 应收$ / 毛利$」五列：按当前选中月份，从账单响应按 keyId 关联出的一行。 */
+function BillingCells({ row }: { row: BillingKeyRow | undefined }) {
+  if (!row) {
+    return (
+      <>
+        <td className="border-l border-border/60 px-4 py-3 text-right tabular-nums text-muted-foreground">—</td>
+        <td className="px-4 py-3 text-right tabular-nums text-muted-foreground">—</td>
+        <td className="px-4 py-3 text-right tabular-nums text-muted-foreground">—</td>
+        <td className="px-4 py-3 text-right tabular-nums text-muted-foreground">—</td>
+        <td className="px-4 py-3 text-right tabular-nums text-muted-foreground">—</td>
+      </>
+    )
+  }
+  const estimated = row.receivableBasis === 'discount'
+  const marginClass =
+    row.marginUsd == null ? '' : row.marginUsd >= 0 ? 'text-emerald-600' : 'text-destructive'
+  return (
+    <>
+      <td className="border-l border-border/60 px-4 py-3 text-right tabular-nums">
+        {formatNumber(row.calls)}
+      </td>
+      <td className="px-4 py-3 text-right tabular-nums">{formatCredits(row.credits)}</td>
+      <td className="px-4 py-3 text-right tabular-nums">{formatUsd(row.costUsd)}</td>
+      <td className="px-4 py-3 text-right tabular-nums">
+        {formatUsd(row.receivableUsd)}
+        {estimated && <EstimatedMark />}
+      </td>
+      <td className={`px-4 py-3 text-right tabular-nums ${marginClass}`}>
+        {formatUsd(row.marginUsd)}
+        {estimated && <EstimatedMark />}
+      </td>
+    </>
+  )
+}
+
+/** 单行「导出对账单」按钮：各自持有独立的 mutation 状态，互不干扰的 pending 展示。 */
+function ExportBillingButton({
+  keyId,
+  keyName,
+  month,
+}: {
+  keyId: number
+  keyName: string
+  month: string
+}) {
+  const exportMutation = useExportBilling()
+  return (
+    <Button
+      size="icon"
+      variant="ghost"
+      className="h-7 w-7"
+      disabled={exportMutation.isPending}
+      onClick={() => exportMutation.mutate({ keyId, keyName, month })}
+      title={exportMutation.isPending ? '导出中…' : '导出对账单'}
+    >
+      {exportMutation.isPending ? (
+        <Loader2 className="h-3.5 w-3.5 animate-spin" />
+      ) : (
+        <Download className="h-3.5 w-3.5" />
+      )}
+    </Button>
+  )
+}
 
 function formatTokens(n: number): string {
   if (n >= 1_000_000) return (n / 1_000_000).toFixed(2) + 'M'
@@ -59,6 +193,15 @@ export function ClientKeysPage() {
   const { data, isLoading } = useClientKeys()
   // 已注册分组列表（来自 groups.json 注册表，与凭据的 groups 字段解耦）
   const groupOptions = useGroupOptions()
+
+  // 账单月份：驱动下表「调用/Credit/成本$/应收$/毛利$」五列与「导出对账单」
+  const [billingMonth, setBillingMonth] = useState(currentMonthValue)
+  const { data: billingData } = useBilling(billingMonth)
+  const billingByKeyId = useMemo(() => {
+    const m = new Map<number, BillingKeyRow>()
+    for (const row of billingData?.keys ?? []) m.set(row.keyId, row)
+    return m
+  }, [billingData])
   const createKey = useCreateClientKey()
   const deleteKey = useDeleteClientKey()
   const setDisabled = useSetClientKeyDisabled()
@@ -264,8 +407,9 @@ export function ClientKeysPage() {
   }
 
   return (
+    <TooltipProvider delayDuration={150}>
     <div>
-      <div className="mb-6 flex items-end justify-between gap-4">
+      <div className="mb-6 flex flex-wrap items-end justify-between gap-4">
         <div>
           <h1 className="text-[28px] font-semibold tracking-tight leading-tight">客户端 Key</h1>
           <p className="mt-1 text-sm text-muted-foreground">
@@ -275,6 +419,13 @@ export function ClientKeysPage() {
         <Button onClick={() => setCreateOpen(true)} size="sm">
           <Plus className="h-3.5 w-3.5" />新建 Key
         </Button>
+      </div>
+
+      <div className="mb-4 flex flex-wrap items-center justify-between gap-3">
+        <p className="text-[12px] text-muted-foreground">
+          下表「调用 / Credit / 成本$ / 应收$ / 毛利$」列与「导出对账单」按所选月份计算
+        </p>
+        <MonthPicker month={billingMonth} onChange={setBillingMonth} />
       </div>
 
       {isLoading ? (
@@ -295,7 +446,7 @@ export function ClientKeysPage() {
       ) : (
         <Card>
           <CardContent className="overflow-x-auto p-0">
-            <table className="w-full min-w-[1040px] text-sm">
+            <table className="w-full min-w-[1480px] text-sm">
               <thead className="text-[12px] text-muted-foreground border-b border-border/60">
                 <tr className="whitespace-nowrap">
                   <th className="text-left font-medium px-4 py-3">ID</th>
@@ -303,12 +454,30 @@ export function ClientKeysPage() {
                   <th className="text-left font-medium px-4 py-3">Key</th>
                   <th className="text-left font-medium px-4 py-3">分组</th>
                   <th className="text-left font-medium px-4 py-3">对客定价</th>
+                  <th
+                    className="border-l border-border/60 text-right font-medium px-4 py-3"
+                    title="按所选月份计算"
+                  >
+                    调用
+                  </th>
+                  <th className="text-right font-medium px-4 py-3" title="按所选月份计算">
+                    Credit
+                  </th>
+                  <th className="text-right font-medium px-4 py-3" title="按所选月份计算">
+                    成本$
+                  </th>
+                  <th className="text-right font-medium px-4 py-3" title="按所选月份计算">
+                    应收$
+                  </th>
+                  <th className="text-right font-medium px-4 py-3" title="按所选月份计算">
+                    毛利$
+                  </th>
                   <th className="text-left font-medium px-4 py-3">状态</th>
                   <th className="text-right font-medium px-4 py-3">总调用</th>
                   <th className="text-right font-medium px-4 py-3">输入</th>
                   <th className="text-right font-medium px-4 py-3">输出</th>
                   <th className="text-left font-medium px-4 py-3">最后使用</th>
-                  <th className="sticky right-0 z-20 min-w-[11.75rem] border-l border-border/60 bg-card px-4 py-3 text-right font-medium">
+                  <th className="sticky right-0 z-20 min-w-[13.5rem] border-l border-border/60 bg-card px-4 py-3 text-right font-medium">
                     操作
                   </th>
                 </tr>
@@ -363,6 +532,7 @@ export function ClientKeysPage() {
                     <td className="px-4 py-3">
                       <PricingCell item={k} />
                     </td>
+                    <BillingCells row={billingByKeyId.get(k.id)} />
                     <td className="px-4 py-3">
                       {k.disabled ? (
                         <Badge variant="destructive">已禁用</Badge>
@@ -414,6 +584,7 @@ export function ClientKeysPage() {
                         >
                           <RotateCcw className="h-3.5 w-3.5" />
                         </Button>
+                        <ExportBillingButton keyId={k.id} keyName={k.name} month={billingMonth} />
                         {!k.isSystem && (
                           <Button
                             size="icon"
@@ -678,5 +849,6 @@ export function ClientKeysPage() {
         </DialogContent>
       </Dialog>
     </div>
+    </TooltipProvider>
   )
 }

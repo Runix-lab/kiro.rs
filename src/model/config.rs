@@ -386,8 +386,11 @@ fn default_trace_retention_days() -> u32 {
     7
 }
 
+/// 月结对账要能回看整个上一个自然月。31 天不够——月初 5 号结上个月的账时，
+/// 上月 1 号已经是 35 天前，日志早被清了，那几天会被当成"零消费"结进账单。
+/// 70 天 = 一个完整月 + 一个完整月的缓冲。
 fn default_usage_log_retention_days() -> u32 {
-    31
+    70
 }
 
 impl Default for Config {

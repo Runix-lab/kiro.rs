@@ -1,5 +1,7 @@
-import { keepPreviousData, useQuery } from '@tanstack/react-query'
-import { getBilling, getByCredential, getByModel, getOverview, getTimeSeries, getTpm } from '@/api/stats'
+import { keepPreviousData, useMutation, useQuery } from '@tanstack/react-query'
+import { toast } from 'sonner'
+import { exportBilling, getBilling, getByCredential, getByModel, getOverview, getTimeSeries, getTpm } from '@/api/stats'
+import { extractErrorMessage } from '@/lib/utils'
 import type { StatsFilter, StatsTimeFilter, TpmDim } from '@/types/api'
 
 /**
@@ -84,5 +86,35 @@ export function useBilling(month: string) {
     queryKey: ['stats', 'billing', month],
     queryFn: () => getBilling({ month }),
     ...COMMON,
+  })
+}
+
+/**
+ * 导出单个客户端 Key 指定月份的对账单 CSV。
+ *
+ * 每个调用方各自持有一份 mutation 状态（不共享 queryKey），因此表格里逐行调用本 hook
+ * 即可拿到互不干扰的按钮 pending 态。成功后直接触发浏览器下载；若服务端标出了缺日志的
+ * 日期，额外弹一条提示——"当天无日志"和"当天无消耗"是两回事，对账时不能混为一谈。
+ */
+export function useExportBilling() {
+  return useMutation({
+    mutationFn: ({ keyId, month }: { keyId: number; month: string; keyName: string }) =>
+      exportBilling(keyId, month),
+    onSuccess: (result, variables) => {
+      const url = URL.createObjectURL(result.blob)
+      const a = document.createElement('a')
+      a.href = url
+      a.download = result.filename || `billing-${variables.keyName}-${variables.month}.csv`
+      document.body.appendChild(a)
+      a.click()
+      document.body.removeChild(a)
+      URL.revokeObjectURL(url)
+      if (result.missingDays && result.missingDays.length > 0) {
+        toast.info(`以下日期无日志：${result.missingDays.join('、')}`)
+      }
+    },
+    onError: (err) => {
+      toast.error('导出对账单失败：' + extractErrorMessage(err))
+    },
   })
 }

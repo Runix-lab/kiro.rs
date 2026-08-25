@@ -1120,6 +1120,11 @@ impl AdminService {
         Ok(())
     }
 
+    /// 用量日志记录器（导出对账明细时按目录读取历史文件）
+    pub fn usage_recorder(&self) -> Option<crate::admin::usage_stats::SharedRecorder> {
+        self.usage_recorder.clone()
+    }
+
     /// 当前调度配置（从 config.json 读取，运行时可改）
     pub fn scheduling_config(&self) -> crate::admin::scheduling::SchedulingConfig {
         self.token_manager.config().scheduling.clone()

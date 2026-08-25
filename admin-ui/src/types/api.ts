@@ -562,6 +562,10 @@ export interface BillingResponse {
   totals: BillingTotals
   /** 月结前需要人工处理的"漏收"清单 */
   unpricedKeys: UnpricedKey[]
+  /** 账期内没有日志文件的日期。"那天没日志" ≠ "那天没消费"，月结时必须区分 */
+  missingDays: string[]
+  /** 账期时区，固定 Asia/Shanghai */
+  timezone: string
   /** credit → USD 汇率 */
   creditUsdRate: number
   /** 成本口径固定可信 */

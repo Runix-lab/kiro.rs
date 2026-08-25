@@ -196,6 +196,13 @@ async fn main() {
         cache_dir.clone(),
         config.usage_log_retention_days as i64,
     ));
+    if config.usage_log_retention_days < 62 {
+        tracing::warn!(
+            retention_days = config.usage_log_retention_days,
+            "用量日志保留期不足 62 天：月结时上个月靠前的日期可能已被清理，\
+             对账会把它们当成零消费。建议调到 70 天。"
+        );
+    }
     let usage_aggregator = std::sync::Arc::new(admin::UsageAggregator::new());
     usage_aggregator.rebuild_from_logs(&cache_dir);
 

@@ -163,6 +163,206 @@ impl UsageRecorder {
     }
 }
 
+impl UsageRecorder {
+    /// 日志目录（导出对账明细时按日期定位文件用）
+    pub fn dir(&self) -> &Path {
+        &self.dir
+    }
+}
+
+/// 结算时区：北京时间。中国 1991 年后不再有夏令时，固定 +08:00 与 Asia/Shanghai
+/// 在任何我们会结算的日期上都完全等价，所以用固定偏移而不引入 tzdata 依赖。
+pub const SETTLEMENT_OFFSET_SECS: i32 = 8 * 3600;
+
+/// 结算时区（北京，+08:00），明细展示与账期归属都用它。
+pub fn settlement_tz() -> chrono::FixedOffset {
+    settlement_offset()
+}
+
+fn settlement_offset() -> chrono::FixedOffset {
+    chrono::FixedOffset::east_opt(SETTLEMENT_OFFSET_SECS).expect("+08:00 是合法偏移")
+}
+
+/// 逐行读取某个日期区间内某个 Key 的用量记录，交给 `sink` 处理。
+///
+/// `start` / `end_exclusive` 是**北京时间的自然日**——月结按北京时间算，这是账单口径。
+/// 但日志文件是按服务器本地日期滚动的（生产上是 UTC），两者差 8 小时：北京 8 月 1 日
+/// 00:00–08:00 的请求落在文件名为 7 月 31 日的文件里。所以这里**多扫前后各一天的文件，
+/// 再逐条按记录自身的 `ts` 换算到北京时间过滤**——文件名只用来找文件，账期归属只认
+/// 时间戳。少了这一层，月头月尾各会错进/错出 8 小时的流量。
+///
+/// 对账导出可能有几万行，全部读进内存再序列化没有必要——按文件、按行流式过一遍即可。
+/// 单个文件读失败只跳过该文件：导出缺一天也比整个对账单失败强，缺口由调用方在
+/// 响应里说明。
+pub fn scan_usage_records(
+    dir: &Path,
+    start: NaiveDate,
+    end_exclusive: NaiveDate,
+    key_id: Option<u64>,
+    mut sink: impl FnMut(&UsageRecord),
+) -> (u64, Vec<String>) {
+    let tz = settlement_offset();
+    let Some(window_start) = start.and_hms_opt(0, 0, 0).map(|t| t.and_local_timezone(tz)) else {
+        return (0, Vec::new());
+    };
+    let Some(window_end) = end_exclusive
+        .and_hms_opt(0, 0, 0)
+        .map(|t| t.and_local_timezone(tz))
+    else {
+        return (0, Vec::new());
+    };
+    let (Some(window_start), Some(window_end)) =
+        (window_start.single(), window_end.single())
+    else {
+        return (0, Vec::new());
+    };
+
+    let mut scanned = 0u64;
+    let mut missing_days: Vec<String> = Vec::new();
+    // 前后各多扫一天，覆盖时区偏移把记录挤到相邻文件里的情况。
+    let mut day = start.pred_opt().unwrap_or(start);
+    let scan_end = end_exclusive.succ_opt().unwrap_or(end_exclusive);
+    let today = Local::now().date_naive();
+
+    while day < scan_end {
+        let path = dir.join(format!("usage_log.{}.jsonl", day.format("%Y-%m-%d")));
+        match File::open(&path) {
+            Ok(f) => {
+                for line in BufReader::new(f).lines().map_while(Result::ok) {
+                    let line = line.trim();
+                    if line.is_empty() {
+                        continue;
+                    }
+                    let Ok(rec) = serde_json::from_str::<UsageRecord>(line) else {
+                        continue;
+                    };
+                    if key_id.is_some_and(|k| rec.key_id != k) {
+                        continue;
+                    }
+                    // 账期归属只认记录自身的时间戳。解析不出来的行宁可漏掉也不能
+                    // 错记到别的月份——对账单里多一条不属于本期的记录比少一条更难解释。
+                    let Ok(ts) = chrono::DateTime::parse_from_rfc3339(&rec.ts) else {
+                        continue;
+                    };
+                    if ts < window_start || ts >= window_end {
+                        continue;
+                    }
+                    scanned += 1;
+                    sink(&rec);
+                }
+            }
+            // 文件不存在通常就是那天没有流量，不是错误；但要如实报给调用方，
+            // 免得"那天没数据"被当成"那天没消费"。未来的日期不算缺口。
+            Err(_) if day <= today => missing_days.push(day.format("%Y-%m-%d").to_string()),
+            Err(_) => {}
+        }
+        day = match day.succ_opt() {
+            Some(d) => d,
+            None => break,
+        };
+    }
+    (scanned, missing_days)
+}
+
+/// 按北京自然日区间，从用量日志直接算出每个 Key 的月结账目。
+///
+/// 为什么不用内存聚合器（[`UsageAggregator::query_billing`]）：聚合器只保留 31 个
+/// 日桶，9 月 5 日结 8 月的账时 8 月 1–4 日已经掉出窗口，会被静默算成零消费；而且
+/// 它和导出明细是两个数据源，客户把明细加起来对不上总账就没法对账了。
+/// 这里和 [`scan_usage_records`] 走同一条流式路径，总账与明细**由构造保证一致**。
+///
+/// 返回 `(账目行, 缺失日期)`。缺失日期必须一路透传到界面——"那天没日志"和
+/// "那天没消费"是两回事，月结时必须能分辨。
+pub fn billing_from_logs(
+    dir: &Path,
+    start: NaiveDate,
+    end_exclusive: NaiveDate,
+    pricing: &crate::common::pricing::PricingTable,
+    pricing_of: &dyn Fn(u64) -> (Option<f64>, Option<f64>),
+) -> (Vec<KeyBillingRow>, Vec<String>) {
+    #[derive(Default)]
+    struct Acc {
+        calls: u64,
+        input: u64,
+        output: u64,
+        cache_write: u64,
+        cache_read: u64,
+        credits: f64,
+    }
+
+    let mut per_key: HashMap<u64, Acc> = HashMap::new();
+    let mut per_key_model: HashMap<(u64, String), Acc> = HashMap::new();
+
+    let (_, missing) = scan_usage_records(dir, start, end_exclusive, None, |rec| {
+        for acc in [
+            per_key.entry(rec.key_id).or_default(),
+            per_key_model
+                .entry((rec.key_id, rec.model.clone()))
+                .or_default(),
+        ] {
+            acc.calls += 1;
+            acc.input += rec.input_tokens;
+            acc.output += rec.output_tokens;
+            acc.cache_write += rec.cache_creation_tokens;
+            acc.cache_read += rec.cache_read_tokens;
+            acc.credits += if rec.credits.is_finite() && rec.credits > 0.0 {
+                rec.credits
+            } else {
+                // 负数/NaN 只可能来自损坏的行。计 0 而不是让它污染整张账单。
+                0.0
+            };
+        }
+    });
+
+    // 官方牌价按模型算，再按 Key 汇总
+    let mut official: HashMap<u64, (f64, bool)> = HashMap::new();
+    for ((key_id, model), a) in &per_key_model {
+        if let Some(usd) =
+            pricing.official_usd(model, a.input, a.output, a.cache_write, a.cache_read)
+        {
+            let e = official.entry(*key_id).or_insert((0.0, false));
+            e.0 += usd;
+            e.1 = true;
+        }
+    }
+
+    let mut rows: Vec<KeyBillingRow> = per_key
+        .into_iter()
+        .map(|(key_id, s)| {
+            let official_usd = official
+                .get(&key_id)
+                .and_then(|(sum, any)| any.then_some(*sum));
+            let (billing_discount, price_per_credit) = pricing_of(key_id);
+            let credit_usd = pricing.credit_usd(s.credits);
+            let (receivable_usd, receivable_basis) = match price_per_credit {
+                Some(p) => (Some(s.credits * p), Some("perCredit")),
+                None => match (official_usd, billing_discount) {
+                    (Some(o), Some(d)) => (Some(o * d), Some("discount")),
+                    _ => (None, None),
+                },
+            };
+            KeyBillingRow {
+                key_id,
+                calls: s.calls,
+                input_tokens: s.input,
+                output_tokens: s.output,
+                cache_creation_tokens: s.cache_write,
+                cache_read_tokens: s.cache_read,
+                credits: s.credits,
+                credit_usd,
+                official_usd,
+                billing_discount,
+                price_per_credit,
+                receivable_usd,
+                receivable_basis,
+                margin_usd: receivable_usd.map(|r| r - credit_usd),
+            }
+        })
+        .collect();
+    rows.sort_by(|a, b| b.credit_usd.total_cmp(&a.credit_usd));
+    (rows, missing)
+}
+
 fn parse_usage_log_filename(name: &str) -> Option<NaiveDate> {
     // 形如 usage_log.2026-05-22.jsonl
     let body = name.strip_prefix("usage_log.")?.strip_suffix(".jsonl")?;
@@ -897,6 +1097,169 @@ mod tests {
     fn parse_log_filename() {
         assert!(parse_usage_log_filename("usage_log.2026-05-22.jsonl").is_some());
         assert!(parse_usage_log_filename("foo.bar").is_none());
+    }
+
+    /// 每个测试一个独立目录，互不干扰。用进程 id + 名字，不引额外依赖。
+    fn temp_dir(tag: &str) -> PathBuf {
+        let p = std::env::temp_dir().join(format!("kiro_billing_test_{}_{}", tag, std::process::id()));
+        let _ = std::fs::remove_dir_all(&p);
+        std::fs::create_dir_all(&p).unwrap();
+        p
+    }
+
+    /// 写一个用量日志文件（文件名给的是"服务器本地日期"，内容 ts 是 UTC）
+    fn write_log(dir: &Path, file_day: &str, records: &[(&str, u64, f64)]) {
+        let path = dir.join(format!("usage_log.{}.jsonl", file_day));
+        let mut body = String::new();
+        for (ts, key_id, credits) in records {
+            body.push_str(&format!(
+                r#"{{"ts":"{}","keyId":{},"credentialId":1,"model":"claude-opus-5","inputTokens":10,"outputTokens":20,"cacheCreationTokens":0,"cacheReadTokens":0,"credits":{},"durationMs":100,"status":"success"}}"#,
+                ts, key_id, credits
+            ));
+            body.push('\n');
+        }
+        std::fs::write(path, body).unwrap();
+    }
+
+    /// 账期按北京时间切：日志文件按 UTC 日期滚动，北京 8/1 00:00–08:00 的请求
+    /// 落在文件名为 7-31 的文件里。这条请求必须算进 8 月，不能算进 7 月。
+    ///
+    /// 这是真金白银的边界——错了就是月头月尾各错 8 小时的流量。
+    #[test]
+    fn billing_period_follows_beijing_days_not_file_names() {
+        let dir = temp_dir("tz");
+        let d = dir.as_path();
+
+        write_log(
+            d,
+            "2026-07-31",
+            &[
+                // UTC 7-31 15:59 = 北京 7-31 23:59 → 属于 7 月
+                ("2026-07-31T15:59:00+00:00", 1, 100.0),
+                // UTC 7-31 16:00 = 北京 8-01 00:00 → 属于 8 月
+                ("2026-07-31T16:00:00+00:00", 1, 7.0),
+            ],
+        );
+        write_log(
+            d,
+            "2026-08-31",
+            &[
+                // UTC 8-31 15:59 = 北京 8-31 23:59 → 属于 8 月
+                ("2026-08-31T15:59:00+00:00", 1, 11.0),
+                // UTC 8-31 16:00 = 北京 9-01 00:00 → 属于 9 月
+                ("2026-08-31T16:00:00+00:00", 1, 500.0),
+            ],
+        );
+
+        let mut credits = 0.0;
+        let (scanned, _) = scan_usage_records(
+            d,
+            NaiveDate::from_ymd_opt(2026, 8, 1).unwrap(),
+            NaiveDate::from_ymd_opt(2026, 9, 1).unwrap(),
+            None,
+            |r| credits += r.credits,
+        );
+
+        assert_eq!(scanned, 2, "8 月应当只收进跨界的那两条");
+        assert_eq!(
+            credits, 18.0,
+            "7+11：北京 7-31 23:59 那条和北京 9-01 00:00 那条都不该进 8 月账"
+        );
+    }
+
+    /// 缺失的日期必须报出来。"那天没日志"和"那天没消费"结论完全不同，
+    /// 静默当成零消费会让账单少收而没人发现。
+    #[test]
+    fn missing_day_files_are_reported_not_silently_zeroed() {
+        let dir = temp_dir("missing");
+        let d = dir.as_path();
+        write_log(d, "2026-08-01", &[("2026-08-01T02:00:00+00:00", 1, 5.0)]);
+        // 8-02 故意不写
+
+        let (_, missing) = scan_usage_records(
+            d,
+            NaiveDate::from_ymd_opt(2026, 8, 1).unwrap(),
+            NaiveDate::from_ymd_opt(2026, 8, 4).unwrap(),
+            None,
+            |_| {},
+        );
+        assert!(
+            missing.contains(&"2026-08-02".to_string()),
+            "缺失日期没报出来: {:?}",
+            missing
+        );
+    }
+
+    /// 总账与明细必须同源：同一区间，明细逐条加出来的 credits
+    /// 必须等于总账那一行的 credits。对不上客户就没法对账。
+    #[test]
+    fn summary_and_detail_agree_by_construction() {
+        let dir = temp_dir("agree");
+        let d = dir.as_path();
+        write_log(
+            d,
+            "2026-08-10",
+            &[
+                ("2026-08-10T01:00:00+00:00", 7, 3.5),
+                ("2026-08-10T02:00:00+00:00", 7, 1.25),
+                ("2026-08-10T03:00:00+00:00", 9, 2.0),
+            ],
+        );
+
+        let pricing = crate::common::pricing::PricingTable::from_config(
+            &crate::common::pricing::PricingConfig::default(),
+        );
+        let (rows, _) = billing_from_logs(
+            d,
+            NaiveDate::from_ymd_opt(2026, 8, 10).unwrap(),
+            NaiveDate::from_ymd_opt(2026, 8, 11).unwrap(),
+            &pricing,
+            &|_| (None, None),
+        );
+
+        let mut detail = 0.0;
+        scan_usage_records(
+            d,
+            NaiveDate::from_ymd_opt(2026, 8, 10).unwrap(),
+            NaiveDate::from_ymd_opt(2026, 8, 11).unwrap(),
+            Some(7),
+            |r| detail += r.credits,
+        );
+
+        let row7 = rows.iter().find(|r| r.key_id == 7).expect("key 7 应在账目里");
+        assert_eq!(row7.credits, detail, "总账与明细不一致");
+        assert_eq!(row7.calls, 2);
+    }
+
+    /// 损坏的行（负 credits / NaN）不能污染账单，也不能让整个导出失败。
+    #[test]
+    fn corrupt_lines_do_not_poison_the_bill() {
+        let dir = temp_dir("corrupt");
+        let d = dir.as_path();
+        let path = d.join("usage_log.2026-08-10.jsonl");
+        std::fs::write(
+            &path,
+            concat!(
+                r#"{"ts":"2026-08-10T01:00:00+00:00","keyId":1,"credentialId":1,"model":"claude-opus-5","inputTokens":10,"outputTokens":20,"credits":5.0,"status":"success"}"#, "\n",
+                "这不是 json\n",
+                r#"{"ts":"2026-08-10T02:00:00+00:00","keyId":1,"credentialId":1,"model":"claude-opus-5","inputTokens":10,"outputTokens":20,"credits":-999.0,"status":"success"}"#, "\n",
+                r#"{"ts":"坏时间","keyId":1,"credentialId":1,"model":"claude-opus-5","inputTokens":10,"outputTokens":20,"credits":42.0,"status":"success"}"#, "\n",
+            ),
+        )
+        .unwrap();
+
+        let pricing = crate::common::pricing::PricingTable::from_config(
+            &crate::common::pricing::PricingConfig::default(),
+        );
+        let (rows, _) = billing_from_logs(
+            d,
+            NaiveDate::from_ymd_opt(2026, 8, 10).unwrap(),
+            NaiveDate::from_ymd_opt(2026, 8, 11).unwrap(),
+            &pricing,
+            &|_| (None, None),
+        );
+        let row = rows.iter().find(|r| r.key_id == 1).unwrap();
+        assert_eq!(row.credits, 5.0, "负数/坏行必须计 0，不能加也不能减");
     }
 
     /// 账单口径：单价优先于折扣，两者都缺则不出应收（不猜）。
