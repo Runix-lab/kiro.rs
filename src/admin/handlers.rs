@@ -1672,7 +1672,8 @@ pub async fn billing_export(
     );
     let mut total_credits = 0.0f64;
     let mut total_cost = 0.0f64;
-    let mut total_receivable = 0.0f64;
+    // 对客金额一律走整数微美元，保证明细能加平合计
+    let mut total_receivable_micros = 0i64;
     let want_json = params.get("format").map(|f| f == "json").unwrap_or(false);
 
     let scan = crate::admin::usage_stats::scan_usage_records(
@@ -1717,7 +1718,8 @@ pub async fn billing_export(
             // 客户把一列加一遍就会对不上——对账单里最经不起的就是这个。
             total_credits += round6(credits);
             total_cost += round6(cost);
-            total_receivable += receivable.map(round6).unwrap_or(0.0);
+            let receivable_micros = receivable.map(to_micros);
+            total_receivable_micros += receivable_micros.unwrap_or(0);
 
             if want_json {
                 rows.push(serde_json::json!({
@@ -1747,8 +1749,9 @@ pub async fn billing_export(
                     rec.output_tokens,
                     rec.cache_creation_tokens,
                     rec.cache_read_tokens,
-                    receivable
-                        .map(|v| format!("{:.6}", v))
+                    // 打印的就是累加的那个整数，不存在第二条舍入路径
+                    receivable_micros
+                        .map(fmt_micros)
                         .unwrap_or_else(|| "".to_string()),
                     csv_field(&rec.status),
                 );
@@ -1762,7 +1765,7 @@ pub async fn billing_export(
     // 总账判 "无法计价"，导出这边不能自称 discount 还给个 0.0。
     let basis = if price_per_credit.is_some() {
         "perCredit"
-    } else if discount.is_some() && total_receivable > 0.0 {
+    } else if discount.is_some() && total_receivable_micros > 0 {
         "discount"
     } else {
         "none"
@@ -1779,7 +1782,8 @@ pub async fn billing_export(
                 "records": scanned,
                 "credits": total_credits,
                 "costUsd": total_cost,
-                "receivableUsd": (basis != "none").then_some(total_receivable),
+                "receivableUsd": (basis != "none")
+                    .then_some(total_receivable_micros as f64 / 1e6),
             },
             "receivableBasis": basis,
             "missingDays": missing,
@@ -1794,7 +1798,7 @@ pub async fn billing_export(
         "\"合计\",\"{} 条\",,,,,{},",
         scanned,
         if basis != "none" {
-            format!("{:.6}", total_receivable)
+            fmt_micros(total_receivable_micros)
         } else {
             String::new()
         }
@@ -1870,12 +1874,86 @@ fn csv_field(v: &str) -> String {
     }
 }
 
-/// 舍入到 6 位小数——CSV 里打印几位，合计就按几位加，保证客户能把列加平。
+/// 舍入到 6 位小数（仅供 JSON 口径使用）。
 fn round6(v: f64) -> f64 {
     if v.is_finite() {
         (v * 1e6).round() / 1e6
     } else {
         0.0
+    }
+}
+
+/// 金额转「微美元」整数（6 位小数的最小单位）。
+///
+/// CSV 的每一行和合计行**必须来自同一个整数**，否则行用 `{:.6}` 格式化、合计用
+/// 浮点累加，两条舍入路径会在半分位上分叉——实测 11490 行差了 0.000055，客户
+/// 把金额列加一遍就对不上合计。整数累加让"加得平"由构造保证，而不是靠两个
+/// 舍入函数碰巧一致。
+fn to_micros(v: f64) -> i64 {
+    if v.is_finite() {
+        (v * 1e6).round() as i64
+    } else {
+        0
+    }
+}
+
+/// 微美元整数还原成 6 位小数字符串（与 `to_micros` 严格互逆）
+fn fmt_micros(m: i64) -> String {
+    let sign = if m < 0 { "-" } else { "" };
+    let a = m.abs();
+    format!("{}{}.{:06}", sign, a / 1_000_000, a % 1_000_000)
+}
+
+#[cfg(test)]
+mod money_tests {
+    use super::*;
+
+    /// 明细逐行加总必须精确等于合计——这是整张对账单的立身之本。
+    /// 从前行用 `{:.6}` 格式化、合计用浮点累加，两条舍入路径在半分位上分叉，
+    /// 实测 11490 行差了 0.000055，客户把金额列加一遍就对不上。
+    #[test]
+    fn printed_rows_sum_exactly_to_the_printed_total() {
+        // 刻意挑落在半微美元边界上的值——正是从前分叉的那一类
+        let values = [
+            0.0212054999_f64,
+            0.0000005,
+            0.1234565,
+            1.9999995,
+            0.000_000_4,
+            642.532_866_5,
+        ];
+        let mut total = 0i64;
+        let mut printed_sum = 0i64;
+        for v in values {
+            let m = to_micros(v);
+            total += m;
+            // 客户看到的是字符串，所以就从字符串反解回来加
+            let s = fmt_micros(m);
+            let parsed: f64 = s.parse().unwrap();
+            printed_sum += (parsed * 1e6).round() as i64;
+        }
+        assert_eq!(
+            printed_sum, total,
+            "打印出去的数加起来必须等于合计，实得 {} vs {}",
+            fmt_micros(printed_sum),
+            fmt_micros(total)
+        );
+    }
+
+    #[test]
+    fn fmt_micros_is_the_inverse_of_to_micros() {
+        for m in [0i64, 1, -1, 999_999, 1_000_000, -1_234_567, 642_532_866] {
+            let s = fmt_micros(m);
+            assert_eq!(to_micros(s.parse::<f64>().unwrap()), m, "往返不一致: {}", s);
+        }
+    }
+
+    /// CSV 字段必须转义：model 是客户端可控的，一个逗号就能把金额顶进状态列。
+    #[test]
+    fn csv_fields_survive_hostile_model_names() {
+        assert_eq!(csv_field("claude-opus-4-5,999"), "\"claude-opus-4-5,999\"");
+        assert_eq!(csv_field("say \"hi\""), "\"say \"\"hi\"\"\"");
+        assert_eq!(csv_field("=1+1"), "\"'=1+1\"");
     }
 }
 
