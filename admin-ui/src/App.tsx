@@ -4,7 +4,7 @@ import { LoginPage } from "@/components/login-page";
 import { Toaster } from "@/components/ui/sonner";
 import { ConfirmProvider } from "@/components/ui/confirm-dialog";
 import { Button } from "@/components/ui/button";
-import { Activity, KeyRound, Server, LogOut, Moon, Sun, ScrollText, FolderTree } from "lucide-react";
+import { Activity, KeyRound, Server, LogOut, Moon, Sun, ScrollText, FolderTree, Receipt } from "lucide-react";
 import { TopbarTools } from "@/components/topbar-tools";
 
 function GithubIcon({ className }: { className?: string }) {
@@ -38,13 +38,18 @@ const TraceLogPage = lazy(() =>
     default: m.TraceLogPage,
   })),
 );
+const BillingPage = lazy(() =>
+  import("@/components/billing-page").then((m) => ({
+    default: m.BillingPage,
+  })),
+);
 const GroupsPage = lazy(() =>
   import("@/components/groups-page").then((m) => ({
     default: m.GroupsPage,
   })),
 );
 
-type Tab = "overview" | "credentials" | "keys" | "groups" | "traces";
+type Tab = "overview" | "credentials" | "keys" | "billing" | "groups" | "traces";
 
 const TABS: {
   key: Tab;
@@ -71,6 +76,12 @@ const TABS: {
     icon: <KeyRound className="h-3.5 w-3.5" />,
   },
   {
+    key: "billing",
+    label: "月度账单",
+    mobileLabel: "账单",
+    icon: <Receipt className="h-3.5 w-3.5" />,
+  },
+  {
     key: "groups",
     label: "分组管理",
     mobileLabel: "分组",
@@ -89,6 +100,7 @@ function readTabFromHash(): Tab {
   if (
     h === "credentials" ||
     h === "keys" ||
+    h === "billing" ||
     h === "groups" ||
     h === "overview" ||
     h === "traces"
@@ -376,6 +388,7 @@ function AppMain({ onLogout, tab }: { onLogout: () => void; tab: Tab }) {
         {tab === "overview" && <OverviewPage />}
         {tab === "credentials" && <Dashboard onLogout={onLogout} embedded />}
         {tab === "keys" && <ClientKeysPage />}
+        {tab === "billing" && <BillingPage />}
         {tab === "groups" && <GroupsPage />}
         {tab === "traces" && <TraceLogPage />}
       </Suspense>

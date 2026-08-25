@@ -57,6 +57,19 @@ pub struct ClientKey {
     /// 老数据无此字段，默认 false。
     #[serde(default, skip_serializing_if = "is_false")]
     pub is_system: bool,
+    /// 对客折扣：应收 = 官方牌价 × 本系数。0.3 表示按官方价的三折向该客户计费。
+    ///
+    /// `None` = 未定价，账单里显示"—"而不是按 0 计费——把未配置当免费是账单里
+    /// 最容易造成漏收的默认值。取值需 > 0；上层负责校验。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub billing_discount: Option<f64>,
+    /// 对客单价：应收 = credits × 本值（美元/credit）。
+    ///
+    /// **比 `billing_discount` 可靠**：credits 是上游 meteringEvent 的真值，而折扣的分母
+    /// （官方牌价）要靠 token 明细换算，而 token 明细在上游不下发时是本地估算的
+    /// （见 ARCHITECTURE.md §4.1.1）。两者都设置时以本项为准。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub billing_price_per_credit: Option<f64>,
 }
 
 /// `by_key` 仅用于判重；鉴权扫描 `entries` 并做常量时间比较。
@@ -196,6 +209,8 @@ impl ClientKeyManager {
             total_credits: 0.0,
             group: group.filter(|g| !g.trim().is_empty()),
             is_system: false,
+            billing_discount: None,
+            billing_price_per_credit: None,
         };
         inner.by_key.insert(plaintext, id);
         inner.entries.insert(id, entry.clone());
@@ -239,6 +254,8 @@ impl ClientKeyManager {
                     total_credits: 0.0,
                     group: None,
                     is_system: true,
+                    billing_discount: None,
+                    billing_price_per_credit: None,
                 },
             );
             changed = true;
@@ -315,6 +332,8 @@ impl ClientKeyManager {
         name: Option<String>,
         description: Option<Option<String>>,
         group: Option<Option<String>>,
+        billing_discount: Option<Option<f64>>,
+        billing_price_per_credit: Option<Option<f64>>,
     ) -> bool {
         let mut inner = self.inner.write();
         let updated = match inner.entries.get_mut(&id) {
@@ -327,6 +346,14 @@ impl ClientKeyManager {
                 }
                 if let Some(g) = group {
                     e.group = g.filter(|s| !s.trim().is_empty());
+                }
+                if let Some(bd) = billing_discount {
+                    // 非正数一律视为"清除定价"：0 或负折扣会算出 0 或负应收，
+                    // 那是账单里最不该静默出现的值。
+                    e.billing_discount = bd.filter(|v| v.is_finite() && *v > 0.0);
+                }
+                if let Some(pc) = billing_price_per_credit {
+                    e.billing_price_per_credit = pc.filter(|v| v.is_finite() && *v > 0.0);
                 }
                 true
             }
@@ -671,6 +698,8 @@ mod tests {
             Some("保留名称".into()),
             Some(Some("保留描述".into())),
             Some(Some("group-a".into())),
+            None,
+            None,
         );
         mgr.record_usage(0, 100, 50, 5, 10, 1.5);
         assert_eq!(mgr.verify_and_touch("custom-a"), Some(0));

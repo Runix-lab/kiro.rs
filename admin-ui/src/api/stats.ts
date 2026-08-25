@@ -1,6 +1,7 @@
 import axios from 'axios'
 import { storage } from '@/lib/storage'
 import type {
+  BillingResponse,
   CredentialDistribution,
   ModelDistribution,
   OverviewStats,
@@ -90,5 +91,16 @@ export async function getTpm(
   if (filter?.keyId !== undefined) params.keyId = String(filter.keyId)
   if (filter?.group) params.group = filter.group
   const { data } = await api.get<TpmStats>('/stats/tpm', { params })
+  return data
+}
+
+/**
+ * 月度账单：按客户端 Key 汇总成本（可信）/ 应收（口径见各行 receivableBasis）/ 毛利。
+ *
+ * 后端也接受 startDate+endDate 自定义窗口，不传 month 时默认当月至今；页面固定用月份
+ * 选择器驱动，因此这里只暴露 month 参数。
+ */
+export async function getBilling(params: { month?: string }): Promise<BillingResponse> {
+  const { data } = await api.get<BillingResponse>('/billing', { params })
   return data
 }

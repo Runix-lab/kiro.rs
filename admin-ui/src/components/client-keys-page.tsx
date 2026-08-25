@@ -1,7 +1,7 @@
 import { useState } from 'react'
 import { toast } from 'sonner'
 import {
-  Plus, KeyRound, Trash2, Copy, Eye, EyeOff, Power, RotateCcw, Pencil, RefreshCw,
+  Plus, KeyRound, Trash2, Copy, Eye, EyeOff, Power, RotateCcw, Pencil, RefreshCw, Coins,
 } from 'lucide-react'
 import { Card, CardContent } from '@/components/ui/card'
 import { Button } from '@/components/ui/button'
@@ -20,9 +20,11 @@ import {
 } from '@/hooks/use-client-keys'
 import { useGroupOptions } from '@/hooks/use-groups'
 import { GroupSingleSelect } from '@/components/group-select'
-import type { ClientKeyItem, CreateClientKeyResponse } from '@/types/api'
-import { extractErrorMessage } from '@/lib/utils'
+import type { ClientKeyItem, CreateClientKeyResponse, UpdateClientKeyRequest } from '@/types/api'
+import { extractErrorMessage, formatDiscount, formatUsd } from '@/lib/utils'
 import { useConfirm } from '@/components/ui/confirm-dialog'
+
+type PricingMode = 'perCredit' | 'discount' | 'clear'
 
 function formatTokens(n: number): string {
   if (n >= 1_000_000) return (n / 1_000_000).toFixed(2) + 'M'
@@ -38,6 +40,19 @@ function formatRelative(ts?: string): string {
   if (diff < 3600_000) return `${Math.floor(diff / 60_000)} 分钟前`
   if (diff < 86400_000) return `${Math.floor(diff / 3600_000)} 小时前`
   return `${Math.floor(diff / 86400_000)} 天前`
+}
+
+/** 「对客定价」列的紧凑展示：单价 / 折扣 / 未定价三选一。 */
+function PricingCell({ item }: { item: ClientKeyItem }) {
+  if (item.billingPricePerCredit) {
+    return (
+      <span className="text-[12px] tabular-nums">{formatUsd(item.billingPricePerCredit)}/credit</span>
+    )
+  }
+  if (item.billingDiscount) {
+    return <span className="text-[12px] tabular-nums">{formatDiscount(item.billingDiscount)}</span>
+  }
+  return <span className="text-[12px] text-muted-foreground">未定价</span>
 }
 
 export function ClientKeysPage() {
@@ -64,6 +79,12 @@ export function ClientKeysPage() {
   const [editName, setEditName] = useState('')
   const [editDesc, setEditDesc] = useState('')
   const [editGroup, setEditGroup] = useState('')
+
+  const [pricingOpen, setPricingOpen] = useState(false)
+  const [pricingTarget, setPricingTarget] = useState<ClientKeyItem | null>(null)
+  const [pricingMode, setPricingMode] = useState<PricingMode>('perCredit')
+  const [pricingPerCredit, setPricingPerCredit] = useState('')
+  const [pricingDiscount, setPricingDiscount] = useState('')
 
   const handleCreate = async (e: React.FormEvent) => {
     e.preventDefault()
@@ -182,6 +203,57 @@ export function ClientKeysPage() {
     }
   }
 
+  const startPricing = (item: ClientKeyItem) => {
+    setPricingTarget(item)
+    if (item.billingPricePerCredit) {
+      setPricingMode('perCredit')
+      setPricingPerCredit(String(item.billingPricePerCredit))
+      setPricingDiscount('')
+    } else if (item.billingDiscount) {
+      setPricingMode('discount')
+      setPricingDiscount(String(item.billingDiscount))
+      setPricingPerCredit('')
+    } else {
+      setPricingMode('perCredit')
+      setPricingPerCredit('')
+      setPricingDiscount('')
+    }
+    setPricingOpen(true)
+  }
+
+  const handleSavePricing = async (e: React.FormEvent) => {
+    e.preventDefault()
+    if (!pricingTarget) return
+    const req: UpdateClientKeyRequest = {}
+    if (pricingMode === 'perCredit') {
+      const v = Number(pricingPerCredit)
+      if (!pricingPerCredit || !(v > 0)) {
+        toast.error('请填写有效的单价')
+        return
+      }
+      req.billingPricePerCredit = v
+      req.billingDiscount = 0 // 切换口径时清掉另一种，避免后端两个字段都非空
+    } else if (pricingMode === 'discount') {
+      const v = Number(pricingDiscount)
+      if (!pricingDiscount || !(v > 0)) {
+        toast.error('请填写有效的折扣系数')
+        return
+      }
+      req.billingDiscount = v
+      req.billingPricePerCredit = 0
+    } else {
+      req.billingPricePerCredit = 0
+      req.billingDiscount = 0
+    }
+    try {
+      await updateKey.mutateAsync({ id: pricingTarget.id, req })
+      toast.success(pricingMode === 'clear' ? '已清除定价' : '定价已更新')
+      setPricingOpen(false)
+    } catch (err) {
+      toast.error('更新失败：' + extractErrorMessage(err))
+    }
+  }
+
   const copyText = async (text: string) => {
     try {
       await navigator.clipboard.writeText(text)
@@ -223,19 +295,20 @@ export function ClientKeysPage() {
       ) : (
         <Card>
           <CardContent className="overflow-x-auto p-0">
-            <table className="w-full min-w-[920px] text-sm">
+            <table className="w-full min-w-[1040px] text-sm">
               <thead className="text-[12px] text-muted-foreground border-b border-border/60">
                 <tr className="whitespace-nowrap">
                   <th className="text-left font-medium px-4 py-3">ID</th>
                   <th className="text-left font-medium px-4 py-3">名称</th>
                   <th className="text-left font-medium px-4 py-3">Key</th>
                   <th className="text-left font-medium px-4 py-3">分组</th>
+                  <th className="text-left font-medium px-4 py-3">对客定价</th>
                   <th className="text-left font-medium px-4 py-3">状态</th>
                   <th className="text-right font-medium px-4 py-3">总调用</th>
                   <th className="text-right font-medium px-4 py-3">输入</th>
                   <th className="text-right font-medium px-4 py-3">输出</th>
                   <th className="text-left font-medium px-4 py-3">最后使用</th>
-                  <th className="sticky right-0 z-20 min-w-[9.75rem] border-l border-border/60 bg-card px-4 py-3 text-right font-medium">
+                  <th className="sticky right-0 z-20 min-w-[11.75rem] border-l border-border/60 bg-card px-4 py-3 text-right font-medium">
                     操作
                   </th>
                 </tr>
@@ -288,6 +361,9 @@ export function ClientKeysPage() {
                       )}
                     </td>
                     <td className="px-4 py-3">
+                      <PricingCell item={k} />
+                    </td>
+                    <td className="px-4 py-3">
                       {k.disabled ? (
                         <Badge variant="destructive">已禁用</Badge>
                       ) : (
@@ -300,7 +376,7 @@ export function ClientKeysPage() {
                     <td className="px-4 py-3 text-[12px] text-muted-foreground">
                       {formatRelative(k.lastUsedAt)}
                     </td>
-                    <td className="sticky right-0 z-10 min-w-[9.75rem] border-l border-border/60 bg-card px-4 py-3">
+                    <td className="sticky right-0 z-10 min-w-[11.75rem] border-l border-border/60 bg-card px-4 py-3">
                       <div className="flex items-center justify-end gap-1">
                         <Button
                           size="icon"
@@ -310,6 +386,15 @@ export function ClientKeysPage() {
                           title="改名"
                         >
                           <Pencil className="h-3.5 w-3.5" />
+                        </Button>
+                        <Button
+                          size="icon"
+                          variant="ghost"
+                          className="h-7 w-7"
+                          onClick={() => startPricing(k)}
+                          title="对客定价"
+                        >
+                          <Coins className="h-3.5 w-3.5" />
                         </Button>
                         <Button
                           size="icon"
@@ -488,6 +573,103 @@ export function ClientKeysPage() {
             </div>
             <DialogFooter>
               <Button type="button" variant="outline" onClick={() => setEditOpen(false)}>取消</Button>
+              <Button type="submit" disabled={updateKey.isPending}>
+                {updateKey.isPending ? '保存中…' : '保存'}
+              </Button>
+            </DialogFooter>
+          </form>
+        </DialogContent>
+      </Dialog>
+
+      {/* 对客定价对话框 */}
+      <Dialog open={pricingOpen} onOpenChange={(o) => !updateKey.isPending && setPricingOpen(o)}>
+        <DialogContent className="sm:max-w-md">
+          <DialogHeader>
+            <DialogTitle>设置对客定价</DialogTitle>
+            <DialogDescription>
+              为 Key "{pricingTarget?.name}" 设置计费口径，用于「月度账单」页计算应收与毛利。
+            </DialogDescription>
+          </DialogHeader>
+          <form onSubmit={handleSavePricing} className="space-y-3 py-2">
+            <div className="grid grid-cols-3 gap-1 rounded-md border border-border/60 p-0.5">
+              <Button
+                type="button"
+                size="sm"
+                variant={pricingMode === 'perCredit' ? 'default' : 'ghost'}
+                className="h-8 rounded-md px-2 text-[12px]"
+                onClick={() => setPricingMode('perCredit')}
+              >
+                按 credit 单价
+              </Button>
+              <Button
+                type="button"
+                size="sm"
+                variant={pricingMode === 'discount' ? 'default' : 'ghost'}
+                className="h-8 rounded-md px-2 text-[12px]"
+                onClick={() => setPricingMode('discount')}
+              >
+                按官方价折扣
+              </Button>
+              <Button
+                type="button"
+                size="sm"
+                variant={pricingMode === 'clear' ? 'default' : 'ghost'}
+                className="h-8 rounded-md px-2 text-[12px]"
+                onClick={() => setPricingMode('clear')}
+              >
+                清除定价
+              </Button>
+            </div>
+
+            {pricingMode === 'perCredit' && (
+              <div>
+                <label className="text-[12px] text-muted-foreground">单价（$ / credit）</label>
+                <Input
+                  type="number"
+                  step="0.0001"
+                  min="0"
+                  placeholder="如 0.02"
+                  value={pricingPerCredit}
+                  onChange={(e) => setPricingPerCredit(e.target.value)}
+                  disabled={updateKey.isPending}
+                  autoFocus
+                />
+                <p className="mt-1 text-[11px] text-muted-foreground">
+                  按实际计费量（credit）直接乘单价，口径可信。
+                </p>
+              </div>
+            )}
+            {pricingMode === 'discount' && (
+              <div>
+                <label className="text-[12px] text-muted-foreground">
+                  折扣系数（0–1，如 0.3 = 三折）
+                </label>
+                <Input
+                  type="number"
+                  step="0.01"
+                  min="0"
+                  max="1"
+                  placeholder="如 0.3"
+                  value={pricingDiscount}
+                  onChange={(e) => setPricingDiscount(e.target.value)}
+                  disabled={updateKey.isPending}
+                  autoFocus
+                />
+                <p className="mt-1 text-[11px] text-amber-600">
+                  依赖官方牌价的本地估算，非上游直接下发，此口径下的应收/毛利为参考值。
+                </p>
+              </div>
+            )}
+            {pricingMode === 'clear' && (
+              <p className="text-[12px] text-muted-foreground">
+                将清除该 Key 的单价与折扣设置，账单页会把它列入「未定价」并提示处理。
+              </p>
+            )}
+
+            <DialogFooter>
+              <Button type="button" variant="outline" onClick={() => setPricingOpen(false)} disabled={updateKey.isPending}>
+                取消
+              </Button>
               <Button type="submit" disabled={updateKey.isPending}>
                 {updateKey.isPending ? '保存中…' : '保存'}
               </Button>

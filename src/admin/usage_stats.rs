@@ -330,6 +330,37 @@ pub struct ModelDistribution {
     pub discount_ratio: Option<f64>,
 }
 
+/// 单个入口 Key 的账单行。
+///
+/// 三个金额是三件不同的事，不能互相替代：
+/// - `credit_usd` **成本**：付给上游的钱（credits × 汇率），权威、无歧义
+/// - `official_usd` **官方牌价**：同样这批 token 直连官方要花多少，是定价的锚
+/// - `receivable_usd` **应收**：官方牌价 × 该 Key 的对客折扣；未配折扣时为 `None`
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct KeyBillingRow {
+    pub key_id: u64,
+    pub calls: u64,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cache_creation_tokens: u64,
+    pub cache_read_tokens: u64,
+    pub credits: f64,
+    pub credit_usd: f64,
+    /// 已配价模型的官方牌价合计；全部未配价时为 `None`
+    pub official_usd: Option<f64>,
+    /// 该 Key 的对客折扣系数（应收 ÷ 官方）；未设置为 `None`
+    pub billing_discount: Option<f64>,
+    /// 该 Key 的对客单价（美元/credit）；未设置为 `None`
+    pub price_per_credit: Option<f64>,
+    /// 应收。优先按 credits × 单价（可靠口径），否则按 官方牌价 × 折扣（估算口径）
+    pub receivable_usd: Option<f64>,
+    /// 应收采用了哪种口径："perCredit"（可靠）/ "discount"（依赖估算 token）/ null
+    pub receivable_basis: Option<&'static str>,
+    /// 毛利 = 应收 − 成本；应收缺失则为 `None`
+    pub margin_usd: Option<f64>,
+}
+
 /// 上游凭据分布
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -598,6 +629,83 @@ impl UsageAggregator {
         out
     }
 
+    /// 按入口 Key 出账单（月度结算用）。
+    ///
+    /// 官方牌价必须按 Key×模型 逐项算——各模型单价差几十倍，用聚合后的 token 总量
+    /// 乘任何单一价都是错的。`by_key_model` 正好提供这个维度。
+    ///
+    /// `discount_of` 由调用方提供（读 ClientKeyManager），本模块不感知 Key 的配置。
+    pub fn query_billing(
+        &self,
+        window: StatsQueryWindow,
+        pricing: &crate::common::pricing::PricingTable,
+        // pricing_of 返回 (对客折扣, 对客单价$/credit)
+        pricing_of: &dyn Fn(u64) -> (Option<f64>, Option<f64>),
+    ) -> Vec<KeyBillingRow> {
+        let inner = self.inner.read();
+        let buckets = select_buckets(&inner, window.granularity);
+
+        // key -> (总量, 按模型的官方成本累加)
+        let mut totals: HashMap<u64, BucketStats> = HashMap::new();
+        let mut official: HashMap<u64, (f64, bool)> = HashMap::new();
+        for b in buckets.iter().filter(|b| bucket_in_window(b, window)) {
+            for (key_id, per_model) in &b.by_key_model {
+                for (model, stats) in per_model {
+                    totals.entry(*key_id).or_default().add_stats(stats);
+                    if let Some(usd) = pricing.official_usd(
+                        model,
+                        stats.input_tokens,
+                        stats.output_tokens,
+                        stats.cache_creation_tokens,
+                        stats.cache_read_tokens,
+                    ) {
+                        let e = official.entry(*key_id).or_insert((0.0, false));
+                        e.0 += usd;
+                        e.1 = true;
+                    }
+                }
+            }
+        }
+
+        let mut rows: Vec<KeyBillingRow> = totals
+            .into_iter()
+            .map(|(key_id, s)| {
+                let official_usd = official
+                    .get(&key_id)
+                    .and_then(|(sum, any)| any.then_some(*sum));
+                let (billing_discount, price_per_credit) = pricing_of(key_id);
+                let credit_usd = pricing.credit_usd(s.credits);
+                // 单价口径优先：credits 是上游真值，而折扣的分母（官方牌价）要靠
+                // token 明细换算，那部分在上游不下发时是本地估算的。
+                let (receivable_usd, receivable_basis) = match price_per_credit {
+                    Some(p) => (Some(s.credits * p), Some("perCredit")),
+                    None => match (official_usd, billing_discount) {
+                        (Some(o), Some(d)) => (Some(o * d), Some("discount")),
+                        _ => (None, None),
+                    },
+                };
+                KeyBillingRow {
+                    key_id,
+                    calls: s.calls,
+                    input_tokens: s.input_tokens,
+                    output_tokens: s.output_tokens,
+                    cache_creation_tokens: s.cache_creation_tokens,
+                    cache_read_tokens: s.cache_read_tokens,
+                    credits: s.credits,
+                    credit_usd,
+                    official_usd,
+                    billing_discount,
+                    price_per_credit,
+                    receivable_usd,
+                    receivable_basis,
+                    margin_usd: receivable_usd.map(|r| r - credit_usd),
+                }
+            })
+            .collect();
+        rows.sort_by(|a, b| b.credit_usd.total_cmp(&a.credit_usd));
+        rows
+    }
+
     /// 概览（今日 + 最近 7 天）
     pub fn overview(&self) -> OverviewStats {
         let inner = self.inner.read();
@@ -789,6 +897,110 @@ mod tests {
     fn parse_log_filename() {
         assert!(parse_usage_log_filename("usage_log.2026-05-22.jsonl").is_some());
         assert!(parse_usage_log_filename("foo.bar").is_none());
+    }
+
+    /// 账单口径：单价优先于折扣，两者都缺则不出应收（不猜）。
+    #[test]
+    fn billing_prefers_the_reliable_per_credit_basis() {
+        let agg = UsageAggregator::new();
+        let now = Utc::now();
+        let rec = |key_id: u64, credits: f64| UsageRecord {
+            ts: now.to_rfc3339(),
+            key_id,
+            credential_id: 1,
+            model: "claude-opus-4-8".to_string(),
+            input_tokens: 1_000_000,
+            output_tokens: 0,
+            cache_creation_tokens: 0,
+            cache_read_tokens: 0,
+            credits,
+            duration_ms: 10,
+            status: "success".to_string(),
+        };
+        agg.ingest(&rec(1, 100.0)); // 只配单价
+        agg.ingest(&rec(2, 100.0)); // 只配折扣
+        agg.ingest(&rec(3, 100.0)); // 都没配
+
+        let pricing = crate::common::pricing::PricingTable::default();
+        let window = StatsQueryWindow::preset(Range::Last24h, StatsGranularity::Hour);
+        let rows = agg.query_billing(window, &pricing, &|id| match id {
+            1 => (None, Some(0.05)),       // $0.05/credit
+            2 => (Some(0.3), None),        // 官方价三折
+            _ => (None, None),
+        });
+        let row = |id: u64| rows.iter().find(|r| r.key_id == id).unwrap();
+
+        // 成本对所有人一致：100 credits × 0.02
+        for id in [1, 2, 3] {
+            assert!((row(id).credit_usd - 2.0).abs() < 1e-9);
+        }
+        // 单价口径：100 × 0.05 = $5，标为可靠
+        assert!((row(1).receivable_usd.unwrap() - 5.0).abs() < 1e-9);
+        assert_eq!(row(1).receivable_basis, Some("perCredit"));
+        assert!((row(1).margin_usd.unwrap() - 3.0).abs() < 1e-9);
+        // 折扣口径：官方 1M input @ $5 = $5，三折 = $1.5，标为估算口径
+        assert!((row(2).receivable_usd.unwrap() - 1.5).abs() < 1e-9);
+        assert_eq!(row(2).receivable_basis, Some("discount"));
+        // 未定价：不出应收也不出毛利——把未配置当免费是账单里最容易漏收的默认值
+        assert!(row(3).receivable_usd.is_none());
+        assert!(row(3).margin_usd.is_none());
+        assert!(row(3).receivable_basis.is_none());
+    }
+
+    /// 两种口径都配时以单价为准（credits 是上游真值，折扣的分母是估算）。
+    #[test]
+    fn billing_per_credit_wins_when_both_are_set() {
+        let agg = UsageAggregator::new();
+        agg.ingest(&UsageRecord {
+            ts: Utc::now().to_rfc3339(),
+            key_id: 7,
+            credential_id: 1,
+            model: "claude-opus-4-8".to_string(),
+            input_tokens: 1_000_000,
+            output_tokens: 0,
+            cache_creation_tokens: 0,
+            cache_read_tokens: 0,
+            credits: 10.0,
+            duration_ms: 10,
+            status: "success".to_string(),
+        });
+        let pricing = crate::common::pricing::PricingTable::default();
+        let window = StatsQueryWindow::preset(Range::Last24h, StatsGranularity::Hour);
+        let rows = agg.query_billing(window, &pricing, &|_| (Some(0.9), Some(0.04)));
+        let r = &rows[0];
+        assert_eq!(r.receivable_basis, Some("perCredit"));
+        assert!((r.receivable_usd.unwrap() - 0.4).abs() < 1e-9, "10 credits × $0.04");
+    }
+
+    /// 官方价按 Key×模型 逐项算：同一 Key 混用不同单价的模型时不能用单一均价。
+    #[test]
+    fn billing_official_value_is_summed_per_model() {
+        let agg = UsageAggregator::new();
+        let now = Utc::now().to_rfc3339();
+        let mk = |model: &str| UsageRecord {
+            ts: now.clone(),
+            key_id: 1,
+            credential_id: 1,
+            model: model.to_string(),
+            input_tokens: 1_000_000,
+            output_tokens: 0,
+            cache_creation_tokens: 0,
+            cache_read_tokens: 0,
+            credits: 1.0,
+            duration_ms: 10,
+            status: "success".to_string(),
+        };
+        agg.ingest(&mk("claude-opus-4-8")); // $5/M input
+        agg.ingest(&mk("claude-haiku-4-5")); // $1/M input
+        agg.ingest(&mk("deepseek-3.2")); // 未配价，不计入
+
+        let pricing = crate::common::pricing::PricingTable::default();
+        let window = StatsQueryWindow::preset(Range::Last24h, StatsGranularity::Hour);
+        let rows = agg.query_billing(window, &pricing, &|_| (Some(1.0), None));
+        let r = &rows[0];
+        // 5 + 1 = 6；未配价那条既不按 0 计也不整行作废
+        assert!((r.official_usd.unwrap() - 6.0).abs() < 1e-9);
+        assert_eq!(r.calls, 3, "调用数仍然全计");
     }
 
     #[test]

@@ -885,6 +885,12 @@ pub struct UpdateClientKeyRequest {
     pub description: Option<String>,
     #[serde(default)]
     pub group: Option<String>,
+    /// 对客折扣（应收 = 官方牌价 × 本值）。传 0 或负数表示清除定价。
+    #[serde(default)]
+    pub billing_discount: Option<f64>,
+    /// 对客单价（应收 = credits × 本值，美元/credit）。比折扣可靠，两者都设时以本项为准。
+    #[serde(default)]
+    pub billing_price_per_credit: Option<f64>,
 }
 
 // ============ IdC 设备授权登录 ============

@@ -1,5 +1,5 @@
 import { keepPreviousData, useQuery } from '@tanstack/react-query'
-import { getByCredential, getByModel, getOverview, getTimeSeries, getTpm } from '@/api/stats'
+import { getBilling, getByCredential, getByModel, getOverview, getTimeSeries, getTpm } from '@/api/stats'
 import type { StatsFilter, StatsTimeFilter, TpmDim } from '@/types/api'
 
 /**
@@ -71,6 +71,18 @@ export function useTpm(dim: TpmDim, time: StatsTimeFilter, filter?: StatsFilter)
       filter?.group ?? 'all',
     ],
     queryFn: () => getTpm(dim, time, filter),
+    ...COMMON,
+  })
+}
+
+/**
+ * 月度账单：按客户端 Key 汇总成本/应收/毛利，月份选择器（YYYY-MM）驱动。
+ * 查询 key 里带上 month，切月即自动 refetch。
+ */
+export function useBilling(month: string) {
+  return useQuery({
+    queryKey: ['stats', 'billing', month],
+    queryFn: () => getBilling({ month }),
     ...COMMON,
   })
 }

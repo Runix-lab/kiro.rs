@@ -994,10 +994,19 @@ pub async fn update_client_key(
             Some(t.to_string())
         }
     });
-    if state
-        .client_keys
-        .update_meta(id, payload.name, description, group)
-    {
+    // 折扣：>0 生效，<=0 视为清除定价（Option<Option<f64>>：外层"是否改动"，内层"设成什么"）
+    let billing_discount = payload.billing_discount.map(|v| (v > 0.0).then_some(v));
+    let price_per_credit = payload
+        .billing_price_per_credit
+        .map(|v| (v > 0.0).then_some(v));
+    if state.client_keys.update_meta(
+        id,
+        payload.name,
+        description,
+        group,
+        billing_discount,
+        price_per_credit,
+    ) {
         Json(SuccessResponse::new(format!("Key #{} 已更新", id))).into_response()
     } else {
         (
@@ -1582,6 +1591,159 @@ pub async fn traces_summary(
         "creditUsdRate": state.pricing.credit_usd_rate(),
     }))
     .into_response()
+}
+
+/// GET /api/admin/billing?month=YYYY-MM（或 startDate/endDate）
+///
+/// 月度总账：每个入口 Key 的成本、官方牌价、按其对客折扣算出的应收与毛利，外加合计。
+///
+/// 数据源是聚合器的**天桶**（保留 31 天），不是 traces.db（只留 7 天）——月结必须
+/// 覆盖整月。因此结算窗口早于 31 天前的月份查不到数据，响应里给出实际覆盖范围。
+pub async fn billing_summary(
+    State(state): State<AdminState>,
+    Query(params): Query<std::collections::HashMap<String, String>>,
+) -> axum::response::Response {
+    // month=YYYY-MM 是月结的常用写法；也接受与 stats 系一致的 startDate/endDate
+    let window = if let Some(month) = params.get("month") {
+        match month_window(month) {
+            Ok(w) => w,
+            Err(message) => return stats_bad_request(message),
+        }
+    } else {
+        match (params.get("startDate"), params.get("endDate")) {
+            (Some(s), Some(e)) => match custom_stats_window(s, e, StatsGranularity::Day) {
+                Ok(w) => w,
+                Err(message) => return stats_bad_request(message),
+            },
+            _ => {
+                // 缺省：当前自然月至今
+                let today = Local::now().date_naive();
+                let first = today.with_day(1).unwrap_or(today);
+                match custom_stats_window(
+                    &first.format("%Y-%m-%d").to_string(),
+                    &today.format("%Y-%m-%d").to_string(),
+                    StatsGranularity::Day,
+                ) {
+                    Ok(w) => w,
+                    Err(message) => return stats_bad_request(message),
+                }
+            }
+        }
+    };
+
+    let keys = state.client_keys.list();
+    let pricing_map: HashMap<u64, (Option<f64>, Option<f64>)> = keys
+        .iter()
+        .map(|k| (k.id, (k.billing_discount, k.billing_price_per_credit)))
+        .collect();
+    let name_map: HashMap<u64, String> = keys.iter().map(|k| (k.id, k.name.clone())).collect();
+
+    let rows = state.usage_aggregator.query_billing(window, &state.pricing, &|id| {
+        pricing_map.get(&id).copied().unwrap_or((None, None))
+    });
+
+    let mut total_cost = 0.0f64;
+    let mut total_official = 0.0f64;
+    let mut official_any = false;
+    let mut total_receivable = 0.0f64;
+    let mut receivable_any = false;
+    let mut unpriced_keys: Vec<serde_json::Value> = Vec::new();
+
+    let items: Vec<serde_json::Value> = rows
+        .iter()
+        .map(|r| {
+            total_cost += r.credit_usd;
+            if let Some(o) = r.official_usd {
+                total_official += o;
+                official_any = true;
+            }
+            match r.receivable_usd {
+                Some(v) => {
+                    total_receivable += v;
+                    receivable_any = true;
+                }
+                None if r.credit_usd > 0.0 => {
+                    // 有消耗却算不出应收 —— 月结时这是必须人工处理的漏收口
+                    unpriced_keys.push(serde_json::json!({
+                        "keyId": r.key_id,
+                        "name": name_map.get(&r.key_id),
+                        "costUsd": r.credit_usd,
+                        "reason": if r.billing_discount.is_none() && r.price_per_credit.is_none() {
+                            "未设置对客定价"
+                        } else {
+                            "模型未配官方价"
+                        },
+                    }));
+                }
+                None => {}
+            }
+            serde_json::json!({
+                "keyId": r.key_id,
+                "name": name_map.get(&r.key_id),
+                "calls": r.calls,
+                "inputTokens": r.input_tokens,
+                "outputTokens": r.output_tokens,
+                "cacheCreationTokens": r.cache_creation_tokens,
+                "cacheReadTokens": r.cache_read_tokens,
+                "credits": r.credits,
+                "costUsd": r.credit_usd,
+                "officialUsd": r.official_usd,
+                "billingDiscount": r.billing_discount,
+                "pricePerCredit": r.price_per_credit,
+                "receivableUsd": r.receivable_usd,
+                "receivableBasis": r.receivable_basis,
+                "marginUsd": r.margin_usd,
+            })
+        })
+        .collect();
+
+    let receivable = receivable_any.then_some(total_receivable);
+    Json(serde_json::json!({
+        "windowStart": chrono::DateTime::from_timestamp(window.start_ts, 0).map(|d| d.to_rfc3339()),
+        "windowEnd": chrono::DateTime::from_timestamp(window.end_ts, 0).map(|d| d.to_rfc3339()),
+        "keys": items,
+        "totals": {
+            "costUsd": total_cost,
+            "officialUsd": official_any.then_some(total_official),
+            "receivableUsd": receivable,
+            "marginUsd": receivable.map(|r| r - total_cost),
+            "marginRate": receivable
+                .filter(|r| *r > 0.0)
+                .map(|r| (r - total_cost) / r * 100.0),
+        },
+        // 有成本但收不出钱的 Key：月结前应当逐个处理，不能让它们静默进毛利
+        "unpricedKeys": unpriced_keys,
+        "creditUsdRate": state.pricing.credit_usd_rate(),
+        "note": "数据源为用量聚合器天桶，保留 31 天；更早的月份查不到",
+        // 成本（credits）来自上游 meteringEvent，是真值；官方牌价靠 token 明细换算，
+        // 而 token 明细在上游不下发时由本地估算补齐（ARCHITECTURE.md §4.1.1）。
+        // 因此按单价计费（perCredit）可靠，按官方价打折（discount）只应作参考。
+        "costReliable": true,
+        "officialUsdEstimated": true,
+    }))
+    .into_response()
+}
+
+/// `YYYY-MM` → 该自然月的 [月初, 次月初) 窗口。
+fn month_window(month: &str) -> Result<StatsQueryWindow, String> {
+    let parts: Vec<&str> = month.split('-').collect();
+    if parts.len() != 2 {
+        return Err("month 必须是 YYYY-MM 格式".to_string());
+    }
+    let year: i32 = parts[0].parse().map_err(|_| "month 年份无效".to_string())?;
+    let mon: u32 = parts[1].parse().map_err(|_| "month 月份无效".to_string())?;
+    let first = NaiveDate::from_ymd_opt(year, mon, 1).ok_or("month 无效".to_string())?;
+    let next = if mon == 12 {
+        NaiveDate::from_ymd_opt(year + 1, 1, 1)
+    } else {
+        NaiveDate::from_ymd_opt(year, mon + 1, 1)
+    }
+    .ok_or("month 无效".to_string())?;
+    Ok(StatsQueryWindow {
+        start_ts: local_midnight_ts(first)?,
+        end_ts: local_midnight_ts(next)?,
+        granularity: StatsGranularity::Day,
+    })
 }
 
 /// GET /api/admin/stats/tpm?dim=key|credential

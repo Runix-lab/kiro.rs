@@ -39,7 +39,11 @@ export function useUpdateClientKey() {
   return useMutation({
     mutationFn: ({ id, req }: { id: number; req: UpdateClientKeyRequest }) =>
       updateClientKey(id, req),
-    onSuccess: () => qc.invalidateQueries({ queryKey: ['client-keys'] }),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ['client-keys'] })
+      // 名称/分组/定价改动都可能影响账单页展示，一并失效
+      qc.invalidateQueries({ queryKey: ['stats', 'billing'] })
+    },
   })
 }
 

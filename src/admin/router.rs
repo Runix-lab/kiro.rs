@@ -9,7 +9,7 @@ use axum::{
 
 use super::{
     handlers::{
-        add_credential, add_proxy, apply_image_update, assign_proxies_round_robin,
+        add_credential, add_proxy, billing_summary, apply_image_update, assign_proxies_round_robin,
         assign_proxy_to_credential, batch_add_proxies, batch_import_credentials, check_all_proxies,
         check_proxy, check_rate_limit, check_update, clear_throttle, complete_social_login,
         complete_social_relogin, create_client_key, create_group, delete_client_key,
@@ -186,6 +186,7 @@ pub fn create_admin_router(state: AdminState) -> Router {
         .route("/stats/by-model", get(stats_by_model))
         .route("/stats/by-credential", get(stats_by_credential))
         .route("/stats/tpm", get(stats_tpm))
+        .route("/billing", get(billing_summary))
         .route("/traces/failure-stats", get(trace_failure_stats))
         .route("/traces/summary", get(traces_summary))
         .route("/traces", get(list_traces))

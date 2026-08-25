@@ -389,6 +389,10 @@ export interface ClientKeyItem {
   group?: string
   /** 是否系统密钥（由 config.json apiKey 同步，不可删除、可轮换） */
   isSystem: boolean
+  /** 对客折扣系数（0.3 = 三折）；未设置为 null/undefined。与 billingPricePerCredit 互斥，后写者生效 */
+  billingDiscount?: number | null
+  /** 对客单价 $/credit；未设置为 null/undefined。与 billingDiscount 互斥，后写者生效 */
+  billingPricePerCredit?: number | null
 }
 
 export interface ClientKeysResponse {
@@ -414,6 +418,10 @@ export interface UpdateClientKeyRequest {
   name?: string
   description?: string
   group?: string
+  /** 对客折扣系数（0.3 = 三折）；传 0 清除该字段 */
+  billingDiscount?: number
+  /** 对客单价 $/credit；传 0 清除该字段 */
+  billingPricePerCredit?: number
 }
 
 // ============ 用量统计 ============
@@ -493,6 +501,74 @@ export interface CredentialDistribution {
   credits: number
   /** 实付美金 = credits × 汇率 */
   creditUsd: number
+}
+
+// ============ 月度账单 ============
+
+/**
+ * 单个客户端 Key 的月度账单行。
+ *
+ * `costUsd` 由 credits（上游计费事件量）换算而来，可信；`officialUsd` 依赖上游按 token
+ * 明细下发牌价，未下发时由本地估算补齐，因此当 `receivableBasis === 'discount'` 时
+ * `receivableUsd` / `marginUsd` 都是估算值，UI 需要显著标注。
+ */
+export interface BillingKeyRow {
+  keyId: number
+  name: string | null
+  calls: number
+  inputTokens: number
+  outputTokens: number
+  cacheCreationTokens: number
+  cacheReadTokens: number
+  credits: number
+  /** 成本 = credits × creditUsdRate，可信 */
+  costUsd: number
+  /** 官方牌价美金；ESTIMATED —— 上游未下发 token 明细时由本地估算补齐 */
+  officialUsd: number | null
+  /** 对客折扣系数（0.3 = 三折）；未配置为 null */
+  billingDiscount: number | null
+  /** 对客单价 $/credit；未配置为 null */
+  pricePerCredit: number | null
+  /** 应收美金；无法定价时为 null */
+  receivableUsd: number | null
+  /** 应收口径：perCredit 可信；discount 依赖官方牌价估算；null = 未定价 */
+  receivableBasis: 'perCredit' | 'discount' | null
+  /** 毛利 = 应收 − 成本 */
+  marginUsd: number | null
+}
+
+/** 月度账单合计（跨全部已定价 Key） */
+export interface BillingTotals {
+  costUsd: number
+  officialUsd: number | null
+  receivableUsd: number | null
+  marginUsd: number | null
+  marginRate: number | null
+}
+
+/** 有消耗但算不出应收的 Key（未定价 / 该窗口全部模型未配官方牌价等） */
+export interface UnpricedKey {
+  keyId: number
+  name: string | null
+  costUsd: number
+  reason: string
+}
+
+/** GET /api/admin/billing 响应 */
+export interface BillingResponse {
+  windowStart: string | null
+  windowEnd: string | null
+  keys: BillingKeyRow[]
+  totals: BillingTotals
+  /** 月结前需要人工处理的"漏收"清单 */
+  unpricedKeys: UnpricedKey[]
+  /** credit → USD 汇率 */
+  creditUsdRate: number
+  /** 成本口径固定可信 */
+  costReliable: true
+  /** 官方牌价口径固定为本地估算 */
+  officialUsdEstimated: true
+  note: string
 }
 
 // ============ 请求链路追踪 ============
