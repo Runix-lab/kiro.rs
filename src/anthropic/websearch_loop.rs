@@ -27,7 +27,7 @@ use crate::kiro::parser::decoder::EventStreamDecoder;
 use crate::kiro::provider::KiroProvider;
 use crate::token;
 
-use super::converter::{ConversionError, convert_request_with_mode, get_context_window_size};
+use super::converter::{ConversionError, convert_request_with_mode};
 use super::handlers::{
     RequestTracer, TraceUsage, UsageRecordHook, last_attempt_outcome, map_provider_error,
 };
@@ -298,8 +298,10 @@ async fn decode_round(
                     }
                 }
                 Event::ContextUsage(cu) => {
-                    let window = get_context_window_size(model);
-                    let actual = (cu.context_usage_percentage * (window as f64) / 100.0) as i32;
+                    let actual = crate::anthropic::context_window_guard::tokens_from_context_usage(
+                        model,
+                        cu.context_usage_percentage,
+                    );
                     context_input_tokens = Some(actual);
                     if cu.context_usage_percentage >= 100.0 {
                         stop_reason_override = Some("model_context_window_exceeded".to_string());

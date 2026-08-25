@@ -45,6 +45,17 @@ fn registry() -> &'static Mutex<HashMap<String, ModelStat>> {
     REG.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+/// 把上游回报的上下文占用百分比换算成 token 数，**并顺带自诊断**。
+///
+/// 这个换算原本在流式、非流式、websearch 三条路径上各抄了一遍。同一个易错公式
+/// 抄三份，就意味着任何针对它的修复都会漏掉两处——守卫第一版只挂在流式那处，
+/// 而线上大量流量是非流式，于是守卫形同虚设。收敛成一个入口，三条路径共用。
+pub fn tokens_from_context_usage(model: &str, percentage: f64) -> i32 {
+    let window = super::converter::get_context_window_size(model);
+    observe(model, percentage, window);
+    (percentage * (window as f64) / 100.0) as i32
+}
+
 /// 记录一次 `contextUsageEvent`，必要时发出告警。
 ///
 /// `percentage` 是上游回报的上下文占用百分比，`window` 是我们当前假定的窗口大小。

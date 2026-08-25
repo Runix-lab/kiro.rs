@@ -1177,7 +1177,6 @@ fn stream_trace_usage(ctx: &StreamContext) -> TraceUsage {
     }
 }
 
-use super::converter::get_context_window_size;
 
 /// 处理非流式请求
 async fn handle_non_stream_request(
@@ -1329,11 +1328,12 @@ async fn handle_non_stream_request(
                             }
                         }
                         Event::ContextUsage(context_usage) => {
-                            // 从上下文使用百分比计算实际的 input_tokens
-                            let window_size = get_context_window_size(model);
+                            // 从上下文使用百分比计算实际的 input_tokens（含窗口常量自诊断）
                             let actual_input_tokens =
-                                (context_usage.context_usage_percentage * (window_size as f64)
-                                    / 100.0) as i32;
+                                crate::anthropic::context_window_guard::tokens_from_context_usage(
+                                    model,
+                                    context_usage.context_usage_percentage,
+                                );
                             context_input_tokens = Some(actual_input_tokens);
                             // 上下文使用量达到 100% 时，设置 stop_reason 为 model_context_window_exceeded
                             if context_usage.context_usage_percentage >= 100.0 {

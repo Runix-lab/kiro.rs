@@ -1496,6 +1496,7 @@ mod tests {
     }
 
     /// 账单口径：单价优先于折扣，两者都缺则不出应收（不猜）。
+    #[allow(deprecated)] // 覆盖弃用路径本身的行为，保留至该函数删除
     #[test]
     fn billing_prefers_the_reliable_per_credit_basis() {
         let agg = UsageAggregator::new();
@@ -1544,6 +1545,7 @@ mod tests {
     }
 
     /// 两种口径都配时以单价为准（credits 是上游真值，折扣的分母是估算）。
+    #[allow(deprecated)] // 覆盖弃用路径本身的行为，保留至该函数删除
     #[test]
     fn billing_per_credit_wins_when_both_are_set() {
         let agg = UsageAggregator::new();
@@ -1569,6 +1571,7 @@ mod tests {
     }
 
     /// 官方价按 Key×模型 逐项算：同一 Key 混用不同单价的模型时不能用单一均价。
+    #[allow(deprecated)] // 覆盖弃用路径本身的行为，保留至该函数删除
     #[test]
     fn billing_official_value_is_summed_per_model() {
         let agg = UsageAggregator::new();
