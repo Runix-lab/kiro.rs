@@ -306,7 +306,8 @@ async fn main() {
             )
             // 与 API 侧共用同一个速率环（anthropic 路由装配时建立并塞进 provider），
             // 否则两侧各建一个环、各只数到一半流量。
-            .with_rate_ring(kiro_provider.rate_ring());
+            .with_rate_ring(kiro_provider.rate_ring())
+            .with_pricing(common::pricing::PricingTable::from_config(&config.pricing));
 
             // 启动余额后台刷新调度器（每 5 分钟一次，与缓存 TTL 对齐）
             admin_state

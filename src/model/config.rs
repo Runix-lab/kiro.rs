@@ -274,6 +274,13 @@ pub struct Config {
     #[serde(default)]
     pub custom_models: Vec<CustomModel>,
 
+    /// 计价配置：credit→USD 汇率 + 模型官方牌价覆盖表。
+    ///
+    /// 只在启动时读取一次（解析成只读 [`crate::common::pricing::PricingTable`]），
+    /// 修改后需重启生效。默认值见 `PricingConfig::default`（0.02 $/credit，仅内置表）。
+    #[serde(default)]
+    pub pricing: crate::common::pricing::PricingConfig,
+
     /// 配置文件路径（运行时元数据，不写入 JSON）
     #[serde(skip)]
     config_path: Option<PathBuf>,
@@ -423,6 +430,7 @@ impl Default for Config {
             usage_log_retention_days: default_usage_log_retention_days(),
             endpoints: HashMap::new(),
             custom_models: Vec::new(),
+            pricing: crate::common::pricing::PricingConfig::default(),
             config_path: None,
         }
     }

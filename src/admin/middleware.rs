@@ -39,6 +39,8 @@ pub struct AdminState {
     ///
     /// `Option` 是为了兼容不注入它的嵌入式/测试装配；生产路径恒为 `Some`。
     pub rate_ring: Option<crate::anthropic::rate_ring::SharedRateRing>,
+    /// 计价表（credit→USD 汇率 + 模型官方牌价），启动时从配置解析，只读。
+    pub pricing: Arc<crate::common::pricing::PricingTable>,
 }
 
 impl AdminState {
@@ -58,7 +60,14 @@ impl AdminState {
             trace_store,
             groups,
             rate_ring: None,
+            pricing: Arc::new(crate::common::pricing::PricingTable::default()),
         }
+    }
+
+    /// 注入按配置解析的计价表（缺省时用内置默认表）。
+    pub fn with_pricing(mut self, pricing: crate::common::pricing::PricingTable) -> Self {
+        self.pricing = Arc::new(pricing);
+        self
     }
 
     /// 注入分钟级速率环（RPM/TPM 数据源）。
