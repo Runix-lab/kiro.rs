@@ -458,6 +458,10 @@ export interface TimeSeriesPoint {
   calls: number
   errors: number
   credits: number
+  /** 实付美金 = credits × 汇率 */
+  creditUsd: number
+  /** 官方牌价美金；null = 该桶无法按模型计价（如启用了分组筛选或全是未配价模型） */
+  officialUsd: number | null
 }
 
 export interface ModelDistribution {
@@ -465,6 +469,16 @@ export interface ModelDistribution {
   calls: number
   inputTokens: number
   outputTokens: number
+  cacheCreationTokens: number
+  cacheReadTokens: number
+  errors: number
+  credits: number
+  /** 实付美金 = credits × 汇率 */
+  creditUsd: number
+  /** 官方牌价美金；null = 该模型未配价 */
+  officialUsd: number | null
+  /** 折扣比 = 实付 ÷ 官方（0.14 即 1.4 折）；未配价时为 null */
+  discountRatio: number | null
 }
 
 export interface CredentialDistribution {
@@ -473,7 +487,12 @@ export interface CredentialDistribution {
   calls: number
   inputTokens: number
   outputTokens: number
+  cacheCreationTokens: number
+  cacheReadTokens: number
   errors: number
+  credits: number
+  /** 实付美金 = credits × 汇率 */
+  creditUsd: number
 }
 
 // ============ 请求链路追踪 ============
@@ -526,6 +545,10 @@ export interface TraceRecord {
   totalTokens?: number
   /** 费用（credits） */
   credits?: number
+  /** 实付美金 = credits × 汇率 */
+  creditUsd: number
+  /** 官方牌价美金；null = 该模型未配价 */
+  officialUsd: number | null
   /** 首 Token 延迟（毫秒，仅流式有值） */
   firstTokenMs?: number | null
   attempts: TraceAttempt[]
@@ -544,6 +567,9 @@ export interface TraceQuery {
   /** 按账号分组名筛选（只返回 final_credential_id 属于该分组的 trace） */
   group?: string
   onlyFailed?: boolean
+  /** YYYY-MM-DD，必须与 endDate 同时提供；本地时区，endDate 含当天 */
+  startDate?: string
+  endDate?: string
   limit?: number
   offset?: number
 }
@@ -552,6 +578,60 @@ export interface TraceQuery {
 export interface TracePage {
   records: TraceRecord[]
   total: number
+}
+
+/** 按模型汇总一行（/traces/summary） */
+export interface TraceSummaryModelItem {
+  model: string
+  calls: number
+  errors: number
+  inputTokens: number
+  outputTokens: number
+  cacheCreationTokens: number
+  cacheReadTokens: number
+  credits: number
+  creditUsd: number
+  officialUsd: number | null
+  discountRatio: number | null
+}
+
+/** /traces/summary 的合计行，字段与按模型行一致（少 model 字段） */
+export type TraceSummaryTotals = Omit<TraceSummaryModelItem, 'model'>
+
+/** GET /traces/summary 响应：与 /traces 同一套筛选参数，按模型汇总 + 合计 */
+export interface TraceSummary {
+  models: TraceSummaryModelItem[]
+  totals: TraceSummaryTotals
+  /** credit → USD 汇率，与 totals.creditUsd / totals.credits 一致 */
+  creditUsdRate: number
+}
+
+/** TPM 统计的分维度口径 */
+export type TpmDim = 'key' | 'credential'
+
+/** 单个实体（入口 Key 或上游凭据）的 TPM/RPM 承载统计 */
+export interface TpmEntityStats {
+  entityId: number
+  label: string
+  /** 窗口内单分钟最大 token 消耗（全口径，含缓存读） */
+  peakTpmTotal: number
+  /** 窗口内单分钟最大 token 消耗（计费口径，不含缓存读） */
+  peakTpmBillable: number
+  peakRpm: number
+  /** 窗口内有调用的分钟数 */
+  activeMinutes: number
+  /** 活跃分钟平均 TPM */
+  avgTpmActive: number
+  totalTokens: number
+  totalCalls: number
+}
+
+/** GET /stats/tpm 响应 */
+export interface TpmStats {
+  dim: string
+  /** 请求日志（trace）当前是否启用；false 时仅剩历史数据 */
+  traceEnabled: boolean
+  entities: TpmEntityStats[]
 }
 
 /** 单凭据失败分类计数（鉴权 / 账号风控 / 其他） */

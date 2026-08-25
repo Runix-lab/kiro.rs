@@ -1,5 +1,5 @@
 import { keepPreviousData, useQuery } from '@tanstack/react-query'
-import { getTraces, getFailureStats } from '@/api/traces'
+import { getTraces, getFailureStats, getTraceSummary } from '@/api/traces'
 import type { TraceQuery } from '@/types/api'
 
 /**
@@ -12,6 +12,22 @@ export function useTraces(query: TraceQuery, enabled = true) {
   return useQuery({
     queryKey: ['traces', query],
     queryFn: () => getTraces(query),
+    enabled,
+    refetchInterval: enabled ? 30_000 : false,
+    staleTime: 10_000,
+    placeholderData: keepPreviousData,
+    refetchOnWindowFocus: false,
+  })
+}
+
+/**
+ * 按模型汇总当前筛选下的用量与成本（含合计行），给「请求日志」页的汇总条用。
+ * 与 useTraces 共享同一套筛选参数、同样的自动刷新与切换保留旧数据策略。
+ */
+export function useTraceSummary(query: TraceQuery, enabled = true) {
+  return useQuery({
+    queryKey: ['traces', 'summary', query],
+    queryFn: () => getTraceSummary(query),
     enabled,
     refetchInterval: enabled ? 30_000 : false,
     staleTime: 10_000,

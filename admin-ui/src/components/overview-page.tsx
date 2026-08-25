@@ -2,7 +2,7 @@ import { useMemo, useState } from 'react'
 import { Card, CardContent } from '@/components/ui/card'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
-import { Activity, Calendar, Coins, Cpu, KeyRound, Server } from 'lucide-react'
+import { Activity, Calendar, Coins, Cpu, Database, KeyRound, Server } from 'lucide-react'
 import { useByCredential, useByModel, useOverview, useTimeSeries } from '@/hooks/use-stats'
 import { useClientKeys } from '@/hooks/use-client-keys'
 import { useGroupOptions } from '@/hooks/use-groups'
@@ -18,9 +18,10 @@ import type {
 } from '@/types/api'
 import { TimeSeriesChart } from '@/components/charts/time-series-chart'
 import { RatePanel } from '@/components/rate-panel'
+import { TpmPanel } from '@/components/tpm-panel'
 import { ModelPieChart } from '@/components/charts/model-pie-chart'
 import { CredentialBarChart } from '@/components/charts/credential-bar-chart'
-import { cn, formatCredits, formatNumber } from '@/lib/utils'
+import { cn, formatCredits, formatDiscount, formatNumber, formatUsd } from '@/lib/utils'
 import { Input } from '@/components/ui/input'
 import {
   Select,
@@ -124,6 +125,7 @@ export function OverviewPage() {
         onPresetRangeChange={filters.selectPresetRange}
       />
       <RatePanel />
+      <TpmPanel timeFilter={filters.timeFilter} statsFilter={filters.statsFilter} />
       <DistributionPanels
         byCred={credData}
         byModel={modelData}
@@ -206,22 +208,45 @@ function PageHeader() {
 interface RangeStats {
   calls: number
   credits: number
+  /** 实付美金 = credits × 汇率 */
+  creditUsd: number
+  /** 官方牌价美金；每个桶都拿不到价（分组筛选 / 全未配价）时为 null */
+  officialUsd: number | null
   errors: number
   inputTokens: number
   outputTokens: number
+  cacheCreationTokens: number
+  cacheReadTokens: number
 }
 
 function aggregateSeries(data: TimeSeriesPoint[]): RangeStats {
-  return data.reduce(
+  const base = data.reduce(
     (acc, p) => ({
       calls: acc.calls + p.calls,
       credits: acc.credits + (p.credits ?? 0),
+      creditUsd: acc.creditUsd + (p.creditUsd ?? 0),
       errors: acc.errors + p.errors,
       inputTokens: acc.inputTokens + p.inputTokens,
       outputTokens: acc.outputTokens + p.outputTokens,
+      cacheCreationTokens: acc.cacheCreationTokens + p.cacheCreationTokens,
+      cacheReadTokens: acc.cacheReadTokens + p.cacheReadTokens,
     }),
-    { calls: 0, credits: 0, errors: 0, inputTokens: 0, outputTokens: 0 },
+    {
+      calls: 0,
+      credits: 0,
+      creditUsd: 0,
+      errors: 0,
+      inputTokens: 0,
+      outputTokens: 0,
+      cacheCreationTokens: 0,
+      cacheReadTokens: 0,
+    },
   )
+  // 每个桶都无法按模型计价（分组筛选 / 全未配价模型）时保持 null，不能悄悄显示成 0
+  const officialUsd = data.every((p) => p.officialUsd == null)
+    ? null
+    : data.reduce((sum, p) => sum + (p.officialUsd ?? 0), 0)
+  return { ...base, officialUsd }
 }
 
 function StatsCards({
@@ -235,6 +260,11 @@ function StatsCards({
   stats: RangeStats
   timeText: string
 }) {
+  const cacheHitDenom = stats.inputTokens + stats.cacheReadTokens
+  const cacheHitRate = cacheHitDenom > 0 ? (stats.cacheReadTokens / cacheHitDenom) * 100 : 0
+  const discount =
+    stats.officialUsd != null && stats.officialUsd > 0 ? stats.creditUsd / stats.officialUsd : null
+
   const cards = [
     {
       icon: <Activity className="h-4 w-4" />,
@@ -247,17 +277,35 @@ function StatsCards({
     { icon: <Cpu className="h-4 w-4" />, label: '输入 Token', value: formatNumber(stats.inputTokens) },
     { icon: <Cpu className="h-4 w-4" />, label: '输出 Token', value: formatNumber(stats.outputTokens) },
     {
+      icon: <Database className="h-4 w-4" />,
+      label: '缓存读',
+      value: formatNumber(stats.cacheReadTokens),
+      extra: (
+        <span className="text-[11px] text-muted-foreground">
+          写 {formatNumber(stats.cacheCreationTokens)} · 命中 {cacheHitRate.toFixed(1)}%
+        </span>
+      ),
+    },
+    {
       icon: <Coins className="h-4 w-4" />,
-      label: 'Credit',
-      value: formatCredits(stats.credits),
-      extra: <span className="text-[11px] text-muted-foreground">上游计费量</span>,
+      label: '成本',
+      value: formatUsd(stats.creditUsd),
+      extra: (
+        <div className="text-right leading-tight">
+          <div className="text-[11px] text-muted-foreground">
+            官方 {formatUsd(stats.officialUsd)} · {formatDiscount(discount)}
+          </div>
+          <div className="text-[10px] text-muted-foreground/70">
+            {formatCredits(stats.credits)} credit
+          </div>
+        </div>
+      ),
     },
     {
       icon: <KeyRound className="h-4 w-4" />,
       label: '启用的客户端 Key',
       meta: '当前可用入口',
       value: formatNumber(activeKeys),
-      className: 'col-span-2 max-[360px]:col-span-1 lg:col-span-1',
       extra: (
         <span className="text-[11px] text-muted-foreground">
           上游 {formatNumber(activeCredentials)}
@@ -267,7 +315,7 @@ function StatsCards({
   ]
 
   return (
-    <div className="mb-6 grid grid-cols-2 gap-3 max-[360px]:grid-cols-1 lg:grid-cols-5">
+    <div className="mb-6 grid grid-cols-2 gap-3 md:grid-cols-3 lg:grid-cols-6">
       {cards.map((card) => (
         <StatCard key={card.label} meta={card.meta ?? timeText} {...card} />
       ))}
@@ -582,14 +630,19 @@ function ModelPanel({
 
 function ModelTable({ data }: { data: ModelDistribution[] }) {
   return (
-    <div className="mt-3 max-h-32 overflow-auto text-[12px]">
-      <table className="min-w-[420px] w-full">
+    <div className="mt-3 max-h-64 overflow-auto text-[12px]">
+      <table className="min-w-[620px] w-full">
         <thead className="text-muted-foreground">
           <tr>
             <th className="text-left font-medium pb-1">模型</th>
             <th className="text-right font-medium">调用</th>
             <th className="text-right font-medium">输入</th>
             <th className="text-right font-medium">输出</th>
+            <th className="text-right font-medium">缓存读</th>
+            <th className="text-right font-medium">Credit</th>
+            <th className="text-right font-medium">实付$</th>
+            <th className="text-right font-medium">官方$</th>
+            <th className="text-right font-medium">折扣</th>
           </tr>
         </thead>
         <tbody>
@@ -599,6 +652,11 @@ function ModelTable({ data }: { data: ModelDistribution[] }) {
               <td className="text-right tabular-nums">{formatNumber(m.calls)}</td>
               <td className="text-right tabular-nums">{formatNumber(m.inputTokens)}</td>
               <td className="text-right tabular-nums">{formatNumber(m.outputTokens)}</td>
+              <td className="text-right tabular-nums">{formatNumber(m.cacheReadTokens)}</td>
+              <td className="text-right tabular-nums">{formatCredits(m.credits)}</td>
+              <td className="text-right tabular-nums">{formatUsd(m.creditUsd)}</td>
+              <td className="text-right tabular-nums">{formatUsd(m.officialUsd)}</td>
+              <td className="text-right tabular-nums">{formatDiscount(m.discountRatio)}</td>
             </tr>
           ))}
         </tbody>

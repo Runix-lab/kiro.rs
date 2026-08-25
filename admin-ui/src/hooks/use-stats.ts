@@ -1,6 +1,6 @@
 import { keepPreviousData, useQuery } from '@tanstack/react-query'
-import { getByCredential, getByModel, getOverview, getTimeSeries } from '@/api/stats'
-import type { StatsFilter, StatsTimeFilter } from '@/types/api'
+import { getByCredential, getByModel, getOverview, getTimeSeries, getTpm } from '@/api/stats'
+import type { StatsFilter, StatsTimeFilter, TpmDim } from '@/types/api'
 
 /**
  * 统计接口共用配置
@@ -54,6 +54,23 @@ export function useByCredential(time: StatsTimeFilter, filter?: StatsFilter) {
   return useQuery({
     queryKey: ['stats', 'by-credential', ...timeKey(time), filter?.keyId ?? 'all', filter?.group ?? 'all'],
     queryFn: () => getByCredential(time, filter),
+    ...COMMON,
+  })
+}
+
+/** 分维度 TPM/RPM 承载统计（数据源：请求日志，旁路查询）。 */
+export function useTpm(dim: TpmDim, time: StatsTimeFilter, filter?: StatsFilter) {
+  return useQuery({
+    queryKey: [
+      'stats',
+      'tpm',
+      dim,
+      time.startDate ?? '',
+      time.endDate ?? '',
+      filter?.keyId ?? 'all',
+      filter?.group ?? 'all',
+    ],
+    queryFn: () => getTpm(dim, time, filter),
     ...COMMON,
   })
 }

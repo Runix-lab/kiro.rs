@@ -8,6 +8,8 @@ import type {
   StatsFilter,
   StatsTimeFilter,
   TimeSeriesPoint,
+  TpmDim,
+  TpmStats,
 } from '@/types/api'
 
 const api = axios.create({
@@ -67,5 +69,26 @@ export async function getByCredential(time: StatsTimeFilter, filter?: StatsFilte
  */
 export async function getRate(): Promise<RateSnapshot> {
   const { data } = await api.get<RateSnapshot>('/stats/rate')
+  return data
+}
+
+/**
+ * 分维度（入口 Key / 上游凭据）分钟级 TPM/RPM 承载统计。
+ *
+ * 数据源是 traces.db（旁路查询，与 rate 环无关），因此接受与 /traces 一致的
+ * 时间与筛选参数；trace 治理开关关闭时后端仍会回历史数据，通过 `traceEnabled`
+ * 字段告知前端只是"没有新数据"而非接口异常。
+ */
+export async function getTpm(
+  dim: TpmDim,
+  time: StatsTimeFilter,
+  filter?: StatsFilter,
+): Promise<TpmStats> {
+  const params: Record<string, string> = { dim }
+  if (time.startDate) params.startDate = time.startDate
+  if (time.endDate) params.endDate = time.endDate
+  if (filter?.keyId !== undefined) params.keyId = String(filter.keyId)
+  if (filter?.group) params.group = filter.group
+  const { data } = await api.get<TpmStats>('/stats/tpm', { params })
   return data
 }

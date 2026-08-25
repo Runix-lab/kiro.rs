@@ -153,6 +153,29 @@ export function formatCredits(value: number | null | undefined): string {
 }
 
 /**
+ * 美元金额展示：精度按量级取舍——≥100 取整、≥1 保留 2 位、否则保留 4 位
+ * （小额费用如 $0.0032 取 2 位会直接归零，不可读）。
+ */
+export function formatUsd(value: number | null | undefined): string {
+  if (value == null || Number.isNaN(value)) return '—'
+  const abs = Math.abs(value)
+  const decimals = abs >= 100 ? 0 : abs >= 1 ? 2 : 4
+  return '$' + value.toLocaleString('en-US', {
+    minimumFractionDigits: decimals,
+    maximumFractionDigits: decimals,
+  })
+}
+
+/**
+ * 折扣比展示：ratio 为「实付 ÷ 官方」（如 0.14 = 1.4 折）；
+ * null 表示该模型/该桶未配官方牌价，无法计算折扣。
+ */
+export function formatDiscount(ratio: number | null | undefined): string {
+  if (ratio == null || Number.isNaN(ratio)) return '—'
+  return (ratio * 10).toFixed(1) + ' 折'
+}
+
+/**
  * 脱敏代理 URL：将 user:pass@host 中的认证信息替换为 xxx****xxx
  */
 /** 企业 SSO (external_idp) 的 authMethod 别名，与后端 canonicalize_auth_method_value 保持一致 */

@@ -10,6 +10,7 @@ import {
   CheckCircle2,
   Unplug,
   Settings2,
+  Calendar,
 } from 'lucide-react'
 import { Card, CardContent } from '@/components/ui/card'
 import { Button } from '@/components/ui/button'
@@ -35,15 +36,21 @@ import {
   SelectContent as UiSelectContent,
   SelectItem as UiSelectItem,
 } from '@/components/ui/select'
-import { useTraces } from '@/hooks/use-traces'
+import { useTraces, useTraceSummary } from '@/hooks/use-traces'
 import { useClientKeys } from '@/hooks/use-client-keys'
 import { useGroupOptions } from '@/hooks/use-groups'
 import {
   useLogGovernanceConfig,
   useSetLogGovernanceConfig,
 } from '@/hooks/use-credentials'
-import { extractErrorMessage } from '@/lib/utils'
-import type { TraceAttempt, TraceQuery, TraceRecord } from '@/types/api'
+import {
+  extractErrorMessage,
+  formatCredits,
+  formatDiscount,
+  formatNumber,
+  formatUsd,
+} from '@/lib/utils'
+import type { TraceAttempt, TraceQuery, TraceRecord, TraceSummary } from '@/types/api'
 
 /** 失败分类 → 中文标签 + Badge 颜色 */
 function outcomeStyle(outcome: string): {
@@ -228,6 +235,45 @@ function TokenCell({ rec }: { rec: TraceRecord }) {
   )
 }
 
+/** 费用单元格：主展示实付美金，hover 显示 credit / 官方牌价 / 折扣明细 */
+function FeeCell({ rec }: { rec: TraceRecord }) {
+  const credits = rec.credits ?? 0
+  const creditUsd = rec.creditUsd ?? 0
+  if (credits <= 0 && creditUsd <= 0) {
+    return <span className="text-muted-foreground">—</span>
+  }
+  const discount = rec.officialUsd ? creditUsd / rec.officialUsd : null
+  return (
+    <TooltipProvider delayDuration={150}>
+      <Tooltip>
+        <TooltipTrigger asChild>
+          <span className="cursor-default border-b border-dotted border-muted-foreground/40 tabular-nums">
+            {formatUsd(creditUsd)}
+          </span>
+        </TooltipTrigger>
+        <TooltipContent className="p-0">
+          <div className="min-w-[160px] px-3 py-2">
+            <div className="space-y-1 text-[12px]">
+              <div className="flex items-center justify-between gap-6">
+                <span className="text-muted-foreground">Credit</span>
+                <span className="font-mono tabular-nums">{credits.toFixed(4)}</span>
+              </div>
+              <div className="flex items-center justify-between gap-6">
+                <span className="text-muted-foreground">官方</span>
+                <span className="font-mono tabular-nums">{formatUsd(rec.officialUsd)}</span>
+              </div>
+              <div className="flex items-center justify-between gap-6">
+                <span className="text-muted-foreground">折扣</span>
+                <span className="font-mono tabular-nums">{formatDiscount(discount)}</span>
+              </div>
+            </div>
+          </div>
+        </TooltipContent>
+      </Tooltip>
+    </TooltipProvider>
+  )
+}
+
 function TraceRow({ rec }: { rec: TraceRecord }) {
   const [open, setOpen] = useState(false)
   const errStyle = rec.errorType ? outcomeStyle(rec.errorType) : null
@@ -262,7 +308,7 @@ function TraceRow({ rec }: { rec: TraceRecord }) {
           <TokenCell rec={rec} />
         </td>
         <td className="py-2.5 pr-3 text-[13px] tabular-nums">
-          {rec.credits != null && rec.credits > 0 ? rec.credits.toFixed(4) : '—'}
+          <FeeCell rec={rec} />
         </td>
         <td className="py-2.5 pr-3 text-[13px] tabular-nums text-muted-foreground">
           {rec.firstTokenMs != null ? formatDuration(rec.firstTokenMs) : '—'}
@@ -543,6 +589,49 @@ function GovernanceButton() {
 }
 
 
+/** 轻量日期输入框，样式抄自 overview-page 的 DateInput */
+function DateInput({ onChange, value }: { onChange: (value: string) => void; value: string }) {
+  return (
+    <div className="relative min-w-0">
+      <Calendar className="pointer-events-none absolute left-2.5 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-muted-foreground" />
+      <Input
+        type="date"
+        value={value}
+        onChange={(e) => onChange(e.target.value)}
+        className="h-8 min-w-0 w-[130px] rounded-md pl-8 text-xs"
+      />
+    </div>
+  )
+}
+
+/** 汇总条：当前筛选下的用量与成本一览，紧跟筛选栏，数据来自 /traces/summary 合计行 */
+function TraceSummaryStrip({ summary }: { summary: TraceSummary }) {
+  const t = summary.totals
+  return (
+    <Card>
+      <CardContent className="flex flex-wrap items-center gap-x-1.5 gap-y-1 p-3 text-[12px] text-muted-foreground">
+        <span>
+          调用 <span className="font-medium tabular-nums text-foreground">{formatNumber(t.calls)}</span>
+          {t.errors > 0 && (
+            <span className="text-destructive">（异常 {formatNumber(t.errors)}）</span>
+          )}
+        </span>
+        <span>· 输入 <span className="tabular-nums text-foreground">{formatNumber(t.inputTokens)}</span></span>
+        <span>· 输出 <span className="tabular-nums text-foreground">{formatNumber(t.outputTokens)}</span></span>
+        <span>
+          · 缓存读 <span className="tabular-nums text-foreground">{formatNumber(t.cacheReadTokens)}</span>
+          {' / 写 '}
+          <span className="tabular-nums text-foreground">{formatNumber(t.cacheCreationTokens)}</span>
+        </span>
+        <span>· Credit <span className="tabular-nums text-foreground">{formatCredits(t.credits)}</span></span>
+        <span>· 实付 <span className="tabular-nums text-foreground">{formatUsd(t.creditUsd)}</span></span>
+        <span>· 官方 <span className="tabular-nums text-foreground">{formatUsd(t.officialUsd)}</span></span>
+        <span>· 折扣 <span className="tabular-nums text-foreground">{formatDiscount(t.discountRatio)}</span></span>
+      </CardContent>
+    </Card>
+  )
+}
+
 const PAGE_SIZE = 50
 
 export function TraceLogPage() {
@@ -550,8 +639,31 @@ export function TraceLogPage() {
   const [errorType, setErrorType] = useState('')
   const [keyId, setKeyId] = useState('')
   const [group, setGroup] = useState('')
+  const [model, setModel] = useState('')
   const [onlyFailed, setOnlyFailed] = useState(false)
   const [page, setPage] = useState(0)
+
+  // 日期范围筛选：草稿态（输入框实时值）与已应用态（实际参与查询）分离，
+  // 与 overview-page 的自定义时间范围交互一致——改输入框不立即触发请求，点「应用」才生效。
+  const [draftStartDate, setDraftStartDate] = useState('')
+  const [draftEndDate, setDraftEndDate] = useState('')
+  const [startDate, setStartDate] = useState('')
+  const [endDate, setEndDate] = useState('')
+  const canApplyDateRange =
+    draftStartDate !== '' && draftEndDate !== '' && draftEndDate >= draftStartDate
+  const applyDateRange = () => {
+    if (!canApplyDateRange) return
+    setStartDate(draftStartDate)
+    setEndDate(draftEndDate)
+    setPage(0)
+  }
+  const clearDateRange = () => {
+    setDraftStartDate('')
+    setDraftEndDate('')
+    setStartDate('')
+    setEndDate('')
+    setPage(0)
+  }
 
   const { data: keysData } = useClientKeys()
   const keyOptions = [
@@ -571,19 +683,28 @@ export function TraceLogPage() {
     setPage(0)
   }
 
-  const query: TraceQuery = {
+  // 与分页无关的筛选参数：/traces 与 /traces/summary 共用同一套，保证口径一致
+  const filterParams: TraceQuery = {
     status: status || undefined,
     errorType: errorType || undefined,
     keyId: keyId ? Number(keyId) : undefined,
     group: group || undefined,
+    model: model || undefined,
     onlyFailed: onlyFailed || undefined,
-    limit: PAGE_SIZE,
-    offset: page * PAGE_SIZE,
+    startDate: startDate || undefined,
+    endDate: endDate || undefined,
   }
+  const query: TraceQuery = { ...filterParams, limit: PAGE_SIZE, offset: page * PAGE_SIZE }
   const { data, isLoading, isFetching, refetch } = useTraces(query)
+  const { data: summary } = useTraceSummary(filterParams)
   const records = data?.records ?? []
   const total = data?.total ?? 0
   const totalPages = Math.max(1, Math.ceil(total / PAGE_SIZE))
+
+  const modelSelectOptions = [
+    { value: '', label: '全部模型' },
+    ...(summary?.models.map((m) => ({ value: m.model, label: m.model })) ?? []),
+  ]
 
   return (
     <div className="space-y-5">
@@ -597,12 +718,26 @@ export function TraceLogPage() {
         <div className="ml-auto flex flex-wrap items-center gap-2">
           <Select value={keyId} onChange={resetTo(setKeyId)} options={keyOptions} />
           <Select value={group} onChange={resetTo(setGroup)} options={groupSelectOptions} />
+          <Select value={model} onChange={resetTo(setModel)} options={modelSelectOptions} />
           <Select value={status} onChange={resetTo(setStatus)} options={STATUS_OPTIONS} />
           <Select
             value={errorType}
             onChange={resetTo(setErrorType)}
             options={ERROR_TYPE_OPTIONS}
           />
+          <div className="flex items-center gap-1.5">
+            <DateInput value={draftStartDate} onChange={setDraftStartDate} />
+            <span className="text-xs text-muted-foreground">至</span>
+            <DateInput value={draftEndDate} onChange={setDraftEndDate} />
+            <Button size="sm" className="h-8 px-3 text-xs" disabled={!canApplyDateRange} onClick={applyDateRange}>
+              应用
+            </Button>
+            {(startDate || endDate) && (
+              <Button size="sm" variant="ghost" className="h-8 px-2 text-xs" onClick={clearDateRange}>
+                清除
+              </Button>
+            )}
+          </div>
           <Button
             size="sm"
             variant={onlyFailed ? 'default' : 'outline'}
@@ -620,6 +755,8 @@ export function TraceLogPage() {
           </Button>
         </div>
       </div>
+
+      {summary && <TraceSummaryStrip summary={summary} />}
 
       <Card>
         <CardContent className="p-0">

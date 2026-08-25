@@ -11,7 +11,7 @@ import {
 } from 'recharts'
 import type { TimeSeriesPoint, StatsGranularity } from '@/types/api'
 import { tooltipCursorStyle } from './tooltip-style'
-import { formatCredits, formatNumber } from '@/lib/utils'
+import { formatCredits, formatNumber, formatUsd } from '@/lib/utils'
 
 interface Props {
   data: TimeSeriesPoint[]
@@ -78,11 +78,13 @@ function ChartTooltip({ active, payload, label }: {
     }
   })
   const credits = payload[0]?.payload?.credits ?? 0
+  const creditUsd = payload[0]?.payload?.creditUsd ?? 0
   return (
     <div style={TOOLTIP_STYLE}>
       <div style={{ fontWeight: 600, marginBottom: 6, color: 'rgba(255,255,255,0.92)' }}>{label}</div>
       {SERIES.map((s) => <TooltipRow key={s.key} entry={s} value={map.get(s.key)} />)}
       {credits > 0 && <CreditTooltipRow credits={credits} />}
+      {creditUsd > 0 && <CreditUsdTooltipRow creditUsd={creditUsd} />}
     </div>
   )
 }
@@ -140,6 +142,16 @@ function CreditTooltipRow({ credits }: { credits: number }) {
       <span style={{ ...TOOLTIP_SWATCH_BASE_STYLE, background: COLORS.credits }} />
       <span style={{ flex: 1 }}>Credit:</span>
       <span style={TOOLTIP_VALUE_STYLE}>{formatCredits(credits)}</span>
+    </div>
+  )
+}
+
+function CreditUsdTooltipRow({ creditUsd }: { creditUsd: number }) {
+  return (
+    <div style={TOOLTIP_ROW_STYLE}>
+      <span style={{ ...TOOLTIP_SWATCH_BASE_STYLE, background: COLORS.credits }} />
+      <span style={{ flex: 1 }}>实付 $:</span>
+      <span style={TOOLTIP_VALUE_STYLE}>{formatUsd(creditUsd)}</span>
     </div>
   )
 }

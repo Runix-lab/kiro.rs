@@ -1604,10 +1604,16 @@ pub async fn stats_tpm(
         .get("group")
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty());
-    let query = match build_trace_query(&state, &params, group.as_deref()) {
+    let mut query = match build_trace_query(&state, &params, group.as_deref()) {
         Ok(q) => q,
         Err(message) => return stats_bad_request(message),
     };
+    // 无时间窗时默认最近 24 小时：trace 库是单连接互斥锁，读查询期间会顶住
+    // 请求收尾的 insert。全表分钟聚合实测 ~600ms、24h 窗口 ~50ms，兜底限窗
+    // 把对写入路径的最坏占锁控制在几十毫秒级。
+    if query.start_ts.is_none() && query.end_ts.is_none() {
+        query.start_ts = Some(chrono::Utc::now().timestamp() - 24 * 3600);
+    }
     let stats = state.trace_store.tpm_stats(dim, &query);
 
     // 实体名称解析：Key 维度用客户端 Key 名，凭据维度用 email
