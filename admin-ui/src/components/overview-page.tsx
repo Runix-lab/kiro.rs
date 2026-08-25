@@ -22,6 +22,7 @@ import { TpmPanel } from '@/components/tpm-panel'
 import { ModelPieChart } from '@/components/charts/model-pie-chart'
 import { CredentialBarChart } from '@/components/charts/credential-bar-chart'
 import { cn, formatCredits, formatDiscount, formatNumber, formatUsd } from '@/lib/utils'
+import { TD_LABEL, TD_NUM, TD_NUM_STRONG, TH_LABEL, TH_NUM } from '@/lib/table-styles'
 import { Input } from '@/components/ui/input'
 import {
   Select,
@@ -647,36 +648,36 @@ function ModelUsageCard({
           </div>
         ) : (
           <div className="overflow-x-auto text-sm">
-            <table className="w-full min-w-[900px]">
+            <table className="w-full min-w-[960px]">
               <thead className="text-muted-foreground">
                 <tr>
-                  <th className="pb-2.5 text-left font-medium">模型</th>
-                  <th className="pb-2.5 text-right font-medium">调用</th>
-                  <th className="pb-2.5 text-right font-medium">输入</th>
-                  <th className="pb-2.5 text-right font-medium">输出</th>
-                  <th className="pb-2.5 text-right font-medium">缓存读</th>
-                  <th className="pb-2.5 text-right font-medium">缓存写</th>
-                  <th className="pb-2.5 text-right font-medium">Credit</th>
-                  <th className="pb-2.5 text-right font-medium">实付$</th>
-                  <th className="pb-2.5 text-right font-medium">官方$</th>
-                  <th className="pb-2.5 text-right font-medium">折扣</th>
+                  <th className={TH_LABEL}>模型</th>
+                  <th className={TH_NUM}>调用</th>
+                  <th className={TH_NUM}>输入</th>
+                  <th className={TH_NUM}>输出</th>
+                  <th className={TH_NUM}>缓存读</th>
+                  <th className={TH_NUM}>缓存写</th>
+                  <th className={TH_NUM}>Credit</th>
+                  <th className={TH_NUM}>实付$</th>
+                  <th className={TH_NUM}>官方$</th>
+                  <th className={TH_NUM}>折扣</th>
                 </tr>
               </thead>
               <tbody>
                 {data.map((m) => (
                   <tr key={m.model} className="border-t border-border/40">
-                    <td className="max-w-[280px] truncate py-2.5 pr-4 font-medium">{m.model}</td>
-                    <td className="py-2.5 pl-3 text-right tabular-nums">{formatNumber(m.calls)}</td>
-                    <td className="py-2.5 pl-3 text-right tabular-nums">{formatNumber(m.inputTokens)}</td>
-                    <td className="py-2.5 pl-3 text-right tabular-nums">{formatNumber(m.outputTokens)}</td>
-                    <td className="py-2.5 pl-3 text-right tabular-nums">{formatNumber(m.cacheReadTokens)}</td>
-                    <td className="py-2.5 pl-3 text-right tabular-nums">{formatNumber(m.cacheCreationTokens)}</td>
-                    <td className="py-2.5 pl-3 text-right tabular-nums">{formatCredits(m.credits)}</td>
-                    <td className="py-2.5 pl-3 text-right tabular-nums">{formatUsd(m.creditUsd)}</td>
-                    <td className="py-2.5 pl-3 text-right tabular-nums">{formatUsd(m.officialUsd)}</td>
-                    <td className="py-2.5 pl-3 text-right font-semibold tabular-nums">
-                      {formatDiscount(m.discountRatio)}
+                    <td className={TD_LABEL} title={m.model}>
+                      {m.model}
                     </td>
+                    <td className={TD_NUM}>{formatNumber(m.calls)}</td>
+                    <td className={TD_NUM}>{formatNumber(m.inputTokens)}</td>
+                    <td className={TD_NUM}>{formatNumber(m.outputTokens)}</td>
+                    <td className={TD_NUM}>{formatNumber(m.cacheReadTokens)}</td>
+                    <td className={TD_NUM}>{formatNumber(m.cacheCreationTokens)}</td>
+                    <td className={TD_NUM}>{formatCredits(m.credits)}</td>
+                    <td className={TD_NUM}>{formatUsd(m.creditUsd)}</td>
+                    <td className={TD_NUM}>{formatUsd(m.officialUsd)}</td>
+                    <td className={TD_NUM_STRONG}>{formatDiscount(m.discountRatio)}</td>
                   </tr>
                 ))}
               </tbody>

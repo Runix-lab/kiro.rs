@@ -343,7 +343,7 @@ export function ProxyPoolDialog({ open, onOpenChange, onSelectProxy }: ProxyPool
                 <div key={proxy.id} className="flex items-center gap-3 p-3">
                   <div className="flex-1 min-w-0">
                     <div className="flex items-center gap-2 flex-wrap">
-                      <span className="font-mono text-xs truncate">
+                      <span className="font-mono text-xs truncate" title={maskProxyUrl(proxy.url)}>
                         {maskProxyUrl(proxy.url)}
                       </span>
                       {proxy.label && (

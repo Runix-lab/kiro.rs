@@ -172,7 +172,7 @@ export function GroupsPage() {
               <CardContent className="p-4 space-y-3">
                 <div className="flex items-start justify-between gap-2">
                   <div className="min-w-0">
-                    <div className="font-medium truncate">{g.name}</div>
+                    <div className="font-medium truncate" title={g.name}>{g.name}</div>
                     {g.description && (
                       <p className="text-xs text-muted-foreground mt-0.5 line-clamp-2">{g.description}</p>
                     )}

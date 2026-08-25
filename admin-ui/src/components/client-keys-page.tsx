@@ -499,7 +499,7 @@ export function ClientKeysPage() {
                   <th className="text-right font-medium px-4 py-3">输入</th>
                   <th className="text-right font-medium px-4 py-3">输出</th>
                   <th className="text-left font-medium px-4 py-3">最后使用</th>
-                  <th className="sticky right-0 z-20 min-w-[13.5rem] border-l border-border/60 bg-card px-4 py-3 text-right font-medium">
+                  <th className="sticky right-0 z-20 min-w-[11.75rem] border-l border-border/60 bg-card px-4 py-3 text-right font-medium">
                     操作
                   </th>
                 </tr>
@@ -512,7 +512,9 @@ export function ClientKeysPage() {
                     </td>
                     <td className="px-4 py-3">
                       <div className="flex items-center gap-1.5">
-                        <span className="max-w-[220px] truncate font-medium">{k.name}</span>
+                        <span className="max-w-[220px] truncate font-medium" title={k.name}>
+                          {k.name}
+                        </span>
                         {k.isSystem && (
                           <Badge variant="secondary" title="由 config.json apiKey 同步，不可删除、可轮换">
                             系统
@@ -520,7 +522,10 @@ export function ClientKeysPage() {
                         )}
                       </div>
                       {k.description && (
-                        <div className="max-w-[220px] truncate text-[11px] text-muted-foreground">
+                        <div
+                          className="max-w-[220px] truncate text-[11px] text-muted-foreground"
+                          title={k.description}
+                        >
                           {k.description}
                         </div>
                       )}

@@ -115,7 +115,9 @@ export function BatchVerifyDialog({
                     <div className="flex items-center gap-2 min-w-0">
                       <span className="font-medium shrink-0">凭据 #{result.id}</span>
                       {result.email && (
-                        <span className="text-xs opacity-80 truncate">{result.email}</span>
+                        <span className="text-xs opacity-80 truncate" title={result.email}>
+                          {result.email}
+                        </span>
                       )}
                       {result.status === 'success' && result.usage && (
                         <Badge variant="secondary" className="text-xs shrink-0">

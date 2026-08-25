@@ -608,18 +608,22 @@ export function CredentialCard({
       </label>
 
       {/* 身份 + 徽章 */}
-      <div className="min-w-0 flex-1">
-        <div className="truncate text-sm font-medium leading-5">
+      <div className="min-w-0 flex-1 py-0.5">
+        <div
+          className="truncate text-sm font-medium leading-5"
+          title={credential.email || `凭据 #${credential.id}`}
+        >
           {credential.email || `凭据 #${credential.id}`}
         </div>
-        <div className="mt-1 flex min-w-0 items-center gap-1 overflow-hidden [&>*]:shrink-0">
-          {badges}
-        </div>
+        {/* 徽章允许换行——一个账号可能同时挂订阅/当前优先/禁用原因/风控/鉴权方式/分组/来源
+            等多个徽章，之前用 overflow-hidden 硬裁剪会让排在后面的徽章直接消失且无任何
+            提示。换行后行高会随徽章数量变化，但信息不会丢失。 */}
+        <div className="mt-1 flex min-w-0 flex-wrap items-center gap-1">{badges}</div>
       </div>
 
       {/* 关键指标（中大屏） */}
       <div className="hidden shrink-0 items-center gap-5 lg:flex">
-        <div className="relative w-14 shrink-0 text-center">
+        <div className="relative min-w-[3.5rem] shrink-0 whitespace-nowrap text-center">
           <div className="text-[10px] uppercase tracking-wider text-muted-foreground">
             优先级
           </div>
@@ -681,7 +685,7 @@ export function CredentialCard({
           </div>
         </div>
 
-        <div className="w-20 text-center">
+        <div className="min-w-[5rem] shrink-0 whitespace-nowrap text-center">
           <div className="text-[10px] uppercase tracking-wider text-muted-foreground">
             失败
           </div>
@@ -718,7 +722,7 @@ export function CredentialCard({
           </button>
         </div>
 
-        <div className="w-16 text-center">
+        <div className="min-w-[4rem] shrink-0 whitespace-nowrap text-center">
           <div className="text-[10px] uppercase tracking-wider text-muted-foreground">
             成功
           </div>
@@ -772,7 +776,14 @@ export function CredentialCard({
 
       {/* 最后调用 + 添加时间（中大屏） */}
       <div className="hidden w-24 shrink-0 truncate text-right text-xs md:block">
-        <div className="truncate text-muted-foreground">
+        <div
+          className="truncate text-muted-foreground"
+          title={
+            credential.lastUsedAt
+              ? new Date(credential.lastUsedAt).toLocaleString("zh-CN")
+              : "从未使用"
+          }
+        >
           {formatLastUsed(credential.lastUsedAt)}
         </div>
         <div
@@ -873,12 +884,13 @@ export function CredentialCard({
               />
             </label>
             <div className="min-w-0 flex-1">
-              <CardTitle className="truncate text-[15px] leading-5">
+              <CardTitle
+                className="truncate text-[15px] leading-5"
+                title={credential.email || `凭据 #${credential.id}`}
+              >
                 {credential.email || `凭据 #${credential.id}`}
               </CardTitle>
-              <div className="mt-1.5 flex min-w-0 flex-wrap items-center gap-1 overflow-hidden">
-                {badges}
-              </div>
+              <div className="mt-1.5 flex min-w-0 flex-wrap items-center gap-1">{badges}</div>
             </div>
             <Switch
               className="mt-0.5"
@@ -997,7 +1009,14 @@ export function CredentialCard({
             </div>
             <div className="flex min-w-0 items-center justify-between gap-2 border-t border-border/50 pt-2 min-[420px]:col-span-2">
               <dt className="shrink-0 text-muted-foreground">最后调用</dt>
-              <dd className="min-w-0 truncate text-right font-medium">
+              <dd
+                className="min-w-0 truncate text-right font-medium"
+                title={
+                  credential.lastUsedAt
+                    ? new Date(credential.lastUsedAt).toLocaleString("zh-CN")
+                    : "从未使用"
+                }
+              >
                 {formatLastUsed(credential.lastUsedAt)}
               </dd>
             </div>
@@ -1013,7 +1032,10 @@ export function CredentialCard({
             {credential.maskedApiKey && (
               <div className="flex min-w-0 items-center justify-between gap-2 min-[420px]:col-span-2">
                 <dt className="shrink-0 text-muted-foreground">API Key</dt>
-                <dd className="min-w-0 truncate text-right font-mono text-xs">
+                <dd
+                  className="min-w-0 truncate text-right font-mono text-xs"
+                  title={credential.maskedApiKey}
+                >
                   {credential.maskedApiKey}
                 </dd>
               </div>
@@ -1021,7 +1043,10 @@ export function CredentialCard({
             {credential.hasProxy && (
               <div className="flex min-w-0 items-center justify-between gap-2 min-[420px]:col-span-2">
                 <dt className="shrink-0 text-muted-foreground">代理</dt>
-                <dd className="min-w-0 truncate text-right font-mono text-xs">
+                <dd
+                  className="min-w-0 truncate text-right font-mono text-xs"
+                  title={maskProxyUrl(credential.proxyUrl ?? "")}
+                >
                   {maskProxyUrl(credential.proxyUrl ?? "")}
                 </dd>
               </div>

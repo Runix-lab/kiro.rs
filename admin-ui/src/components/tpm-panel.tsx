@@ -3,6 +3,7 @@ import { Card, CardContent } from '@/components/ui/card'
 import { Button } from '@/components/ui/button'
 import { useTpm } from '@/hooks/use-stats'
 import { formatCredits, formatDiscount, formatNumber, formatUsd } from '@/lib/utils'
+import { TD_LABEL, TD_NUM, TD_NUM_STRONG, TH_LABEL, TH_NUM, TH_TEXT } from '@/lib/table-styles'
 import type { StatsFilter, StatsTimeFilter, TpmDim, TpmEntityStats } from '@/types/api'
 
 const DIM_OPTIONS: { label: string; value: TpmDim }[] = [
@@ -76,22 +77,20 @@ export function TpmPanel({
             <table className="w-full min-w-[1260px]">
               <thead className="text-muted-foreground">
                 <tr>
-                  <th className="pb-2.5 text-left font-medium">
-                    {dim === 'key' ? '入口 Key' : '上游凭据'}
-                  </th>
-                  <th className="pb-2.5 pl-3 text-left font-medium">主用模型</th>
-                  <th className="pb-2.5 pl-3 text-right font-medium">峰值 TPM</th>
-                  <th className="pb-2.5 pl-3 text-right font-medium">计费峰值</th>
-                  <th className="pb-2.5 pl-3 text-right font-medium">峰值 RPM</th>
-                  <th className="pb-2.5 pl-3 text-right font-medium">均值 TPM</th>
-                  <th className="pb-2.5 pl-3 text-right font-medium">均值 RPM</th>
-                  <th className="pb-2.5 pl-3 text-right font-medium">活跃分钟</th>
-                  <th className="pb-2.5 pl-3 text-right font-medium">总调用</th>
-                  <th className="pb-2.5 pl-3 text-right font-medium">成功率</th>
-                  <th className="pb-2.5 pl-3 text-right font-medium">Credit</th>
-                  <th className="pb-2.5 pl-3 text-right font-medium">实付$</th>
-                  <th className="pb-2.5 pl-3 text-right font-medium">官方$</th>
-                  <th className="pb-2.5 pl-3 text-right font-medium">折扣</th>
+                  <th className={TH_LABEL}>{dim === 'key' ? '入口 Key' : '上游凭据'}</th>
+                  <th className={TH_TEXT}>主用模型</th>
+                  <th className={TH_NUM}>峰值 TPM</th>
+                  <th className={TH_NUM}>计费峰值</th>
+                  <th className={TH_NUM}>峰值 RPM</th>
+                  <th className={TH_NUM}>均值 TPM</th>
+                  <th className={TH_NUM}>均值 RPM</th>
+                  <th className={TH_NUM}>活跃分钟</th>
+                  <th className={TH_NUM}>总调用</th>
+                  <th className={TH_NUM}>成功率</th>
+                  <th className={TH_NUM}>Credit</th>
+                  <th className={TH_NUM}>实付$</th>
+                  <th className={TH_NUM}>官方$</th>
+                  <th className={TH_NUM}>折扣</th>
                 </tr>
               </thead>
               <tbody>
@@ -100,44 +99,20 @@ export function TpmPanel({
                 ))}
                 {totals && totals.totalCalls > 0 && (
                   <tr className="border-t-2 border-border/70 font-medium">
-                    <td className="py-2.5 pr-4">合计</td>
-                    <td className="py-2.5 pl-3 text-muted-foreground">—</td>
-                    <td className="py-2.5 pl-3 text-right tabular-nums">
-                      {formatNumber(totals.peakTpmTotal)}
-                    </td>
-                    <td className="py-2.5 pl-3 text-right tabular-nums">
-                      {formatNumber(totals.peakTpmBillable)}
-                    </td>
-                    <td className="py-2.5 pl-3 text-right tabular-nums">
-                      {formatNumber(totals.peakRpm)}
-                    </td>
-                    <td className="py-2.5 pl-3 text-right tabular-nums">
-                      {formatNumber(totals.avgTpmActive)}
-                    </td>
-                    <td className="py-2.5 pl-3 text-right tabular-nums">
-                      {formatNumber(totals.avgRpmActive)}
-                    </td>
-                    <td className="py-2.5 pl-3 text-right tabular-nums">
-                      {formatNumber(totals.activeMinutes)}
-                    </td>
-                    <td className="py-2.5 pl-3 text-right tabular-nums">
-                      {formatNumber(totals.totalCalls)}
-                    </td>
-                    <td className="py-2.5 pl-3 text-right tabular-nums">
-                      {totals.successRate.toFixed(1)}%
-                    </td>
-                    <td className="py-2.5 pl-3 text-right tabular-nums">
-                      {formatCredits(totals.credits)}
-                    </td>
-                    <td className="py-2.5 pl-3 text-right tabular-nums">
-                      {formatUsd(totals.creditUsd)}
-                    </td>
-                    <td className="py-2.5 pl-3 text-right tabular-nums">
-                      {formatUsd(totals.officialUsd)}
-                    </td>
-                    <td className="py-2.5 pl-3 text-right tabular-nums">
-                      {formatDiscount(totals.discountRatio)}
-                    </td>
+                    <td className="py-2.5 pr-4 whitespace-nowrap">合计</td>
+                    <td className="py-2.5 pl-3 whitespace-nowrap text-muted-foreground">—</td>
+                    <td className={TD_NUM}>{formatNumber(totals.peakTpmTotal)}</td>
+                    <td className={TD_NUM}>{formatNumber(totals.peakTpmBillable)}</td>
+                    <td className={TD_NUM}>{formatNumber(totals.peakRpm)}</td>
+                    <td className={TD_NUM}>{formatNumber(totals.avgTpmActive)}</td>
+                    <td className={TD_NUM}>{formatNumber(totals.avgRpmActive)}</td>
+                    <td className={TD_NUM}>{formatNumber(totals.activeMinutes)}</td>
+                    <td className={TD_NUM}>{formatNumber(totals.totalCalls)}</td>
+                    <td className={TD_NUM}>{totals.successRate.toFixed(1)}%</td>
+                    <td className={TD_NUM}>{formatCredits(totals.credits)}</td>
+                    <td className={TD_NUM}>{formatUsd(totals.creditUsd)}</td>
+                    <td className={TD_NUM}>{formatUsd(totals.officialUsd)}</td>
+                    <td className={TD_NUM_STRONG}>{formatDiscount(totals.discountRatio)}</td>
                   </tr>
                 )}
               </tbody>
@@ -180,8 +155,13 @@ function EntityRow({ e }: { e: TpmEntityStats }) {
     e.successRate < 95 ? 'text-destructive' : e.successRate < 99 ? 'text-amber-600' : ''
   return (
     <tr className="border-t border-border/40">
-      <td className="max-w-[220px] truncate py-2.5 pr-4 font-medium">{e.label}</td>
-      <td className="max-w-[200px] truncate py-2.5 pl-3 text-muted-foreground">
+      <td className={TD_LABEL} title={e.label}>
+        {e.label}
+      </td>
+      <td
+        className="max-w-[200px] truncate py-2.5 pl-3 text-muted-foreground"
+        title={e.topModel ? `${e.topModel}（占比 ${e.topModelShare.toFixed(0)}%）` : undefined}
+      >
         {e.topModel ? (
           <>
             {e.topModel}
@@ -193,14 +173,14 @@ function EntityRow({ e }: { e: TpmEntityStats }) {
           '—'
         )}
       </td>
-      <td className="py-2.5 pl-3 text-right tabular-nums">{formatNumber(e.peakTpmTotal)}</td>
-      <td className="py-2.5 pl-3 text-right tabular-nums">{formatNumber(e.peakTpmBillable)}</td>
-      <td className="py-2.5 pl-3 text-right tabular-nums">{formatNumber(e.peakRpm)}</td>
-      <td className="py-2.5 pl-3 text-right tabular-nums">{formatNumber(e.avgTpmActive)}</td>
-      <td className="py-2.5 pl-3 text-right tabular-nums">{formatNumber(e.avgRpmActive)}</td>
-      <td className="py-2.5 pl-3 text-right tabular-nums">{formatNumber(e.activeMinutes)}</td>
-      <td className="py-2.5 pl-3 text-right tabular-nums">{formatNumber(e.totalCalls)}</td>
-      <td className={`py-2.5 pl-3 text-right tabular-nums ${rateClass}`}>
+      <td className={TD_NUM}>{formatNumber(e.peakTpmTotal)}</td>
+      <td className={TD_NUM}>{formatNumber(e.peakTpmBillable)}</td>
+      <td className={TD_NUM}>{formatNumber(e.peakRpm)}</td>
+      <td className={TD_NUM}>{formatNumber(e.avgTpmActive)}</td>
+      <td className={TD_NUM}>{formatNumber(e.avgRpmActive)}</td>
+      <td className={TD_NUM}>{formatNumber(e.activeMinutes)}</td>
+      <td className={TD_NUM}>{formatNumber(e.totalCalls)}</td>
+      <td className={`${TD_NUM} ${rateClass}`}>
         {e.successRate.toFixed(1)}%
         {e.errors > 0 && (
           <span className="ml-1 text-[11px] text-muted-foreground/70">
@@ -208,12 +188,10 @@ function EntityRow({ e }: { e: TpmEntityStats }) {
           </span>
         )}
       </td>
-      <td className="py-2.5 pl-3 text-right tabular-nums">{formatCredits(e.credits)}</td>
-      <td className="py-2.5 pl-3 text-right tabular-nums">{formatUsd(e.creditUsd)}</td>
-      <td className="py-2.5 pl-3 text-right tabular-nums">{formatUsd(e.officialUsd)}</td>
-      <td className="py-2.5 pl-3 text-right font-semibold tabular-nums">
-        {formatDiscount(e.discountRatio)}
-      </td>
+      <td className={TD_NUM}>{formatCredits(e.credits)}</td>
+      <td className={TD_NUM}>{formatUsd(e.creditUsd)}</td>
+      <td className={TD_NUM}>{formatUsd(e.officialUsd)}</td>
+      <td className={TD_NUM_STRONG}>{formatDiscount(e.discountRatio)}</td>
     </tr>
   )
 }

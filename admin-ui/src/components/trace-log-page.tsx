@@ -294,7 +294,9 @@ function TraceRow({ rec, showErrorColumn }: { rec: TraceRecord; showErrorColumn:
           {formatTime(rec.ts)}
         </td>
         <td className="py-2.5 pr-3 text-[13px]">
-          <span className="inline-block max-w-[220px] truncate align-middle">{rec.model}</span>
+          <span className="inline-block max-w-[220px] truncate align-middle" title={rec.model}>
+            {rec.model}
+          </span>
           {rec.isStream && <Badge variant="outline" className="ml-1.5">流式</Badge>}
         </td>
         <td className="py-2.5 pr-3 text-[13px]">
@@ -325,25 +327,26 @@ function TraceRow({ rec, showErrorColumn }: { rec: TraceRecord; showErrorColumn:
           {formatDuration(rec.durationMs)}
         </td>
       </tr>
-      {open && <ExpandedTraceRow rec={rec} />}
+      {open && <ExpandedTraceRow rec={rec} colSpan={showErrorColumn ? 12 : 11} />}
     </>
   )
 }
 
 function TraceCredentialCell({ rec }: { rec: TraceRecord }) {
+  const label = credLabel(rec.finalCredentialId, rec.finalEmail)
   return (
     <td className="py-2.5 pr-3 text-[13px]">
-      <span className="inline-block max-w-[220px] truncate align-middle">
-        {credLabel(rec.finalCredentialId, rec.finalEmail)}
+      <span className="inline-block max-w-[220px] truncate align-middle" title={label}>
+        {label}
       </span>
     </td>
   )
 }
 
-function ExpandedTraceRow({ rec }: { rec: TraceRecord }) {
+function ExpandedTraceRow({ rec, colSpan }: { rec: TraceRecord; colSpan: number }) {
   return (
     <tr className="border-b border-border/40 bg-secondary/20">
-      <td colSpan={12} className="px-3 py-3">
+      <td colSpan={colSpan} className="px-3 py-3">
         <ExpandedDetail rec={rec} />
       </td>
     </tr>
