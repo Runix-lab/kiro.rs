@@ -646,35 +646,35 @@ function ModelUsageCard({
             窗口内无数据
           </div>
         ) : (
-          <div className="max-h-[480px] overflow-auto text-[13px]">
-            <table className="w-full min-w-[860px]">
-              <thead className="sticky top-0 bg-card text-muted-foreground">
+          <div className="overflow-x-auto text-sm">
+            <table className="w-full min-w-[900px]">
+              <thead className="text-muted-foreground">
                 <tr>
-                  <th className="pb-2 text-left font-medium">模型</th>
-                  <th className="pb-2 text-right font-medium">调用</th>
-                  <th className="pb-2 text-right font-medium">输入</th>
-                  <th className="pb-2 text-right font-medium">输出</th>
-                  <th className="pb-2 text-right font-medium">缓存读</th>
-                  <th className="pb-2 text-right font-medium">缓存写</th>
-                  <th className="pb-2 text-right font-medium">Credit</th>
-                  <th className="pb-2 text-right font-medium">实付$</th>
-                  <th className="pb-2 text-right font-medium">官方$</th>
-                  <th className="pb-2 text-right font-medium">折扣</th>
+                  <th className="pb-2.5 text-left font-medium">模型</th>
+                  <th className="pb-2.5 text-right font-medium">调用</th>
+                  <th className="pb-2.5 text-right font-medium">输入</th>
+                  <th className="pb-2.5 text-right font-medium">输出</th>
+                  <th className="pb-2.5 text-right font-medium">缓存读</th>
+                  <th className="pb-2.5 text-right font-medium">缓存写</th>
+                  <th className="pb-2.5 text-right font-medium">Credit</th>
+                  <th className="pb-2.5 text-right font-medium">实付$</th>
+                  <th className="pb-2.5 text-right font-medium">官方$</th>
+                  <th className="pb-2.5 text-right font-medium">折扣</th>
                 </tr>
               </thead>
               <tbody>
                 {data.map((m) => (
                   <tr key={m.model} className="border-t border-border/40">
-                    <td className="max-w-[260px] truncate py-2 pr-3 font-medium">{m.model}</td>
-                    <td className="py-2 text-right tabular-nums">{formatNumber(m.calls)}</td>
-                    <td className="py-2 text-right tabular-nums">{formatNumber(m.inputTokens)}</td>
-                    <td className="py-2 text-right tabular-nums">{formatNumber(m.outputTokens)}</td>
-                    <td className="py-2 text-right tabular-nums">{formatNumber(m.cacheReadTokens)}</td>
-                    <td className="py-2 text-right tabular-nums">{formatNumber(m.cacheCreationTokens)}</td>
-                    <td className="py-2 text-right tabular-nums">{formatCredits(m.credits)}</td>
-                    <td className="py-2 text-right tabular-nums">{formatUsd(m.creditUsd)}</td>
-                    <td className="py-2 text-right tabular-nums">{formatUsd(m.officialUsd)}</td>
-                    <td className="py-2 text-right font-semibold tabular-nums">
+                    <td className="max-w-[280px] truncate py-2.5 pr-4 font-medium">{m.model}</td>
+                    <td className="py-2.5 pl-3 text-right tabular-nums">{formatNumber(m.calls)}</td>
+                    <td className="py-2.5 pl-3 text-right tabular-nums">{formatNumber(m.inputTokens)}</td>
+                    <td className="py-2.5 pl-3 text-right tabular-nums">{formatNumber(m.outputTokens)}</td>
+                    <td className="py-2.5 pl-3 text-right tabular-nums">{formatNumber(m.cacheReadTokens)}</td>
+                    <td className="py-2.5 pl-3 text-right tabular-nums">{formatNumber(m.cacheCreationTokens)}</td>
+                    <td className="py-2.5 pl-3 text-right tabular-nums">{formatCredits(m.credits)}</td>
+                    <td className="py-2.5 pl-3 text-right tabular-nums">{formatUsd(m.creditUsd)}</td>
+                    <td className="py-2.5 pl-3 text-right tabular-nums">{formatUsd(m.officialUsd)}</td>
+                    <td className="py-2.5 pl-3 text-right font-semibold tabular-nums">
                       {formatDiscount(m.discountRatio)}
                     </td>
                   </tr>
