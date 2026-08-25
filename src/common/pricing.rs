@@ -101,7 +101,10 @@ const BUILTIN_PRICES: &[(&str, ModelPrice)] = &[
     ("claude-opus-4-6", ModelPrice::standard(5.0, 25.0)),
     ("claude-opus-4-5", ModelPrice::standard(5.0, 25.0)),
     ("claude-opus-4-1", ModelPrice::standard(15.0, 75.0)),
-    ("claude-sonnet-5", ModelPrice::standard(3.0, 15.0)),
+    // Sonnet 5 现价是introductory $2/$10（有效期至 2026-08-31），list 价 $3/$15。
+    // 用现价：官方价值按实际能拿到的价算，折扣才不会偏乐观。促销结束后改回 3/15，
+    // 或用 config 的 pricing.models 覆盖。
+    ("claude-sonnet-5", ModelPrice::standard(2.0, 10.0)),
     ("claude-sonnet-4-6", ModelPrice::standard(3.0, 15.0)),
     ("claude-sonnet-4-5", ModelPrice::standard(3.0, 15.0)),
     ("claude-sonnet-4", ModelPrice::standard(3.0, 15.0)),
