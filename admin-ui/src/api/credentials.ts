@@ -36,6 +36,8 @@ import type {
   UpdateCheckInfo,
   GitHubRateLimitInfo,
   UpdateAdminKeyRequest,
+  SchedulingConfig,
+  SchedulingRunResult,
 } from '@/types/api'
 
 // 创建 axios 实例
@@ -517,6 +519,28 @@ export async function setLogGovernanceConfig(
   patch: Partial<LogGovernanceConfig>,
 ): Promise<LogGovernanceConfig> {
   const { data } = await api.put<LogGovernanceConfig>('/config/log-governance', patch)
+  return data
+}
+
+// ============ 调度策略 ============
+
+// 获取调度策略配置
+export async function getSchedulingConfig(): Promise<SchedulingConfig> {
+  const { data } = await api.get<SchedulingConfig>('/config/scheduling')
+  return data
+}
+
+// 更新调度策略配置
+export async function setSchedulingConfig(
+  config: SchedulingConfig,
+): Promise<SchedulingConfig> {
+  const { data } = await api.put<SchedulingConfig>('/config/scheduling', config)
+  return data
+}
+
+// 立即执行一轮调度
+export async function runScheduling(): Promise<SchedulingRunResult> {
+  const { data } = await api.post<SchedulingRunResult>('/config/scheduling/run')
   return data
 }
 

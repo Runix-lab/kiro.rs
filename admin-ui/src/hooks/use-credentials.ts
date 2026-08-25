@@ -26,8 +26,16 @@ import {
   setLogGovernanceConfig,
   resetSuccessCount,
   resetAllSuccessCount,
+  getSchedulingConfig,
+  setSchedulingConfig,
+  runScheduling,
 } from '@/api/credentials'
-import type { AddCredentialRequest, UpdateCredentialRequest, UpdateRefreshTokenRequest } from '@/types/api'
+import type {
+  AddCredentialRequest,
+  UpdateCredentialRequest,
+  UpdateRefreshTokenRequest,
+  SchedulingConfig,
+} from '@/types/api'
 
 // 查询凭据列表
 export function useCredentials() {
@@ -294,6 +302,36 @@ export function useSetLogGovernanceConfig() {
     mutationFn: setLogGovernanceConfig,
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['logGovernanceConfig'] })
+    },
+  })
+}
+
+// 获取调度策略配置
+export function useSchedulingConfig() {
+  return useQuery({
+    queryKey: ['schedulingConfig'],
+    queryFn: getSchedulingConfig,
+  })
+}
+
+// 更新调度策略配置
+export function useSetSchedulingConfig() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: (config: SchedulingConfig) => setSchedulingConfig(config),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['schedulingConfig'] })
+    },
+  })
+}
+
+// 立即执行一轮调度：会实际改动凭据优先级，同时失效凭据列表
+export function useRunScheduling() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: () => runScheduling(),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['credentials'] })
     },
   })
 }

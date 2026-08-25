@@ -785,6 +785,52 @@ export interface MinuteSample {
   upstreamFailures: number
 }
 
+// ============ 调度策略 ============
+
+/**
+ * 调度取向：决定「按取向铺排」这条自动规则怎么排优先级。
+ * - manual：只运行额度守卫 + 首选层保护两条规则，手工设置的优先级不受影响
+ * - throughput：把所有凭据拉平到 50，配合均衡负载模式打散流量
+ * - conserve：剩余额度最多的排最前，几个账号一起匀速消耗
+ * - drain：剩余额度最少的排最前，优先烧完这部分再轮到额度充足的账号
+ */
+export type SchedulingProfile = 'manual' | 'throughput' | 'conserve' | 'drain'
+
+/** GET/PUT /api/admin/config/scheduling 的配置体 */
+export interface SchedulingConfig {
+  /** 总开关；关闭时不运行任何自动调度规则 */
+  enabled: boolean
+  /** 额度守卫阈值（百分比，0-100）：用量超过该值即触发降级 */
+  demoteThresholdPct: number
+  /** 触发额度守卫后临时改到的优先级（必须 > 50 基准档） */
+  demoteTo: number
+  /** 首选层保护：至少保留几个凭据共享最小（最优先）优先级值 */
+  minTopTier: number
+  /** 调度取向 */
+  profile: SchedulingProfile
+}
+
+/** 单条调度变更的原因 */
+export type SchedulingChangeReason =
+  | 'quotaDemote'
+  | 'quotaRestore'
+  | 'topTierRefill'
+  | 'profileRebalance'
+
+/** 单条优先级变更 */
+export interface SchedulingChange {
+  id: number
+  from: number
+  to: number
+  reason: SchedulingChangeReason
+}
+
+/** POST /api/admin/config/scheduling/run 的响应 */
+export interface SchedulingRunResult {
+  applied: number
+  changes: SchedulingChange[]
+}
+
 /**
  * GET /api/admin/stats/rate 的响应。
  *
