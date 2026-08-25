@@ -176,6 +176,67 @@ export function formatDiscount(ratio: number | null | undefined): string {
 }
 
 /**
+ * 速率类数值展示（次/分钟、token/分钟）：低流量场景常是 0.x~几十的小数，
+ * 直接丢给 `formatNumber` 会被 `String(value)` 原样吐出一长串小数位；
+ * 这里 <10 保留 2 位小数，≥10 交给 `formatNumber` 走整数/紧凑格式。
+ */
+export function formatRate(value: number | null | undefined): string {
+  if (value == null || Number.isNaN(value)) return '0'
+  if (Math.abs(value) < 10) return value.toFixed(2)
+  return formatNumber(Math.round(value))
+}
+
+/**
+ * 北京时间（Asia/Shanghai，UTC+8，无夏令时）格式化。
+ *
+ * 用固定偏移量直接搬 wall-clock 字段，而不是 `Intl.DateTimeFormat` 的 timeZone
+ * 选项——语义等价但不依赖运行环境的 ICU 时区数据，更可控。全产品按北京时间结算
+ * 与展示，这里不能用浏览器本地时区（管理员可能人在境外打开面板）。
+ */
+const BEIJING_OFFSET_MS = 8 * 60 * 60 * 1000
+
+interface BeijingParts {
+  year: number
+  month: number
+  day: number
+  hour: number
+  minute: number
+}
+
+function toBeijingParts(ms: number): BeijingParts {
+  const d = new Date(ms + BEIJING_OFFSET_MS)
+  return {
+    year: d.getUTCFullYear(),
+    month: d.getUTCMonth() + 1,
+    day: d.getUTCDate(),
+    hour: d.getUTCHours(),
+    minute: d.getUTCMinutes(),
+  }
+}
+
+function pad2(n: number): string {
+  return String(n).padStart(2, '0')
+}
+
+/** `HH:mm`，北京时间。用于 ≤24h 的分钟级图表横轴。 */
+export function formatBeijingHM(ms: number): string {
+  const p = toBeijingParts(ms)
+  return `${pad2(p.hour)}:${pad2(p.minute)}`
+}
+
+/** `MM-DD HH:mm`，北京时间。用于跨天的按小时均值图表横轴。 */
+export function formatBeijingMdHm(ms: number): string {
+  const p = toBeijingParts(ms)
+  return `${pad2(p.month)}-${pad2(p.day)} ${pad2(p.hour)}:${pad2(p.minute)}`
+}
+
+/** `MM-DD`，北京时间。用于按天均值图表横轴。 */
+export function formatBeijingMd(ms: number): string {
+  const p = toBeijingParts(ms)
+  return `${pad2(p.month)}-${pad2(p.day)}`
+}
+
+/**
  * 脱敏代理 URL：将 user:pass@host 中的认证信息替换为 xxx****xxx
  */
 /** 企业 SSO (external_idp) 的 authMethod 别名，与后端 canonicalize_auth_method_value 保持一致 */

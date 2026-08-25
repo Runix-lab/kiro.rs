@@ -33,6 +33,9 @@ import {
 } from '@/components/ui/select'
 
 const RANGES: { label: string; value: StatsRange }[] = [
+  { label: '1 小时', value: '1h' },
+  { label: '3 小时', value: '3h' },
+  { label: '6 小时', value: '6h' },
   { label: '24 小时', value: '24h' },
   { label: '7 天', value: '7d' },
   { label: '30 天', value: '30d' },
@@ -58,8 +61,17 @@ function customTimeFilter(
   return { startDate, endDate, granularity }
 }
 
+/**
+ * 短时预设（1h/3h/6h）落在同一个日历日内，`startDate`/`endDate` 只有天粒度，
+ * 表达不了"最近 N 小时"这种小时精度——这三档统一按"今天"取，效果等价于其它
+ * 按天分桶的图表（TimeSeriesChart 等）显示"今天的按小时数据"，真正的小时级
+ * 窗口精度由 RatePanel 走速率环单独实现（见 rate-panel.tsx）。
+ */
 function presetStartDate(range: StatsRange, endDate: string): string {
-  const days = range === '24h' ? 1 : range === '7d' ? 6 : 29
+  const days = range === '1h' || range === '3h' || range === '6h' ? 0
+    : range === '24h' ? 1
+    : range === '7d' ? 6
+    : 29
   const d = new Date(`${endDate}T00:00:00`)
   d.setDate(d.getDate() - days)
   return toDateInputValue(d)
@@ -119,7 +131,7 @@ export function OverviewPage() {
         onGranularityChange={filters.setDraftGranularity}
         onPresetRangeChange={filters.selectPresetRange}
       />
-      <RatePanel />
+      <RatePanel range={filters.draftRange} timeFilter={filters.timeFilter} />
       <TpmPanel timeFilter={filters.timeFilter} statsFilter={filters.statsFilter} />
       <ModelUsageCard
         data={modelData}
@@ -138,9 +150,10 @@ export function OverviewPage() {
 
 function useOverviewFilters() {
   const today = useMemo(() => toDateInputValue(new Date()), [])
-  const [timeFilter, setTimeFilter] = useState<StatsTimeFilter>(() =>
-    customTimeFilter(presetStartDate('24h', today), today, 'hour'),
-  )
+  const [timeFilter, setTimeFilter] = useState<StatsTimeFilter>(() => ({
+    range: '24h',
+    granularity: 'hour',
+  }))
   const [customStartDate, setCustomStartDate] = useState(() => presetStartDate('24h', today))
   const [customEndDate, setCustomEndDate] = useState(today)
   const [draftGranularity, setDraftGranularity] = useState<StatsGranularity>('hour')
@@ -154,7 +167,14 @@ function useOverviewFilters() {
     return f
   }, [keyFilter, groupFilter])
   const applyCustomRange = () => {
+    // 手动点「应用」= 明确要自定义区间，此时才用 startDate/endDate
+    setDraftRange(undefined)
     setTimeFilter(customTimeFilter(customStartDate, customEndDate, draftGranularity))
+  }
+  const changeGranularity = (g: StatsGranularity) => {
+    setDraftGranularity(g)
+    // 预设档位下改粒度要就地生效，否则用户得再点一次预设才看得到变化
+    if (draftRange) setTimeFilter({ range: draftRange, granularity: g })
   }
   const updateCustomStartDate = (value: string) => {
     setCustomStartDate(value)
@@ -166,9 +186,17 @@ function useOverviewFilters() {
   }
   const selectPresetRange = (range: StatsRange) => {
     const endDate = toDateInputValue(new Date())
+    // 自定义输入框仍然回填一个近似日期区间，方便用户接着微调
     setCustomStartDate(presetStartDate(range, endDate))
     setCustomEndDate(endDate)
     setDraftRange(range)
+    // 预设档位一律走 range，不走 startDate/endDate。
+    //
+    // 从前预设也被翻译成日期区间，而后端把日期区间展开成【整日】：
+    // 选「24 小时」发的是 startDate=昨天&endDate=今天，实际窗口是两个完整
+    // 自然日，最多 48 小时——和标签写的不是一回事。range 走的是精确时间戳
+    // （now - N 小时），选几小时就是几小时，各面板口径也才能真正一致。
+    setTimeFilter({ range, granularity: draftGranularity })
   }
   return {
     applyCustomRange,
@@ -181,7 +209,7 @@ function useOverviewFilters() {
     selectPresetRange,
     setCustomEndDate: updateCustomEndDate,
     setCustomStartDate: updateCustomStartDate,
-    setDraftGranularity,
+    setDraftGranularity: changeGranularity,
     setKeyFilter,
     setGroupFilter,
     statsFilter,
@@ -484,7 +512,7 @@ function PresetRangeButtons({
   onChange: (value: StatsRange) => void
 }) {
   return (
-    <div className="grid grid-cols-3 gap-1 rounded-md border border-border/60 p-0.5 lg:flex lg:items-center">
+    <div className="grid grid-cols-3 gap-1 rounded-md border border-border/60 p-0.5 lg:flex lg:flex-wrap lg:items-center lg:justify-end">
       {RANGES.map((r) => (
         <Button
           key={r.value}

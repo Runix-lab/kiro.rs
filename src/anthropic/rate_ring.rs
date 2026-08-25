@@ -20,13 +20,20 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-/// 环容量（分钟桶数）。120 = 2 小时。
-pub const RING_MINUTES: usize = 120;
+/// 环容量（分钟桶数）。1440 = 24 小时。
+///
+/// 原本是 120（2 小时），导致速率图无论上面选了多长的时间范围，最多也只有
+/// 两小时的数据可画。单个桶是 9 个 u64 原子量 ≈ 72 字节，24 小时也才 ~104KB，
+/// 为了让"选 24 小时就看 24 小时"成立，这个内存完全值得。
+///
+/// 注意：环在进程内存里，重启后从空开始逐分钟填。比环更长的范围、或重启后
+/// 尚未填满的部分，前端应改用 `/stats/timeseries`（小时桶，启动时从日志重建）。
+pub const RING_MINUTES: usize = 1440;
 
 /// 单个分钟桶。
 ///
 /// `minute` 兼作代次标记：槽位按 `minute % RING_MINUTES` 复用，读写时都要比对
-/// `minute` 是否等于期望值，否则读到的是 2 小时前那一轮的残留。
+/// `minute` 是否等于期望值，否则读到的是上一轮（24 小时前）的残留。
 #[derive(Debug, Default)]
 struct Bucket {
     /// 该桶代表的 Unix 分钟数（epoch 秒 / 60）。0 表示从未写入。
@@ -201,9 +208,17 @@ impl RateRing {
     /// 速率取**上一个完整分钟**而不是当前分钟：当前分钟还在累加，读出来是个偏低的
     /// 半成品，会让面板上的 RPM 看起来总比实际低。
     pub fn snapshot(&self) -> RateSnapshot {
+        self.snapshot_recent(None)
+    }
+
+    /// 同 [`snapshot`]，但只取最近 `minutes` 分钟（`None` = 满环）。
+    ///
+    /// 峰值仍然按**取回的这段区间**算——面板上写着"近 1 小时"，峰值就该是这一
+    /// 小时内的峰值，不能混进 23 小时前的尖峰。
+    pub fn snapshot_recent(&self, minutes: Option<usize>) -> RateSnapshot {
         let now = Self::now_minute();
         let last_complete = now.saturating_sub(1);
-        let series = self.recent(RING_MINUTES);
+        let series = self.recent(minutes.unwrap_or(RING_MINUTES));
         let current = series
             .iter()
             .find(|s| s.minute == last_complete)
@@ -243,7 +258,9 @@ impl RateRing {
             peak_tpm_total,
             peak_tpm_billable,
             retry_amplification: amplification,
-            window_minutes: RING_MINUTES,
+            // 报实际取回的分钟数，不是环容量——前端要靠它判断"是不是刚重启、
+            // 这段还没填满"，写死 RING_MINUTES 会让空窗口看起来像零流量。
+            window_minutes: series.len(),
             series,
         }
     }

@@ -31,8 +31,14 @@ export async function getOverview(): Promise<OverviewStats> {
 }
 
 function statsParams(time: StatsTimeFilter, filter?: StatsFilter) {
+  // range 与 startDate/endDate 互斥。后端在两者都收到时优先日期区间，而日期
+  // 区间会被展开成整日——选「1 小时」会静默变成「今天一整天」。这里把互斥
+  // 落实在唯一的出口上，调用方就不会各自踩一遍。
+  const window = time.range
+    ? { range: time.range, granularity: time.granularity }
+    : { startDate: time.startDate, endDate: time.endDate, granularity: time.granularity }
   return {
-    ...time,
+    ...window,
     ...(filter?.keyId !== undefined ? { keyId: filter.keyId } : {}),
     ...(filter?.group ? { group: filter.group } : {}),
   }
@@ -62,14 +68,17 @@ export async function getByCredential(time: StatsTimeFilter, filter?: StatsFilte
 /**
  * 取分钟级 RPM / TPM。
  *
- * 数据来自后端内存速率环，**不受 trace 开关影响**，也不接受 range / group 过滤 ——
- * 环是固定 120 分钟窗口且只存标量，没有维度可筛。
+ * 数据来自后端内存速率环，**不受 trace 开关影响**，也不接受 group 过滤——环里
+ * 只存标量，没有维度可筛。`minutes` 取最近 N 分钟（1~1440，缺省给满环）：
+ * 这是"以当前时刻为终点"的相对窗口，不能拿去表示任意历史区间（比如"上周三"）。
  *
  * 采集层未注入时后端回 503，调用方应据此显示"未启用"而不是一堆 0，
  * 否则分不清"没装采集层"与"真的没流量"。
  */
-export async function getRate(): Promise<RateSnapshot> {
-  const { data } = await api.get<RateSnapshot>('/stats/rate')
+export async function getRate(minutes?: number): Promise<RateSnapshot> {
+  const { data } = await api.get<RateSnapshot>('/stats/rate', {
+    params: minutes != null ? { minutes } : undefined,
+  })
   return data
 }
 
@@ -86,8 +95,15 @@ export async function getTpm(
   filter?: StatsFilter,
 ): Promise<TpmStats> {
   const params: Record<string, string> = { dim }
-  if (time.startDate) params.startDate = time.startDate
-  if (time.endDate) params.endDate = time.endDate
+  // range 与 startDate/endDate 互斥：预设档位走 range（精确到小时），
+  // 自定义区间才走日期。两个都发的话后端优先日期，短档位就会失效。
+  if (time.range) {
+    params.range = time.range
+  } else {
+    if (time.startDate) params.startDate = time.startDate
+    if (time.endDate) params.endDate = time.endDate
+  }
+  if (time.granularity) params.granularity = time.granularity
   if (filter?.keyId !== undefined) params.keyId = String(filter.keyId)
   if (filter?.group) params.group = filter.group
   const { data } = await api.get<TpmStats>('/stats/tpm', { params })

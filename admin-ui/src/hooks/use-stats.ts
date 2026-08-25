@@ -1,6 +1,6 @@
 import { keepPreviousData, useMutation, useQuery } from '@tanstack/react-query'
 import { toast } from 'sonner'
-import { exportBilling, getBilling, getByCredential, getByModel, getOverview, getTimeSeries, getTpm } from '@/api/stats'
+import { exportBilling, getBilling, getByCredential, getByModel, getOverview, getRate, getTimeSeries, getTpm } from '@/api/stats'
 import { extractErrorMessage } from '@/lib/utils'
 import type { StatsFilter, StatsTimeFilter, TpmDim } from '@/types/api'
 
@@ -73,6 +73,56 @@ export function useTpm(dim: TpmDim, time: StatsTimeFilter, filter?: StatsFilter)
       filter?.group ?? 'all',
     ],
     queryFn: () => getTpm(dim, time, filter),
+    ...COMMON,
+  })
+}
+
+/** 速率环轮询间隔。后端按整分钟聚合，比这更快只会重复读同一个桶。 */
+const RATE_POLL_MS = 15_000
+
+/**
+ * 分钟级 RPM / TPM（速率环，最长覆盖 1440 分钟 = 24h）。
+ *
+ * 只支持"以当前时刻为终点、往回数 N 分钟"的相对窗口——调用方（RatePanel）需自行
+ * 保证仅在选中的是这类窗口（1h/3h/6h/24h 预设）时把 `enabled` 置为 true；任意
+ * 历史区间（7d/30d 预设或自定义日期）请改用 `useRateBuckets`，环回答不了"上周三
+ * 那小时"这种问题。
+ *
+ * 与其它统计接口分开轮询：这里要 15s 一刷，合并到 `COMMON`（30s）会让"实时"变得
+ * 不够实时；`placeholderData` 保留切换窗口时的旧数据，避免每次点预设按钮都闪一下。
+ */
+export function useRateRing(minutes: number, enabled: boolean) {
+  return useQuery({
+    queryKey: ['stats', 'rate', 'ring', minutes],
+    queryFn: () => getRate(minutes),
+    enabled,
+    refetchInterval: enabled ? RATE_POLL_MS : false,
+    staleTime: RATE_POLL_MS - 1000,
+    placeholderData: keepPreviousData,
+    refetchOnWindowFocus: false,
+  })
+}
+
+/**
+ * 速率环覆盖不到的窗口（7d/30d 预设或跨天的自定义区间）的回退查询：复用
+ * `/stats/timeseries` 的小时/天分桶，由调用方（RatePanel）换算成"桶均值速率"
+ * （calls / 桶时长）。
+ *
+ * 刻意不传 keyId/group 过滤——速率面板设计上是"看全局系统承载"，与页面顶部的
+ * 入口 Key / 分组筛选无关，这一点与环模式保持一致。
+ */
+export function useRateBuckets(timeFilter: StatsTimeFilter, enabled: boolean) {
+  return useQuery({
+    queryKey: [
+      'stats',
+      'rate',
+      'buckets',
+      timeFilter.startDate ?? '',
+      timeFilter.endDate ?? '',
+      timeFilter.granularity,
+    ],
+    queryFn: () => getTimeSeries(timeFilter),
+    enabled,
     ...COMMON,
   })
 }

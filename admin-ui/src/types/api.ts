@@ -426,7 +426,7 @@ export interface UpdateClientKeyRequest {
 
 // ============ 用量统计 ============
 
-export type StatsRange = '24h' | '7d' | '30d'
+export type StatsRange = '1h' | '3h' | '6h' | '24h' | '7d' | '30d'
 export type StatsGranularity = 'hour' | 'day'
 
 export interface StatsTimeFilter {
@@ -857,7 +857,8 @@ export interface SchedulingRunResult {
 }
 
 /**
- * GET /api/admin/stats/rate 的响应。
+ * GET /api/admin/stats/rate?minutes=N 的响应。`minutes` 取最近 N 分钟（1~1440，
+ * 缺省给满环）——这是"以当前时刻为终点"的相对窗口，不支持任意历史区间。
  *
  * 两组数字都是成对的，不要单看其中一个：入口与上游相差的倍数就是重试放大，
  * 全口径与计费口径 TPM 的差值就是缓存读取的量。
@@ -881,7 +882,11 @@ export interface RateSnapshot {
   peakTpmBillable: number
   /** 上游跳数 / 入口请求数。1.0 = 零重试。 */
   retryAmplification: number
-  /** 环覆盖的分钟数（后端固定 120）。 */
+  /**
+   * 本次响应实际返回的分钟数——不是环容量（环容量固定 1440 = 24h）。
+   * 请求 `minutes=60` 但进程刚重启、环还没填满时，这里会小于 60；
+   * 前端要用这个值判断"数据不够"，不能把短序列误读成"流量骤降"。
+   */
   windowMinutes: number
   /** 逐分钟序列，时间升序、缺口补零。 */
   series: MinuteSample[]

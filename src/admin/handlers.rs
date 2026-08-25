@@ -1125,9 +1125,10 @@ pub async fn rotate_client_key(
 
 fn parse_range(params: &std::collections::HashMap<String, String>) -> Result<Range, String> {
     let Some(range) = params.get("range") else {
-        return Err("range 必须是 24h、7d 或 30d".to_string());
+        return Err("range 必须是 1h、3h、6h、24h、7d 或 30d".to_string());
     };
-    Range::parse(range.as_str()).ok_or_else(|| "range 必须是 24h、7d 或 30d".to_string())
+    Range::parse(range.as_str())
+        .ok_or_else(|| "range 必须是 1h、3h、6h、24h、7d 或 30d".to_string())
 }
 
 fn parse_key_id(params: &HashMap<String, String>) -> Result<Option<u64>, String> {
@@ -1266,7 +1267,10 @@ pub async fn stats_overview(State(state): State<AdminState>) -> impl IntoRespons
 ///
 /// TPM 同样两个口径：`tpmTotal` 含缓存读取，`tpmBillable` 不含。生产实测这两个数能
 /// 差几十倍，所以不能只暴露一个。
-pub async fn stats_rate(State(state): State<AdminState>) -> axum::response::Response {
+pub async fn stats_rate(
+    State(state): State<AdminState>,
+    Query(params): Query<std::collections::HashMap<String, String>>,
+) -> axum::response::Response {
     let Some(ring) = state.rate_ring.as_ref() else {
         // 未注入速率环的装配（嵌入式/测试）。明确回 503 而不是回一堆 0，
         // 否则前端无法区分"没装采集层"与"真的没流量"。
@@ -1278,7 +1282,13 @@ pub async fn stats_rate(State(state): State<AdminState>) -> axum::response::Resp
         )
             .into_response();
     };
-    Json(ring.snapshot()).into_response()
+    // minutes=N 只取最近 N 分钟；缺省给满环。上面时间范围选 1h 就没必要
+    // 传 24 小时的点回去，白白让前端下采样。
+    let minutes = params
+        .get("minutes")
+        .and_then(|v| v.parse::<usize>().ok())
+        .map(|n| n.clamp(1, crate::anthropic::rate_ring::RING_MINUTES));
+    Json(ring.snapshot_recent(minutes)).into_response()
 }
 
 /// GET /api/admin/stats/timeseries?range=24h|7d|30d&granularity=hour|day&group=...

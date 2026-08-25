@@ -114,8 +114,10 @@ log "live healthy on $IMAGE (swap window ${SWAP_T1}-${SWAP_T0}s wall: $((SWAP_T1
 RELAY_URL="https://jp.kiro.runixcloud.io/health"
 relay_code="$(curl -s -o /dev/null -m 15 -w '%{http_code}' "$RELAY_URL" 2>/dev/null || echo 000)"
 if [ "$relay_code" = "200" ]; then
+  # 注意这是从 Iowa 测的（跨太平洋），不是日本用户看到的握手时间。
+  # 日本本地实测是 ~48ms —— 中转存在的意义正是把那个数从 306ms 降下来。
   relay_tls="$(curl -s -o /dev/null -m 15 -w '%{time_appconnect}' "$RELAY_URL" 2>/dev/null || echo '?')"
-  log "tokyo relay ok (health=200, tls handshake ${relay_tls}s)"
+  log "tokyo relay ok (health=200; handshake from here ${relay_tls}s, from japan ~0.048s)"
 else
   log "WARNING: tokyo relay check failed (health=$relay_code) — japanese users may be degraded."
   log "         relay host 35.200.53.131: check 'sudo nginx -t' and /var/log/nginx/error.log there."

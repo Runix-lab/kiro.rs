@@ -499,6 +499,12 @@ struct AggregatorInner {
 /// 预设聚合查询时间范围
 #[derive(Debug, Clone, Copy)]
 pub enum Range {
+    /// 小时级档位。桶是按小时聚合的，所以 1h/3h/6h 拿到的是 1~6 个桶——
+    /// 分钟级细节看速率环（`/stats/rate?minutes=N`），这里只保证**窗口口径一致**：
+    /// 上面选了几小时，所有面板就都只算这几小时，不会退化成"今天"。
+    Last1h,
+    Last3h,
+    Last6h,
     Last24h,
     Last7d,
     Last30d,
@@ -507,6 +513,9 @@ pub enum Range {
 impl Range {
     pub fn parse(s: &str) -> Option<Self> {
         match s {
+            "1h" => Some(Range::Last1h),
+            "3h" => Some(Range::Last3h),
+            "6h" => Some(Range::Last6h),
             "24h" => Some(Range::Last24h),
             "7d" => Some(Range::Last7d),
             "30d" => Some(Range::Last30d),
@@ -542,6 +551,9 @@ impl StatsQueryWindow {
     pub fn preset(range: Range, granularity: StatsGranularity) -> Self {
         let now = Utc::now().timestamp();
         let start_ts = match range {
+            Range::Last1h => now - 3600,
+            Range::Last3h => now - 3 * 3600,
+            Range::Last6h => now - 6 * 3600,
             Range::Last24h => now - 24 * 3600,
             Range::Last7d => now - 7 * 24 * 3600,
             Range::Last30d => now - 30 * 24 * 3600,
