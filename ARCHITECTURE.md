@@ -199,6 +199,27 @@ UsageRecordHook::record
 
 这些计数器**不 gate 任何东西**（无 quota/limit/remaining 字段，`disabled` 只由管理动作显式设置），所以崩溃丢最多 30s 计数损失的是面板精度，不影响资金安全。
 
+### 5.4 成本换算与分维度 TPM（2026-08-25 起）
+
+**计价**：`src/common/pricing.rs`。启动时从 `config.json` 的 `pricing` 段解析成只读
+`PricingTable`（挂在 `AdminState`），两套口径并行——实付（credits × `creditUsdRate`，
+默认 0.02）与官方牌价（内置 Claude 家族 $/Mtok，cache 写 1.25×、读 0.1× 输入价；
+`pricing.models` 可覆盖/补充任意模型）。查不到价返回 `None` 而非 0，前端显示"—"；
+折扣 = 实付 ÷ 官方。模型名先归一化（小写、点转横线）再查表，因为 trace 里点号名与
+官方横线名并存。
+
+**新增只读端点**（全部旁路查询，不碰请求热路径）：
+
+| 端点 | 数据源 | 说明 |
+|---|---|---|
+| `GET /api/admin/traces/summary` | traces.db | 与 `/traces` 完全同一套 WHERE（`build_trace_query` 共享），按模型汇总用量/成本/折扣 + 合计 |
+| `GET /api/admin/stats/tpm?dim=key\|credential` | traces.db | 按 (实体, 分钟) 内层聚合再取峰值/均值；峰值 TPM 即该 Key/凭据的实测承载。无时间窗时服务端兜底最近 24h——trace 库是单连接互斥锁，全表分钟聚合实测 ~600ms 占锁、24h 窗口 ~50ms |
+| `/traces` | traces.db | 新增 `startDate`/`endDate`（本地零点、end 含当天，与 stats 系同语义）；每行附 `creditUsd`/`officialUsd` |
+| `/stats/timeseries` `by-model` `by-credential` | 聚合器 | 补 cache token 列与成本字段；by-model 另有 `discountRatio`。分组筛选路径没有 凭据×模型 维度，timeseries 的 `officialUsd` 在该路径为 `None` |
+
+**TPM 口径注意**：trace 在请求**结束**时落库，token 整体计入完成分钟；长流式请求的
+产出不按时长摊薄。作为承载/峰值参考足够，不能当精确的瞬时速率用（那是 rate 环的活）。
+
 ## 6. RPM / TPM
 
 `rate_ring.rs`：120 个分钟桶、每桶 8 个 `AtomicU64`、`minute % 120` 直接索引，写入 O(1) 无锁。接口 `GET /api/admin/stats/rate`，面板在概览页「实时速率」。
