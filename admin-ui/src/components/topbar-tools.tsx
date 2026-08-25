@@ -2,7 +2,7 @@ import { forwardRef, useEffect, useState, type ComponentPropsWithoutRef } from '
 import {
   Activity, RefreshCw, UploadCloud, Settings, Key, Wand2, Eye, EyeOff, Copy,
   MoreHorizontal, ShieldAlert, ShieldCheck, Boxes, HeartPulse, HeartCrack,
-  Gauge,
+  Gauge, Receipt,
 } from 'lucide-react'
 import { useQueryClient } from '@tanstack/react-query'
 import { toast } from 'sonner'
@@ -15,7 +15,7 @@ import {
 } from '@/components/ui/dialog'
 import {
   DropdownMenu, DropdownMenuTrigger, DropdownMenuContent,
-  DropdownMenuItem, DropdownMenuLabel,
+  DropdownMenuItem, DropdownMenuLabel, DropdownMenuSeparator,
 } from '@/components/ui/dropdown-menu'
 import {
   useLoadBalancingMode, useSetLoadBalancingMode,
@@ -28,6 +28,7 @@ import { updateAdminKey, type SelfHealConfigPatch } from '@/api/credentials'
 import { extractErrorMessage, generateApiKey } from '@/lib/utils'
 import { ImageUpdateDialog } from '@/components/image-update-dialog'
 import { AvailableModelsDialog } from '@/components/available-models-dialog'
+import { MonthlySettlementDialog } from '@/components/monthly-settlement-dialog'
 
 /**
  * 顶栏右侧通用工具栏：负载均衡切换、可用模型、刷新、在线更新、设置（Key 管理）。
@@ -49,6 +50,7 @@ export function TopbarTools({ compact = false }: TopbarToolsProps) {
 
   const [imageUpdateOpen, setImageUpdateOpen] = useState(false)
   const [modelsDialogOpen, setModelsDialogOpen] = useState(false)
+  const [settlementDialogOpen, setSettlementDialogOpen] = useState(false)
   const [keyDialogOpen, setKeyDialogOpen] = useState(false)
   const [newKey, setNewKey] = useState('')
   const [showPlain, setShowPlain] = useState(false)
@@ -120,6 +122,7 @@ export function TopbarTools({ compact = false }: TopbarToolsProps) {
     openImageUpdate: () => setImageUpdateOpen(true),
     openModels: () => setModelsDialogOpen(true),
     openKeyDialog,
+    openSettlementDialog: () => setSettlementDialogOpen(true),
     throttleConfig,
     updateCheck,
     updateCooldown: (secs: number) =>
@@ -137,6 +140,10 @@ export function TopbarTools({ compact = false }: TopbarToolsProps) {
       <AvailableModelsDialog
         open={modelsDialogOpen}
         onOpenChange={setModelsDialogOpen}
+      />
+      <MonthlySettlementDialog
+        open={settlementDialogOpen}
+        onOpenChange={setSettlementDialogOpen}
       />
 
       <Dialog
@@ -245,6 +252,7 @@ interface ToolControls {
   openImageUpdate: () => void
   openKeyDialog: () => void
   openModels: () => void
+  openSettlementDialog: () => void
   throttleConfig?: { failover: boolean; cooldownSecs: number }
   updateCheck?: { hasUpdate: boolean; latestVersion: string; currentVersion: string }
   updateCooldown: (secs: number) => void
@@ -266,7 +274,10 @@ function FullTools({ controls }: { controls: ToolControls }) {
       <ModelsButton onOpen={controls.openModels} />
       <RefreshButton onRefresh={controls.handleRefresh} />
       <ImageUpdateButton controls={controls} />
-      <KeySettingsMenu onOpenKeyDialog={controls.openKeyDialog} />
+      <KeySettingsMenu
+        onOpenKeyDialog={controls.openKeyDialog}
+        onOpenSettlement={controls.openSettlementDialog}
+      />
     </>
   )
 }
@@ -315,6 +326,10 @@ function CompactTools({ controls }: { controls: ToolControls }) {
         <ThrottleCompactItems {...throttleProps} />
         <SelfHealCompactItems />
         <AccountRpmLimitCompactItems />
+        <DropdownMenuLabel>账务</DropdownMenuLabel>
+        <DropdownMenuItem onSelect={controls.openSettlementDialog}>
+          <Receipt />月度总账
+        </DropdownMenuItem>
         <DropdownMenuLabel>密钥管理</DropdownMenuLabel>
         <DropdownMenuItem onSelect={controls.openKeyDialog}>
           <Key />修改登录API密钥（管理面板登录）
@@ -376,7 +391,13 @@ function ImageUpdateButton({ controls }: { controls: ToolControls }) {
   )
 }
 
-function KeySettingsMenu({ onOpenKeyDialog }: { onOpenKeyDialog: () => void }) {
+function KeySettingsMenu({
+  onOpenKeyDialog,
+  onOpenSettlement,
+}: {
+  onOpenKeyDialog: () => void
+  onOpenSettlement: () => void
+}) {
   return (
     <DropdownMenu>
       <DropdownMenuTrigger asChild>
@@ -385,6 +406,11 @@ function KeySettingsMenu({ onOpenKeyDialog }: { onOpenKeyDialog: () => void }) {
         </Button>
       </DropdownMenuTrigger>
       <DropdownMenuContent align="end">
+        <DropdownMenuLabel>账务</DropdownMenuLabel>
+        <DropdownMenuItem onSelect={onOpenSettlement}>
+          <Receipt />月度总账
+        </DropdownMenuItem>
+        <DropdownMenuSeparator />
         <DropdownMenuLabel>密钥管理</DropdownMenuLabel>
         <DropdownMenuItem onSelect={onOpenKeyDialog}>
           <Key />修改登录API密钥（管理面板登录）

@@ -898,6 +898,8 @@ fn key_to_item(k: &super::client_keys::ClientKey) -> ClientKeyItem {
         total_cache_read_tokens: k.total_cache_read_tokens,
         group: k.group.clone(),
         is_system: k.is_system,
+        billing_discount: k.billing_discount,
+        billing_price_per_credit: k.billing_price_per_credit,
     }
 }
 
@@ -1666,7 +1668,7 @@ pub async fn billing_export(
 
     let mut rows: Vec<serde_json::Value> = Vec::new();
     let mut csv = String::from(
-        "时间(北京),模型,输入token,输出token,缓存写token,缓存读token,credit,成本USD,应收USD,状态\n",
+        "时间(北京),模型,输入token,输出token,缓存写token,缓存读token,金额USD,状态\n",
     );
     let mut total_credits = 0.0f64;
     let mut total_cost = 0.0f64;
@@ -1732,19 +1734,19 @@ pub async fn billing_export(
                 }));
             } else {
                 use std::fmt::Write as _;
+                // 对客明细只出「金额」= 应收。credit 是我方与上游的结算单位，
+                // 成本更是我方内部数字，都不该出现在给客户的对账单上。
                 let _ = writeln!(
                     csv,
-                    "{},{},{},{},{},{},{:.6},{:.6},{},{}",
+                    "{},{},{},{},{},{},{},{}",
                     csv_field(&ts_local),
                     // model 是客户端原样传进来的，不转义就能用一个逗号把后面
-                    // 每一列右移一位——应收数值会落进「状态」列
+                    // 每一列右移一位——金额会落进「状态」列
                     csv_field(&rec.model),
                     rec.input_tokens,
                     rec.output_tokens,
                     rec.cache_creation_tokens,
                     rec.cache_read_tokens,
-                    credits,
-                    cost,
                     receivable
                         .map(|v| format!("{:.6}", v))
                         .unwrap_or_else(|| "".to_string()),
@@ -1789,10 +1791,8 @@ pub async fn billing_export(
     use std::fmt::Write as _;
     let _ = writeln!(
         csv,
-        "\"合计\",\"{} 条\",,,,,{:.6},{:.6},{},",
+        "\"合计\",\"{} 条\",,,,,{},",
         scanned,
-        total_credits,
-        total_cost,
         if basis != "none" {
             format!("{:.6}", total_receivable)
         } else {
@@ -1802,7 +1802,11 @@ pub async fn billing_export(
 
     // 缺口要写在客户拿到的那份文件里，不能只放在响应头——客户看到的是 CSV
     if !missing.is_empty() {
-        let _ = writeln!(csv, "\"以下日期无用量日志（非零消费）\",\"{}\"", missing.join(" "));
+        let _ = writeln!(
+            csv,
+            "\"以下日期无用量日志（非零消费）\",\"{}\"",
+            missing.join(" ")
+        );
     }
     if scan.malformed > 0 {
         let _ = writeln!(

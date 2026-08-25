@@ -846,6 +846,13 @@ pub struct ClientKeyItem {
     /// 是否系统密钥（由 config.json apiKey 同步，不可删除、可轮换）
     #[serde(default)]
     pub is_system: bool,
+    /// 对客折扣系数（应收 ÷ 官方牌价）。列表接口从前不返回它，
+    /// 导致运营改完折扣页面上看不到任何变化。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub billing_discount: Option<f64>,
+    /// 对客单价（美元/credit）。与折扣二选一，单价优先。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub billing_price_per_credit: Option<f64>,
 }
 
 /// 客户端 Key 列表响应
