@@ -84,6 +84,16 @@ const BUILTIN_PRICES: &[(&str, ModelPrice)] = &[
     ("gpt-5-6-sol", ModelPrice::standard(4.0, 20.0)),
     ("gpt-5-6-terra", ModelPrice::standard(2.0, 12.0)),
     ("gpt-5-6-luna", ModelPrice::standard(0.2, 1.2)),
+    ("gpt-5-5", ModelPrice::standard(5.0, 30.0)),
+    // 以下非 Anthropic/OpenAI 家族的价格于 2026-08-25 从各家官方定价页抓取并二次复核。
+    // MiniMax / Qwen 的缓存价是官方published（恰好等于 1.25×/0.1×）；GLM-5 只公布了
+    // 缓存读（$0.2），缓存写按 1.25× 推导——它实际按小时计缓存存储费，此处不建模。
+    ("minimax-m2-5", ModelPrice::standard(0.3, 1.2)),
+    ("minimax-m2-1", ModelPrice::standard(0.3, 1.2)),
+    ("glm-5", ModelPrice::standard(1.0, 3.2)),
+    ("qwen3-coder-next", ModelPrice::standard(0.3, 1.5)),
+    // deepseek-3.2 刻意不配价：官方已于 2026-07-24 下线该型号、不再公布价格，
+    // 拿历史价当现价会得出一个看着合理但错误的折扣。宁可显示"—"。
     ("claude-fable-5", ModelPrice::standard(10.0, 50.0)),
     ("claude-opus-5", ModelPrice::standard(5.0, 25.0)),
     ("claude-opus-4-8", ModelPrice::standard(5.0, 25.0)),
@@ -149,7 +159,7 @@ impl PricingTable {
         }
         self.exact
             .iter()
-            .filter(|(k, _)| norm.starts_with(k.as_str()))
+            .filter(|(k, _)| is_variant_of(&norm, k))
             .max_by_key(|(k, _)| k.len())
             .map(|(_, p)| *p)
     }
@@ -177,6 +187,28 @@ impl PricingTable {
 /// 模型名归一化：小写 + 点号转横线。
 fn normalize_model(model: &str) -> String {
     model.trim().to_ascii_lowercase().replace('.', "-")
+}
+
+/// `candidate` 是否是价表条目 `key` 的**同价变体**——只认日期快照后缀。
+///
+/// 裸前缀匹配会把「更高版本」误判成同一款：`glm-5-2`（官方 $1.4/$4.4）以
+/// `glm-5`（$1.0/$3.2）开头，按前缀会拿错价并算出一个看着合理的错误折扣。
+/// 版本号后缀（`-2`、`-6`）一律不接受，只接受 8 位日期快照（`-20260101`）
+/// 与非数字开头的后缀（`-thinking` 这类同价变体）。
+fn is_variant_of(candidate: &str, key: &str) -> bool {
+    let Some(rest) = candidate.strip_prefix(key) else {
+        return false;
+    };
+    let Some(rest) = rest.strip_prefix('-') else {
+        return false; // 必须落在段边界上，避免 gpt-5-6 命中 gpt-5
+    };
+    let head = rest.split('-').next().unwrap_or("");
+    if head.chars().all(|c| c.is_ascii_digit()) {
+        // 纯数字段：8 位视为日期快照（同款），其余视为新版本号（不同款）
+        head.len() == 8
+    } else {
+        true
+    }
 }
 
 /// 折扣比：实付 ÷ 官方。官方价缺失或为 0 时返回 `None`。
@@ -209,6 +241,29 @@ mod tests {
         // opus-4-1 是 15/75，不能被 opus-4 前缀（不存在）或其他项污染
         let p = t.price_for("claude-opus-4-1").unwrap();
         assert_eq!(p.input_per_mtok, 15.0);
+    }
+
+    #[test]
+    fn a_newer_version_does_not_inherit_the_older_models_price() {
+        let t = PricingTable::default();
+        // glm-5-2 官方 $1.4/$4.4，与 glm-5（$1.0/$3.2）不同款：宁可未配价也不能错配
+        assert!(t.price_for("glm-5.2").is_none());
+        assert!(t.price_for("minimax-m2.7").is_none());
+        // 但 8 位日期快照与非数字变体后缀仍视为同款
+        assert_eq!(t.price_for("glm-5-20260101").unwrap().input_per_mtok, 1.0);
+        assert_eq!(t.price_for("glm-5-thinking").unwrap().input_per_mtok, 1.0);
+        // 段边界：gpt-5-6 不能命中 gpt-5-5
+        assert!(t.price_for("gpt-5-6").is_none());
+    }
+
+    #[test]
+    fn third_party_models_are_priced_from_their_own_vendors() {
+        let t = PricingTable::default();
+        assert_eq!(t.price_for("minimax-m2.5").unwrap().output_per_mtok, 1.2);
+        assert_eq!(t.price_for("qwen3-coder-next").unwrap().output_per_mtok, 1.5);
+        assert_eq!(t.price_for("gpt-5.5").unwrap().output_per_mtok, 30.0);
+        // deepseek-3.2 官方已下线且不再公布价格，刻意留空
+        assert!(t.price_for("deepseek-3.2").is_none());
     }
 
     #[test]
