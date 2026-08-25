@@ -1497,8 +1497,28 @@ fn build_trace_query(
             .map(|c| c.id)
             .collect()
     });
-    let (start_ts, end_ts) = match (params.get("startDate"), params.get("endDate")) {
-        (Some(start), Some(end)) => {
+    // 时间窗有两种写法，与 stats 系保持一致：
+    //   range=1h|3h|6h|24h|7d|30d  → 精确时间戳（预设档位用这个）
+    //   startDate + endDate        → 自定义区间，按整日展开
+    //
+    // 从前这里**只认后者**。前端预设档位改发 range 之后，这里静默落到
+    // (None, None)，再被调用方兜底成「最近 24 小时」——于是选 7 天和选 24 小时
+    // 得到同一个数，而隔壁按聚合器算的面板是对的，两个面板差 34%。
+    let (start_ts, end_ts) = match (
+        params.get("range"),
+        params.get("startDate"),
+        params.get("endDate"),
+    ) {
+        (Some(range), _, _) => {
+            let r = crate::admin::usage_stats::Range::parse(range.as_str())
+                .ok_or_else(|| "range 必须是 1h、3h、6h、24h、7d 或 30d".to_string())?;
+            let w = crate::admin::usage_stats::StatsQueryWindow::preset(
+                r,
+                crate::admin::usage_stats::StatsGranularity::Hour,
+            );
+            (Some(w.start_ts), Some(w.end_ts))
+        }
+        (None, Some(start), Some(end)) => {
             let start_date = parse_stats_date(start, "startDate")?;
             let end_date = parse_stats_date(end, "endDate")?;
             if end_date < start_date {
@@ -1509,7 +1529,7 @@ fn build_trace_query(
                 Some(local_midnight_ts(end_date + Duration::days(1))?),
             )
         }
-        (None, None) => (None, None),
+        (None, None, None) => (None, None),
         _ => return Err("startDate 和 endDate 必须同时提供".to_string()),
     };
     Ok(TraceQuery {
