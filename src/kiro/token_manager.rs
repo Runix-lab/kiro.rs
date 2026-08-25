@@ -1586,7 +1586,17 @@ impl MultiTokenManager {
         let generation = self.model_cache_generation(id);
         let epoch = self.model_cache_epoch.load(Ordering::Relaxed);
         let _permit = self.model_refresh_semaphore.acquire().await?;
-        let (token, credentials) = self.prepare_request_token(id).await?;
+        let (token, _) = self.prepare_request_token(id).await?;
+        // Enterprise/IdC 必须带真实 profileArn，否则上游 403；见 ensure_profile_arn_for_rest
+        self.ensure_profile_arn_for_rest(id, &token).await;
+        let credentials = {
+            let entries = self.entries.lock();
+            entries
+                .iter()
+                .find(|e| e.id == id)
+                .map(|e| e.credentials.clone())
+                .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?
+        };
         let global_proxy = self.proxy.lock().clone();
         let effective_proxy = credentials.effective_proxy(global_proxy.as_ref());
         let response =
@@ -3351,6 +3361,43 @@ impl MultiTokenManager {
         Ok(Some(arn))
     }
 
+    /// 用量类接口（getUsageLimits / ListAvailableModels）调用前的 profileArn 兜底解析。
+    ///
+    /// 这些接口对 Enterprise/IdC token **必须**带真实 ARN，否则上游回
+    /// `403 User is not authorized to make this call.`。而 ARN 原先只在**聊天请求**
+    /// 路径（`KiroProvider::ensure_profile_arn`）解析——于是一条新导入的 IdC 凭据在
+    /// 发出第一个聊天请求之前，余额与模型列表必然全 403，管理台看起来就是"新增凭据失败"。
+    ///
+    /// 失败只 warn 不阻断：解析不出来时按原 ARN 继续，让上游给出真实错误，
+    /// 而不是把一个网络抖动变成"凭据不可用"。
+    ///
+    /// 去重靠 `resolve_profile_arn_for` 自身的短路（已有真实 ARN 直接返回，不发请求），
+    /// 所以稳态下每次调用只是一次锁内查表。
+    async fn ensure_profile_arn_for_rest(&self, id: u64, token: &str) {
+        use crate::kiro::model::credentials::is_placeholder_profile_arn;
+        let needs = {
+            let entries = self.entries.lock();
+            match entries.iter().find(|e| e.id == id) {
+                Some(e) if e.credentials.is_api_key_credential() => false,
+                Some(e) => match e.credentials.profile_arn.as_deref() {
+                    None => true,
+                    Some(arn) => is_placeholder_profile_arn(arn),
+                },
+                None => false,
+            }
+        };
+        if !needs {
+            return;
+        }
+        if let Err(e) = self.resolve_profile_arn_for(id, token).await {
+            tracing::warn!(
+                "凭据 #{} 用量接口前解析 profileArn 失败（按原值继续）: {}",
+                id,
+                e
+            );
+        }
+    }
+
     /// 获取指定凭据的使用额度（Admin API）
     pub async fn get_usage_limits_for(&self, id: u64) -> anyhow::Result<UsageLimitsResponse> {
         let credentials = {
@@ -3415,6 +3462,8 @@ impl MultiTokenManager {
             }
         };
 
+        // Enterprise/IdC 必须带真实 profileArn，否则上游 403；见 ensure_profile_arn_for_rest
+        self.ensure_profile_arn_for_rest(id, &token).await;
         let credentials = {
             let entries = self.entries.lock();
             entries
