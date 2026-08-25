@@ -36,6 +36,11 @@ const MAX_RETRIES_PER_CREDENTIAL: usize = 3;
 /// 注：上游 429 多为账号级速率配额（SERVICE_REQUEST_RATE_EXCEEDED），高峰期
 /// 多账号同时触顶时，过多重试会在账号间连环撞墙、放大限流。故上限取较小值，
 /// 配合 429 专用长退避（见 retry_delay_throttle），被限时尽早返回而非耗尽配额。
+/// 吞吐模式下的重试上限。常态是 4，够不到大池子的后排；吞吐模式要能走完
+/// 前排 → 中间档 → 溢出储备这条链，所以放宽到 12（约 12 跳，仍有绝对上限，
+/// 避免超大池子把单个请求拖成长尾）。
+const MAX_TOTAL_RETRIES_THROUGHPUT: usize = 12;
+
 const MAX_TOTAL_RETRIES: usize = 4;
 
 /// HTTP Client 缓存容量上限（不含常驻的全局代理 client）。
@@ -743,7 +748,15 @@ impl KiroProvider {
     ) -> anyhow::Result<KiroCallResult> {
         // 重试预算按当前请求所属分组的账号数计算，避免小分组按全局账号数获得过多无效重试
         let total_credentials = self.token_manager.total_count_in_group(group).max(1);
-        let max_retries = (total_credentials * MAX_RETRIES_PER_CREDENTIAL).min(MAX_TOTAL_RETRIES);
+        // 吞吐模式把上限提到"能走完整个分组"：常态的 4 次硬顶意味着 7 条凭据的池子
+        // 最多只试 4 个，溢出根本走不到后面的储备档。仍然留一个绝对上限，
+        // 避免超大池子把单个请求拖成长尾。
+        let cap = if self.token_manager.throughput_mode_active() {
+            MAX_TOTAL_RETRIES_THROUGHPUT
+        } else {
+            MAX_TOTAL_RETRIES
+        };
+        let max_retries = (total_credentials * MAX_RETRIES_PER_CREDENTIAL).min(cap);
         let mut last_error: Option<anyhow::Error> = None;
         let mut force_refreshed: HashSet<u64> = HashSet::new();
         let api_type = if is_stream { "流式" } else { "非流式" };
@@ -1015,19 +1028,35 @@ impl KiroProvider {
                 continue;
             }
 
-            // 429 + suspicious activity = 账号级临时风控
-            // 仅当前凭据被针对，故障转移到其它凭据可立即恢复（受配置开关控制）。
+            // 429 的两种处理：
+            //
+            // ① 账号级风控（响应体含 "suspicious activity" + "temporary limits"）：
+            //    只针对当前凭据，换号可立即恢复。冷却用配置值（默认 30 分钟）。
+            //
+            // ② 吞吐模式下的普通限流：上游的 USER_REQUEST_RATE_EXCEEDED 两个字面量
+            //    都不含，常态路径会掉进下面的瞬态分支，在**同一个号**上退避重试，
+            //    把重试预算烧光也不碰第二个号——「溢出储备档」因此永远接不到流量。
+            //    吞吐模式的整个意义就是让限流溢出到别的号，所以这里必须换号。
+            //    冷却取短值（≤45s）：普通限流是"这一分钟发太快了"，不是账号被风控，
+            //    用 30 分钟会把号停在场外，池子越用越小，与提升吞吐正好相反。
+            let account_throttled = endpoint.is_account_throttled(&body);
+            let throughput_spill =
+                !account_throttled && self.token_manager.throughput_mode_active();
             if status.as_u16() == 429
                 && self.token_manager.get_account_throttle_failover()
-                && endpoint.is_account_throttled(&body)
+                && (account_throttled || throughput_spill)
             {
-                let cooldown_secs = self
-                    .token_manager
-                    .get_account_throttle_cooldown_secs()
-                    .max(1);
+                let cooldown_secs = if throughput_spill {
+                    self.token_manager.throughput_spill_cooldown_secs().max(1)
+                } else {
+                    self.token_manager
+                        .get_account_throttle_cooldown_secs()
+                        .max(1)
+                };
                 let cooldown = std::time::Duration::from_secs(cooldown_secs);
                 tracing::warn!(
-                    "API 请求失败（账号级风控，凭据 #{} 冷却 {}s 并切换，尝试 {}/{}）: {}",
+                    kind = if throughput_spill { "throughput_spill" } else { "account_throttle" },
+                    "API 请求失败（限流，凭据 #{} 冷却 {}s 并切换，尝试 {}/{}）: {}",
                     ctx.id,
                     cooldown_secs,
                     attempt + 1,
@@ -1052,9 +1081,13 @@ impl KiroProvider {
                 let (rate_limit_error, must_wait_for_upstream) =
                     account_rate_limit_with_fallback(rate_limit_error, cooldown_secs);
 
-                // 上游给出明确等待时间时必须立即交给客户端遵守，不能在同一请求中
-                // 提前换号重试。无有效 Retry-After 时仍允许按既有策略故障转移。
-                if must_wait_for_upstream {
+                // 上游给出明确等待时间时通常必须交给客户端遵守。
+                //
+                // 但吞吐模式是例外：Retry-After 说的是「**这个账号**多久后能再试」，
+                // 对池子里其它账号没有任何约束。既然还有别的号可用，直接把 429 甩给
+                // 客户端等于让整池闲着——这正是要消除的浪费。所以吞吐模式下先换号，
+                // 只有确实没号可用（remaining == 0）时才回 429。
+                if must_wait_for_upstream && !(throughput_spill && remaining > 0) {
                     return Err(rate_limit_error.into());
                 }
 

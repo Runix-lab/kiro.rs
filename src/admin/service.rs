@@ -1062,6 +1062,52 @@ impl AdminService {
     /// 拿不到余额的凭据不参与降级判断——那等于把"不知道"当"快用完了"。
     ///
     /// 返回实际执行的调整条数。
+    /// 构造调度输入（凭据快照 + 余额缓存）。预估与实际执行共用同一份视图，
+    /// 否则界面上算出来的档位分布和真正生效的会对不上。
+    fn scheduling_inputs(&self) -> Vec<crate::admin::scheduling::CredentialSchedulingInput> {
+        use crate::admin::scheduling::CredentialSchedulingInput;
+        let snapshot = self.token_manager.snapshot();
+        let balances = self.balance_cache.lock();
+        snapshot
+            .entries
+            .iter()
+            .map(|e| {
+                let bal = balances.get(&e.id).map(|c| &c.data);
+                CredentialSchedulingInput {
+                    id: e.id,
+                    priority: e.priority,
+                    disabled: e.disabled,
+                    usage_pct: bal.map(|b| b.usage_percentage),
+                    remaining: bal.map(|b| b.remaining),
+                    auto_demoted_from: e.auto_demoted_from,
+                }
+            })
+            .collect()
+    }
+
+    /// 开启吞吐模式前的预估。观测值来自真实用量，不是拍脑袋的常数。
+    pub fn throughput_estimate(
+        &self,
+        obs: crate::admin::scheduling::ThroughputObservations,
+    ) -> crate::admin::scheduling::ThroughputEstimate {
+        let cfg = self.scheduling_config();
+        crate::admin::scheduling::estimate_throughput(&cfg, &self.scheduling_inputs(), obs)
+    }
+
+    /// 距离额度重置还有多少小时（取各凭据里最早的那个重置点）。
+    pub fn hours_to_quota_reset(&self) -> Option<f64> {
+        let balances = self.balance_cache.lock();
+        let now = chrono::Utc::now().timestamp() as f64;
+        balances
+            .values()
+            .filter_map(|c| c.data.next_reset_at)
+            .filter(|t| *t > now)
+            .map(|t| (t - now) / 3600.0)
+            .fold(None, |acc: Option<f64>, h| {
+                Some(acc.map_or(h, |a: f64| a.min(h)))
+            })
+    }
+
     pub fn run_scheduling_pass(&self) -> Vec<crate::admin::scheduling::PriorityChange> {
         use crate::admin::scheduling::{CredentialSchedulingInput, plan_changes};
         let cfg = self.scheduling_config();

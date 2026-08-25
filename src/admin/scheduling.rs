@@ -43,6 +43,13 @@ pub struct SchedulingConfig {
     /// 首选层最少保留几个可用凭据
     #[serde(default = "default_min_top_tier")]
     pub min_top_tier: usize,
+    /// **吞吐模式专用**：用量低于该百分比的凭据进前排，尽情烧。
+    #[serde(default = "default_throughput_burn_below_pct")]
+    pub throughput_burn_below_pct: f64,
+    /// **吞吐模式专用**：用量达到该百分比的凭据退到溢出储备档，
+    /// 不接主力流量，只接前排 429 之后溢出的那部分。
+    #[serde(default = "default_throughput_reserve_at_pct")]
+    pub throughput_reserve_at_pct: f64,
     /// 调度取向，见 [`SchedulingProfile`]
     #[serde(default)]
     pub profile: SchedulingProfile,
@@ -57,6 +64,20 @@ fn default_demote_to() -> u32 {
 fn default_min_top_tier() -> usize {
     2
 }
+fn default_throughput_burn_below_pct() -> f64 {
+    80.0
+}
+fn default_throughput_reserve_at_pct() -> f64 {
+    95.0
+}
+
+/// 吞吐模式的三档优先级。数值越小越优先。
+///
+/// 之所以拉开到 40/50/70 而不是挤在基线附近：选凭据是按 priority 分档的，
+/// 档与档之间必须有明确间隔，溢出档才不会被误当成主力候选。
+pub const THROUGHPUT_FRONT: u32 = 40;
+pub const THROUGHPUT_MID: u32 = 50;
+pub const THROUGHPUT_RESERVE: u32 = 70;
 
 impl Default for SchedulingConfig {
     fn default() -> Self {
@@ -65,6 +86,8 @@ impl Default for SchedulingConfig {
             demote_threshold_pct: default_demote_threshold_pct(),
             demote_to: default_demote_to(),
             min_top_tier: default_min_top_tier(),
+            throughput_burn_below_pct: default_throughput_burn_below_pct(),
+            throughput_reserve_at_pct: default_throughput_reserve_at_pct(),
             profile: SchedulingProfile::default(),
         }
     }
@@ -141,7 +164,15 @@ pub fn plan_changes(
     let mut effective: Vec<CredentialSchedulingInput> = creds.to_vec();
 
     // ---- 规则 1：额度守卫 ----
+    //
+    // 吞吐模式跳过这条：它的分档本身就把 >= reserve_at_pct 的号放到了比
+    // demote_to 更靠后的溢出档。两条规则同时跑会互相拉锯——守卫把号拽到 60、
+    // 分档又把它推到 70，每轮都产生一次变更，日志里全是抖动。
+    let quota_guard_active = cfg.profile != SchedulingProfile::Throughput;
     for c in effective.iter_mut() {
+        if !quota_guard_active {
+            break;
+        }
         let Some(pct) = c.usage_pct else { continue };
         match c.auto_demoted_from {
             // 已降级：用量回落到阈值以下则恢复原值
@@ -194,10 +225,14 @@ fn plan_profile(
     effective: &mut [CredentialSchedulingInput],
 ) -> Vec<PriorityChange> {
     let mut out = Vec::new();
+    // 吞吐模式接管全部优先级，包括此前被额度守卫降级的号——它自己会把
+    // 高用量的号放进溢出档，不需要守卫的记账。其它取向仍然避开守卫降级的号，
+    // 否则两条规则拉锯。
+    let takes_over = cfg.profile == SchedulingProfile::Throughput;
     let mut eligible: Vec<usize> = effective
         .iter()
         .enumerate()
-        .filter(|(_, c)| !c.disabled && c.auto_demoted_from.is_none())
+        .filter(|(_, c)| !c.disabled && (takes_over || c.auto_demoted_from.is_none()))
         .map(|(i, _)| i)
         .collect();
     if eligible.is_empty() {
@@ -206,10 +241,26 @@ fn plan_profile(
 
     let targets: Vec<(usize, u32)> = match cfg.profile {
         SchedulingProfile::Manual => return out,
-        // 全部拉平到基线：同档并列，交给 balanced 模式并行铺开
-        SchedulingProfile::Throughput => {
-            eligible.iter().map(|&i| (i, PRIORITY_BASELINE)).collect()
-        }
+        // 两档铺排：
+        //   用量 < burn_below   → 前排，尽情烧（同档并列，靠 balanced 并行铺开）
+        //   burn_below..reserve → 中间档，正常输出
+        //   用量 >= reserve     → 溢出储备，只接前排 429 之后溢出的流量
+        //
+        // 取不到用量的号放中间档：把"不知道"当"快用完了"会平白少掉一个主力，
+        // 当成"还很空"又会把流量压给一个可能已经见底的号。中间档是唯一不做
+        // 假设的位置。
+        SchedulingProfile::Throughput => eligible
+            .iter()
+            .map(|&i| {
+                let target = match effective[i].usage_pct {
+                    Some(pct) if pct >= cfg.throughput_reserve_at_pct => THROUGHPUT_RESERVE,
+                    Some(pct) if pct < cfg.throughput_burn_below_pct => THROUGHPUT_FRONT,
+                    Some(_) => THROUGHPUT_MID,
+                    None => THROUGHPUT_MID,
+                };
+                (i, target)
+            })
+            .collect(),
         // 余额多的排前面（Conserve）/ 余额少的排前面（Drain）
         SchedulingProfile::Conserve | SchedulingProfile::Drain => {
             let desc = cfg.profile == SchedulingProfile::Conserve;
@@ -260,10 +311,23 @@ fn plan_top_tier_refill(
     }
     // 排除被额度守卫摘下的号：它们额度将尽，提回首选层会立刻耗尽并再次降级，
     // 两条规则来回拉锯。首选层补不齐时宁可留缺口——那是容量问题，得加号解决。
+    //
+    // 吞吐模式下额外排除**溢出储备档**：那一档的存在意义就是"不接主力流量、
+    // 只接前排 429 之后溢出的部分"。把它提回首选层等于取消了储备，前排一撑不住
+    // 就连储备一起烧穿，整池同时见底。
+    let reserve_excluded = cfg.profile == SchedulingProfile::Throughput;
     let mut usable: Vec<usize> = effective
         .iter()
         .enumerate()
-        .filter(|(_, c)| !c.disabled && c.auto_demoted_from.is_none())
+        .filter(|(_, c)| {
+            if c.disabled || c.auto_demoted_from.is_some() {
+                return false;
+            }
+            if reserve_excluded && c.priority >= THROUGHPUT_RESERVE {
+                return false;
+            }
+            true
+        })
         .map(|(i, _)| i)
         .collect();
     if usable.len() <= 1 {
@@ -353,6 +417,82 @@ mod tests {
             enabled: true,
             profile,
             ..Default::default()
+        }
+    }
+
+    /// 吞吐模式的两档：<80% 进前排尽情烧，>=95% 退到溢出储备，中间正常输出。
+    #[test]
+    fn throughput_mode_splits_into_burn_and_reserve_bands() {
+        let cfg = on(SchedulingProfile::Throughput);
+        let creds = vec![
+            cred(1, 50, Some(1.4)),   // 几乎没用 → 前排
+            cred(2, 50, Some(48.9)),  // 用了一半 → 前排
+            cred(3, 50, Some(86.6)),  // 中间带
+            cred(4, 50, Some(93.0)),  // 中间带（还没到 95）
+            cred(5, 50, Some(96.5)),  // 见底 → 溢出储备
+        ];
+        let ch = plan_changes(&cfg, &creds);
+        let to = |id: u64| ch.iter().find(|c| c.id == id).map(|c| c.to);
+        assert_eq!(to(1), Some(THROUGHPUT_FRONT), "空号该进前排");
+        assert_eq!(to(2), Some(THROUGHPUT_FRONT));
+        assert_eq!(to(3), None, "已在中间档，无需变更");
+        assert_eq!(to(4), None);
+        assert_eq!(to(5), Some(THROUGHPUT_RESERVE), "快见底的该退到溢出储备");
+    }
+
+    /// 溢出储备不能被首选层补齐规则拽回前排——那等于取消了储备，
+    /// 前排一撑不住就连储备一起烧穿，整池同时见底。
+    #[test]
+    fn top_tier_refill_never_pulls_the_reserve_band_forward() {
+        let cfg = SchedulingConfig {
+            enabled: true,
+            profile: SchedulingProfile::Throughput,
+            min_top_tier: 3, // 故意要求 3 个，而前排只有 1 个
+            ..Default::default()
+        };
+        let creds = vec![
+            cred(1, 50, Some(10.0)),  // 唯一的前排
+            cred(2, 50, Some(97.0)),  // 溢出储备
+            cred(3, 50, Some(98.0)),  // 溢出储备
+        ];
+        let ch = plan_changes(&cfg, &creds);
+        for c in &ch {
+            if c.id == 2 || c.id == 3 {
+                assert_eq!(
+                    c.to, THROUGHPUT_RESERVE,
+                    "储备档 #{} 被拽到了 {}，储备形同虚设",
+                    c.id, c.to
+                );
+            }
+        }
+    }
+
+    /// 吞吐模式接管额度守卫：同一个号不能既被守卫拽到 60、又被分档推到 70，
+    /// 那样每轮都产生一次变更，日志里全是抖动。
+    #[test]
+    fn throughput_mode_takes_over_the_quota_guard() {
+        let cfg = on(SchedulingProfile::Throughput);
+        let creds = vec![cred(1, 50, Some(99.0)), cred(2, 50, Some(20.0))];
+        let ch = plan_changes(&cfg, &creds);
+        let c1 = ch.iter().find(|c| c.id == 1).expect("高用量号应被安排");
+        assert_eq!(c1.to, THROUGHPUT_RESERVE, "应进溢出档而不是守卫的 demote_to");
+        assert_eq!(c1.auto_demoted_from, None, "吞吐模式不走守卫的记账");
+        assert!(
+            matches!(c1.reason, ChangeReason::ProfileRebalance),
+            "变更原因应是分档而非额度降级，实得 {:?}",
+            c1.reason
+        );
+    }
+
+    /// 取不到用量的号放中间档：当成"快用完"平白少一个主力，
+    /// 当成"还很空"又可能把流量压给已经见底的号。
+    #[test]
+    fn unknown_usage_lands_in_the_middle_band() {
+        let cfg = on(SchedulingProfile::Throughput);
+        let creds = vec![cred(1, 40, None), cred(2, 70, None)];
+        let ch = plan_changes(&cfg, &creds);
+        for c in &ch {
+            assert_eq!(c.to, THROUGHPUT_MID, "用量未知的号不该被猜到任何一端");
         }
     }
 
@@ -457,14 +597,19 @@ mod tests {
         assert_eq!(by_id(3).reason, ChangeReason::TopTierRefill);
     }
 
+    /// 加 TPM 的核心仍然是「并列铺开」——只是并列的位置从基线换成了前排档。
+    /// 额度充足的号无论人工设成 40/50/55，都要落到同一档，balanced 才能真正并行。
     #[test]
-    fn throughput_profile_flattens_everyone_onto_the_baseline() {
+    fn throughput_profile_flattens_the_front_band_onto_one_tier() {
         let cfg = on(SchedulingProfile::Throughput);
-        let ch = plan_changes(&cfg, &[cred(1, 40, Some(10.0)), cred(2, 55, Some(10.0)), cred(3, 50, Some(10.0))]);
+        let ch = plan_changes(
+            &cfg,
+            &[cred(1, 40, Some(10.0)), cred(2, 55, Some(10.0)), cred(3, 50, Some(10.0))],
+        );
         for c in &ch {
-            assert_eq!(c.to, PRIORITY_BASELINE, "加 TPM = 全部并列，让负载真正铺开");
+            assert_eq!(c.to, THROUGHPUT_FRONT, "额度充足的号必须并列在前排同一档");
         }
-        assert_eq!(ch.len(), 2, "已经在基线上的那个不动");
+        assert_eq!(ch.len(), 2, "已经在前排档上的那个不动");
     }
 
     #[test]
@@ -533,7 +678,10 @@ mod tests {
 
     #[test]
     fn profile_rebalance_leaves_quota_demoted_credentials_alone() {
-        let cfg = on(SchedulingProfile::Throughput);
+        // 用 Conserve：Throughput 现在**故意**接管额度守卫（见
+        // throughput_mode_takes_over_the_quota_guard），这条不变量守的是
+        // 「守卫与取向不得互相拉锯」，对其余取向依然成立。
+        let cfg = on(SchedulingProfile::Conserve);
         let mut demoted = cred(1, 60, Some(99.0));
         demoted.auto_demoted_from = Some(50);
         let ch = plan_changes(&cfg, &[demoted, cred(2, 44, Some(10.0))]);
@@ -549,8 +697,164 @@ mod tests {
             min_top_tier: 1,
             ..on(SchedulingProfile::Throughput)
         };
-        // 已经在基线且无需降级 → 不产生任何写操作
-        let ch = plan_changes(&cfg, &[cred(1, 50, Some(10.0)), cred(2, 50, Some(10.0))]);
-        assert!(ch.is_empty());
+        // 已经在各自该在的档位上 → 不产生任何写操作
+        // （用量 10% 的号本来就该在前排档，写一遍原值只会白白触发持久化）
+        let ch = plan_changes(
+            &cfg,
+            &[
+                cred(1, THROUGHPUT_FRONT, Some(10.0)),
+                cred(2, THROUGHPUT_FRONT, Some(10.0)),
+            ],
+        );
+        assert!(ch.is_empty(), "净变化为 0 不应产生写操作，实得 {:?}", ch);
+    }
+}
+
+// ============================================================================
+// 吞吐预估
+// ============================================================================
+
+/// 开启吞吐模式前的预估。
+///
+/// # 为什么要有这个
+///
+/// 「打开吞吐模式」听起来像个免费的加速开关，其实不是：它只改变**流量怎么分布**，
+/// 不改变**能烧多少**。上游额度是按月固定的，把并发铺开只会让同样的额度烧得更快。
+/// 所以打开之前必须让人看到两个数：能提到多少并发，以及这样烧还能撑几天。
+///
+/// # 口径
+///
+/// - **并发**：前排档凭据数 × 单凭据实测并发上限。这是能力上限，不是保证值。
+/// - **可持续 TPM**：前排剩余额度 ÷ 距离重置的时间，换算成 token。这才是真天花板——
+///   实测中位 TPM 已经是可持续值的 3 倍时，提并发只会让见底提前。
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ThroughputEstimate {
+    /// 前排档（尽情烧）凭据数
+    pub front_tier: usize,
+    /// 中间档凭据数
+    pub mid_tier: usize,
+    /// 溢出储备档凭据数
+    pub reserve_tier: usize,
+    /// 预估并发上限 = 参与主力的凭据数 × 单凭据实测并发
+    pub estimated_concurrency: u32,
+    /// 当前并发上限（按当前实际参与主力的凭据数算），用于给出提升倍数
+    pub current_concurrency: u32,
+    /// 相对当前的提升倍数
+    pub concurrency_gain: f64,
+    /// 前排 + 中间档剩余额度合计
+    pub usable_credits: f64,
+    /// 按当前烧速，这些额度还能撑多少小时；无烧速数据为 `None`
+    pub runway_hours: Option<f64>,
+    /// 距离额度重置还有多少小时
+    pub hours_to_reset: Option<f64>,
+    /// 可持续 TPM：可用额度 ÷ 距重置时间，按每 credit 折合 token 换算
+    pub sustainable_tpm: Option<u64>,
+    /// 人话说明，直接显示给运营
+    pub notes: Vec<String>,
+}
+
+/// 预估所需的实测输入。全部来自真实观测，不要拍脑袋填。
+#[derive(Debug, Clone, Copy)]
+pub struct ThroughputObservations {
+    /// 单凭据实测并发峰值（近几天观测到的最大同时在飞请求数）
+    pub per_credential_concurrency: u32,
+    /// 每 credit 折合多少 token（计费口径，实测值）
+    pub tokens_per_credit: f64,
+    /// 当前烧速：credits/小时
+    pub credits_per_hour: f64,
+    /// 距离额度重置还有多少小时
+    pub hours_to_reset: f64,
+}
+
+/// 按分档结果算出吞吐预估。纯函数，便于测试。
+pub fn estimate_throughput(
+    cfg: &SchedulingConfig,
+    creds: &[CredentialSchedulingInput],
+    obs: ThroughputObservations,
+) -> ThroughputEstimate {
+    let live: Vec<&CredentialSchedulingInput> = creds.iter().filter(|c| !c.disabled).collect();
+
+    let band_of = |c: &CredentialSchedulingInput| match c.usage_pct {
+        Some(p) if p >= cfg.throughput_reserve_at_pct => 2u8,
+        Some(p) if p < cfg.throughput_burn_below_pct => 0,
+        _ => 1,
+    };
+    let front = live.iter().filter(|c| band_of(c) == 0).count();
+    let mid = live.iter().filter(|c| band_of(c) == 1).count();
+    let reserve = live.iter().filter(|c| band_of(c) == 2).count();
+
+    // 主力 = 前排 + 中间档。储备档只接溢出，不计入常态并发能力。
+    let primary = front + mid;
+    let estimated = primary as u32 * obs.per_credential_concurrency;
+
+    // 当前能力：没开吞吐模式时，priority 最小的那一档才是主力，
+    // 其余的号只在故障转移时才会被碰到。
+    let min_priority = live.iter().map(|c| c.priority).min().unwrap_or(PRIORITY_BASELINE);
+    let current_primary = live.iter().filter(|c| c.priority == min_priority).count();
+    let current = current_primary as u32 * obs.per_credential_concurrency;
+
+    let usable_credits: f64 = live
+        .iter()
+        .filter(|c| band_of(c) != 2)
+        .filter_map(|c| c.remaining)
+        .sum();
+
+    let runway_hours = if obs.credits_per_hour > 0.0 {
+        Some(usable_credits / obs.credits_per_hour)
+    } else {
+        None
+    };
+    let hours_to_reset = (obs.hours_to_reset > 0.0).then_some(obs.hours_to_reset);
+    let sustainable_tpm = hours_to_reset.map(|h| {
+        // 额度撑到重置的前提下，平均每分钟能烧多少 token
+        (usable_credits * obs.tokens_per_credit / (h * 60.0)).max(0.0) as u64
+    });
+
+    let mut notes = Vec::new();
+    if primary == 0 {
+        notes.push("没有凭据落在主力档——全部已达溢出储备阈值，此时开吞吐模式不会提升任何东西，先加号或等额度重置。".to_string());
+    } else if front == 0 {
+        notes.push(format!(
+            "前排档为空：{} 个主力号的用量都已超过 {:.0}%，吞吐提升有限且会加速见底。",
+            mid, cfg.throughput_burn_below_pct
+        ));
+    }
+    if reserve > 0 {
+        notes.push(format!(
+            "{} 个号已达 {:.0}% 用量，退到溢出储备档：不接主力流量，只在前排 429 时兜底。",
+            reserve, cfg.throughput_reserve_at_pct
+        ));
+    }
+    if let (Some(rw), Some(reset)) = (runway_hours, hours_to_reset) {
+        if rw < reset {
+            notes.push(format!(
+                "按当前烧速，可用额度还能撑 {:.1} 小时，但距离重置还有 {:.1} 小时——会提前 {:.1} 小时断供。提并发会让这个缺口更大。",
+                rw, reset, reset - rw
+            ));
+        } else {
+            notes.push(format!(
+                "按当前烧速可撑 {:.1} 小时，够撑到 {:.1} 小时后的重置，有 {:.0}% 余量。",
+                rw, reset, (rw / reset - 1.0) * 100.0
+            ));
+        }
+    }
+
+    ThroughputEstimate {
+        front_tier: front,
+        mid_tier: mid,
+        reserve_tier: reserve,
+        estimated_concurrency: estimated,
+        current_concurrency: current,
+        concurrency_gain: if current > 0 {
+            estimated as f64 / current as f64
+        } else {
+            0.0
+        },
+        usable_credits,
+        runway_hours,
+        hours_to_reset,
+        sustainable_tpm,
+        notes,
     }
 }

@@ -1985,6 +1985,102 @@ fn month_dates(month: &str) -> Result<(NaiveDate, NaiveDate), String> {
     Ok((first, next))
 }
 
+/// GET /api/admin/config/scheduling/throughput-estimate
+///
+/// 开启吞吐模式前先看这个：能提到多少并发、可用额度还能撑多久、
+/// 撑到重置的话每分钟只能烧多少 token。
+///
+/// 「打开吞吐模式」听起来像免费加速，其实只改变流量**怎么分布**，
+/// 不改变**能烧多少**——上游额度按月固定，铺开并发只会烧得更快。
+/// 所以这个接口存在的意义是：开之前让人看见代价。
+pub async fn throughput_estimate(
+    State(state): State<AdminState>,
+    Query(params): Query<std::collections::HashMap<String, String>>,
+) -> axum::response::Response {
+    use crate::admin::scheduling::ThroughputObservations;
+
+    // 观测值从最近的真实用量里算，不写死。
+    let (tokens_per_credit, credits_per_hour) = state
+        .service
+        .usage_recorder()
+        .map(|r| observed_burn(r.dir()))
+        .unwrap_or((0.0, 0.0));
+
+    let obs = ThroughputObservations {
+        // 单凭据并发峰值：无运行时在飞计数（全仓没有并发限制器），
+        // 只能取实测观测值。可用 query 覆盖以便做假设推演。
+        per_credential_concurrency: params
+            .get("perCredentialConcurrency")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(OBSERVED_PER_CREDENTIAL_CONCURRENCY),
+        tokens_per_credit,
+        credits_per_hour,
+        hours_to_reset: state.service.hours_to_quota_reset().unwrap_or(0.0),
+    };
+    let est = state.service.throughput_estimate(obs);
+    Json(serde_json::json!({
+        "estimate": est,
+        "observations": {
+            "perCredentialConcurrency": obs.per_credential_concurrency,
+            "tokensPerCredit": obs.tokens_per_credit,
+            "creditsPerHour": obs.credits_per_hour,
+            "hoursToReset": obs.hours_to_reset,
+        },
+        // 口径说明直接跟着数走，免得数字被单独截图后失去上下文
+        "caveat": "并发是能力上限不是保证值；可持续 TPM 由额度决定，与速率无关。提并发不会增加月度总量，只会更快烧完。",
+    }))
+    .into_response()
+}
+
+/// 实测烧速：返回 (每 credit 折合计费 token, credits/小时)。
+///
+/// 取最近 3 个日志文件——够抹平单日波动，又不至于把很久以前的用法混进来。
+fn observed_burn(dir: &std::path::Path) -> (f64, f64) {
+    use std::io::BufRead;
+    let mut files: Vec<_> = match std::fs::read_dir(dir) {
+        Ok(rd) => rd
+            .flatten()
+            .filter_map(|e| {
+                let n = e.file_name().into_string().ok()?;
+                (n.starts_with("usage_log.") && n.ends_with(".jsonl")).then(|| e.path())
+            })
+            .collect(),
+        Err(_) => return (0.0, 0.0),
+    };
+    files.sort();
+    let recent: Vec<_> = files.into_iter().rev().take(3).collect();
+    let (mut credits, mut billable, mut earliest, mut latest) = (0.0f64, 0u64, f64::MAX, 0.0f64);
+    for path in recent {
+        let Ok(f) = std::fs::File::open(&path) else {
+            continue;
+        };
+        for line in std::io::BufReader::new(f).lines().map_while(Result::ok) {
+            let Ok(rec) =
+                serde_json::from_str::<crate::admin::usage_stats::UsageRecord>(line.trim())
+            else {
+                continue;
+            };
+            credits += crate::admin::usage_stats::sane_credits(rec.credits);
+            billable += rec.input_tokens + rec.output_tokens + rec.cache_creation_tokens;
+            if let Ok(ts) = chrono::DateTime::parse_from_rfc3339(&rec.ts) {
+                let t = ts.timestamp() as f64;
+                earliest = earliest.min(t);
+                latest = latest.max(t);
+            }
+        }
+    }
+    if credits <= 0.0 {
+        return (0.0, 0.0);
+    }
+    let hours = ((latest - earliest) / 3600.0).max(1.0);
+    (billable as f64 / credits, credits / hours)
+}
+
+/// 实测的单凭据并发峰值。全仓没有并发限制器（无信号量、无在飞计数），
+/// 所以这个数只能来自观测：2026-08 用 ts+durationMs 反推，各凭据峰值 8~38，
+/// 取中位附近的 16 作为保守估计。
+const OBSERVED_PER_CREDENTIAL_CONCURRENCY: u32 = 16;
+
 /// GET /api/admin/config/scheduling —— 读取凭据调度自动化配置
 pub async fn get_scheduling_config(State(state): State<AdminState>) -> impl IntoResponse {
     Json(state.service.scheduling_config())

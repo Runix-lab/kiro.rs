@@ -1197,6 +1197,9 @@ pub struct MultiTokenManager {
 }
 
 /// 每个凭据最大 API 调用失败次数
+/// 吞吐模式下普通限流的冷却上限（秒）。
+const THROUGHPUT_SPILL_COOLDOWN_SECS: u64 = 45;
+
 const MAX_FAILURES_PER_CREDENTIAL: u32 = 3;
 
 /// 单账号 RPM 限流的滑动窗口长度（秒）。固定 60 秒 = 每分钟。
@@ -1986,7 +1989,13 @@ impl MultiTokenManager {
             }
 
             let (id, credentials, is_balanced) = {
-                let is_balanced = self.load_balancing_mode.lock().as_str() == "balanced";
+                // 吞吐模式强制 balanced：priority 模式是**粘滞**的，current_id 选中
+                // 一个号后会一直用它，只有失败/限流/RPM 超标才换。此时把优先级拉平
+                // （吞吐取向做的事）毫无作用——min_by_key 只会返回 Vec 里第一个，
+                // 「同档并列」等于第一个号吃掉全部流量。不强制 balanced，
+                // 整个吞吐模式就是个空开关。
+                let is_balanced = self.throughput_mode_active()
+                    || self.load_balancing_mode.lock().as_str() == "balanced";
 
                 // balanced 模式：每次请求都重新均衡选择，不固定 current_id
                 // priority 模式：优先使用 current_id 指向的凭据
@@ -4351,6 +4360,27 @@ impl MultiTokenManager {
     /// 获取账号级风控冷却时长秒数（Admin API）
     pub fn get_account_throttle_cooldown_secs(&self) -> u64 {
         self.account_throttle_cooldown_secs.load(Ordering::Relaxed)
+    }
+
+    /// 吞吐模式是否生效（调度已开启且取向为 Throughput）。
+    ///
+    /// 吞吐模式会改变 429 的处理方式：普通限流也换号而不是原地重试。
+    /// 这是「溢出储备档」能真正接到流量的前提——上游返回的
+    /// `USER_REQUEST_RATE_EXCEEDED` 不含账号级风控那两个字面量，
+    /// 常态路径会在同一个号上退避重试，把重试预算烧光也不碰第二个号。
+    pub fn throughput_mode_active(&self) -> bool {
+        let sched = &self.config.scheduling;
+        sched.enabled && sched.profile == crate::admin::scheduling::SchedulingProfile::Throughput
+    }
+
+    /// 吞吐模式下普通限流的冷却时长：远短于账号级风控的默认 30 分钟。
+    ///
+    /// 普通限流是"这一分钟发太快了"，不是"这个号被风控了"。用 30 分钟冷却
+    /// 会把号长时间停在场外，池子越用越小，和提升吞吐的目标正好相反。
+    pub fn throughput_spill_cooldown_secs(&self) -> u64 {
+        self.account_throttle_cooldown_secs
+            .load(Ordering::Relaxed)
+            .min(THROUGHPUT_SPILL_COOLDOWN_SECS)
     }
 
     /// 设置账号级风控故障转移配置（Admin API）
