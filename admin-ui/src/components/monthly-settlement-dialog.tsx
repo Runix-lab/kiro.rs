@@ -12,6 +12,7 @@ import { Input } from '@/components/ui/input'
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@/components/ui/tooltip'
 import { useBilling } from '@/hooks/use-stats'
 import { cn, formatCredits, formatUsd } from '@/lib/utils'
+import { PricingAdvicePanel } from '@/components/pricing-advice-panel'
 import type { BillingTotals, UnpricedKey, ZeroCreditKey } from '@/types/api'
 
 function currentMonthValue(): string {
@@ -181,12 +182,18 @@ interface MonthlySettlementDialogProps {
  * 月度总账弹窗：凭据管理页的成本侧汇总（我方向上游付了多少、能收回多少、赚了多少）。
  *
  * 原先以卡片形式常驻凭据管理 Tab 顶部，连同警示条会把整页撑满、挤掉凭据列表；
- * 现在挪进设置齿轮菜单，按需弹出。逐 Key 明细不在此展示，那属于「客户端 Key」页的
- * 客户视角。
+ * 现在挪进设置齿轮菜单，按需弹出。逐 Key 的常规账单明细（调用/Credit/成本/应收/毛利）
+ * 不在此展示，那属于「客户端 Key」页的客户视角；这里唯一的逐 Key 表格是下方的
+ * 「定价建议」——它需要联动同一个 `month`，单独开一个月份选择器只会重演本文件要修的
+ * 联动缺失问题。
  *
  * 弹窗下方是一叠按严重度排列的警示条：zeroCreditKeys（红，上游计费可能已变更，
  * 页面会看起来完全正常）→ malformedLines（金额未知）→ missingDays（当天没日志）→
  * unpriced（有消耗但算不出应收）。这些信号只在后端 JSON 里出现是没用的——必须露出来。
+ * 再往下是「定价建议」面板：目标毛利率 + raiseOnly 开关驱动 `usePricingAdvice`，
+ * 应用建议时复用账单页同款的 `useUpdateClientKey`（PUT billingDiscount），成功后额外
+ * 失效 `['stats','pricing-advice']`——那是本面板独有的 query key，不在 useUpdateClientKey
+ * 默认失效的范围内。
  */
 export function MonthlySettlementDialog({ open, onOpenChange }: MonthlySettlementDialogProps) {
   const [month, setMonth] = useState(currentMonthValue)
@@ -214,7 +221,7 @@ export function MonthlySettlementDialog({ open, onOpenChange }: MonthlySettlemen
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent className="sm:max-w-4xl max-h-[85vh] overflow-y-auto">
+      <DialogContent className="sm:max-w-5xl max-h-[85vh] overflow-y-auto">
         <TooltipProvider delayDuration={150}>
           <DialogHeader>
             <DialogTitle className="flex items-center gap-2">
@@ -325,6 +332,10 @@ export function MonthlySettlementDialog({ open, onOpenChange }: MonthlySettlemen
                 </WarningBanner>
               )}
             </div>
+          )}
+
+          {!isLoading && data && (
+            <PricingAdvicePanel month={month} billingKeys={data.keys} />
           )}
         </TooltipProvider>
       </DialogContent>

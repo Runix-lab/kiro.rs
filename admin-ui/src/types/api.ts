@@ -596,6 +596,54 @@ export interface BillingResponse {
   note: string
 }
 
+// ============ 定价建议 ============
+
+/** 按建议全部调整后的月度应收影响，用于在动手前先看清方向与幅度 */
+export interface PricingAdviceImpact {
+  currentReceivableUsd: number
+  afterAdviceReceivableUsd: number
+  deltaUsd: number
+}
+
+export interface PricingAdviceKeyRow {
+  keyId: number
+  name: string | null
+  calls: number
+  costUsd: number
+  /** 官方牌价美金；ESTIMATED，口径与 BillingKeyRow.officialUsd 一致 */
+  officialUsd: number | null
+  /** 当前折扣系数；未配置为 null */
+  currentDiscount: number | null
+  /** 当前按 credit 单价定价时的单价；与 currentDiscount 互斥 */
+  currentPricePerCredit: number | null
+  /** 保本线 = 成本 ÷ 官方牌价，由该客户的模型组合决定，不是谈出来的 */
+  breakevenDiscount: number | null
+  currentMarginRatePct: number | null
+  /** 建议折扣；已按 1.0（不打折）封顶 */
+  recommendedDiscount: number | null
+  recommendedReceivableUsd: number | null
+  /** 应用建议后应收的变化（美金），可正可负 */
+  receivableDeltaUsd: number | null
+  /** 该客户成本结构下即使打满价（折扣=1.0）也够不到目标毛利率 */
+  targetUnreachable: boolean
+  /** 折扣=1.0 时能做到的最高毛利率，仅在 targetUnreachable 时用于说明 */
+  maxAchievableMarginRatePct: number | null
+  belowTarget: boolean
+  /** false 表示该客户已达标或本次不建议调整（如 raiseOnly 下已高于目标） */
+  actionSuggested: boolean
+  /** 人类可读的结论，actionSuggested=false 时用于说明"为什么不动它" */
+  verdict: string
+}
+
+/** GET /api/admin/billing/pricing-advice 响应 */
+export interface PricingAdviceResponse {
+  targetMarginRate: number
+  raiseOnly: boolean
+  impact: PricingAdviceImpact
+  keys: PricingAdviceKeyRow[]
+  note: string
+}
+
 // ============ 请求链路追踪 ============
 
 /** 单次上游尝试 */

@@ -1,6 +1,6 @@
 import { keepPreviousData, useMutation, useQuery } from '@tanstack/react-query'
 import { toast } from 'sonner'
-import { exportBilling, getBilling, getByCredential, getByModel, getOverview, getRate, getTimeSeries, getTpm } from '@/api/stats'
+import { exportBilling, getBilling, getByCredential, getByModel, getOverview, getPricingAdvice, getRate, getTimeSeries, getTpm } from '@/api/stats'
 import { extractErrorMessage } from '@/lib/utils'
 import type { StatsFilter, StatsTimeFilter, TpmDim } from '@/types/api'
 
@@ -135,6 +135,18 @@ export function useBilling(month: string) {
   return useQuery({
     queryKey: ['stats', 'billing', month],
     queryFn: () => getBilling({ month }),
+    ...COMMON,
+  })
+}
+
+/**
+ * 定价建议：目标毛利率（分数，0.5 = 50%）+ raiseOnly 任一变化都要重新算；`month` 与
+ * 账单页/月度总账弹窗共用同一个月份状态，切月联动，不单独维护一份。
+ */
+export function usePricingAdvice(month: string, targetMarginRate: number, raiseOnly: boolean) {
+  return useQuery({
+    queryKey: ['stats', 'pricing-advice', month, targetMarginRate, raiseOnly],
+    queryFn: () => getPricingAdvice({ month, targetMargin: targetMarginRate, raiseOnly }),
     ...COMMON,
   })
 }

@@ -5,6 +5,7 @@ import type {
   CredentialDistribution,
   ModelDistribution,
   OverviewStats,
+  PricingAdviceResponse,
   RateSnapshot,
   StatsFilter,
   StatsTimeFilter,
@@ -118,6 +119,29 @@ export async function getTpm(
  */
 export async function getBilling(params: { month?: string }): Promise<BillingResponse> {
   const { data } = await api.get<BillingResponse>('/billing', { params })
+  return data
+}
+
+/**
+ * 定价建议：按目标毛利率给每个客户端 Key 推算「建议折扣」。
+ *
+ * `raiseOnly` 默认 true——已达标客户会被标 `actionSuggested: false` 并附一句"维持现状"的
+ * verdict，前端必须尊重这个标记：统一目标毛利率去套已经做到 60~75% 毛利的客户会变成
+ * 变相降价。`breakevenDiscount`（成本 ÷ 官方牌价）是该客户模型组合决定的硬下限，
+ * `recommendedDiscount` 已在后端按 1.0（不打折）封顶。
+ */
+export async function getPricingAdvice(params: {
+  month: string
+  targetMargin: number
+  raiseOnly: boolean
+}): Promise<PricingAdviceResponse> {
+  const { data } = await api.get<PricingAdviceResponse>('/billing/pricing-advice', {
+    params: {
+      month: params.month,
+      targetMargin: params.targetMargin,
+      raiseOnly: params.raiseOnly,
+    },
+  })
   return data
 }
 

@@ -445,7 +445,7 @@ export function ClientKeysPage() {
 
       <div className="mb-4 flex flex-wrap items-center justify-between gap-3">
         <p className="text-[12px] text-muted-foreground">
-          下表「调用 / Credit / 成本$ / 应收$ / 毛利$」列与「导出对账单」按所选月份计算
+          下表「{billingMonth} 账单」列组与「导出对账单」随下方月份选择器联动；「账号历史累计」列组不随之变化，见表头标注
         </p>
         <MonthPicker month={billingMonth} onChange={setBillingMonth} />
       </div>
@@ -470,38 +470,69 @@ export function ClientKeysPage() {
           <CardContent className="overflow-x-auto p-0">
             <table className="w-full min-w-[1480px] text-sm">
               <thead className="text-[12px] text-muted-foreground border-b border-border/60">
+                {/*
+                  两行表头：第一行是「按什么口径」分组，第二行才是具体列名。这是对
+                  操作者原话「点了日期，下面没有跟着联动」的直接回应——账单五列随
+                  billingMonth 变化，账号历史四列不随之变化，两组必须在视觉上一眼
+                  区分开，而不是十六列挤在一行让人以为全部同源。billingMonth 直接
+                  写进分组标题里，切月份时这行文字本身也会变，是「联动」最直观的证据。
+                */}
                 <tr className="whitespace-nowrap">
-                  <th className="text-left font-medium px-4 py-3">ID</th>
-                  <th className="text-left font-medium px-4 py-3">名称</th>
-                  <th className="text-left font-medium px-4 py-3">Key</th>
-                  <th className="text-left font-medium px-4 py-3">分组</th>
-                  <th className="text-left font-medium px-4 py-3">对客定价</th>
+                  <th rowSpan={2} className="text-left font-medium px-4 py-1.5 align-bottom">ID</th>
+                  <th rowSpan={2} className="text-left font-medium px-4 py-1.5 align-bottom">名称</th>
+                  <th rowSpan={2} className="text-left font-medium px-4 py-1.5 align-bottom">Key</th>
+                  <th rowSpan={2} className="text-left font-medium px-4 py-1.5 align-bottom">分组</th>
+                  <th rowSpan={2} className="text-left font-medium px-4 py-1.5 align-bottom">对客定价</th>
+                  <th
+                    colSpan={5}
+                    className="border-l border-border/60 px-4 py-1.5 text-center font-semibold text-foreground"
+                    title="随下方月份选择器联动"
+                  >
+                    {billingMonth} 账单
+                  </th>
+                  <th rowSpan={2} className="text-left font-medium px-4 py-1.5 align-bottom">状态</th>
+                  <th
+                    colSpan={4}
+                    className="border-l border-border/60 px-4 py-1.5 text-center font-semibold"
+                    title="自 Key 创建或上次重置统计以来的累计值，不随月份选择器变化"
+                  >
+                    账号历史累计（不随月份筛选）
+                  </th>
+                  <th
+                    rowSpan={2}
+                    className="sticky right-0 z-20 min-w-[11.75rem] border-l border-border/60 bg-card px-4 py-1.5 text-right font-medium align-bottom"
+                  >
+                    操作
+                  </th>
+                </tr>
+                <tr className="whitespace-nowrap">
                   <th
                     className="border-l border-border/60 text-right font-medium px-4 py-3"
-                    title="按所选月份计算"
+                    title={`${billingMonth} 账单，随月份选择器联动`}
                   >
                     调用
                   </th>
-                  <th className="text-right font-medium px-4 py-3" title="按所选月份计算">
+                  <th className="text-right font-medium px-4 py-3" title={`${billingMonth} 账单，随月份选择器联动`}>
                     Credit
                   </th>
-                  <th className="text-right font-medium px-4 py-3" title="按所选月份计算">
+                  <th className="text-right font-medium px-4 py-3" title={`${billingMonth} 账单，随月份选择器联动`}>
                     成本$
                   </th>
-                  <th className="text-right font-medium px-4 py-3" title="按所选月份计算">
+                  <th className="text-right font-medium px-4 py-3" title={`${billingMonth} 账单，随月份选择器联动`}>
                     应收$
                   </th>
-                  <th className="text-right font-medium px-4 py-3" title="按所选月份计算">
+                  <th className="text-right font-medium px-4 py-3" title={`${billingMonth} 账单，随月份选择器联动`}>
                     毛利$
                   </th>
-                  <th className="text-left font-medium px-4 py-3">状态</th>
-                  <th className="text-right font-medium px-4 py-3">总调用</th>
-                  <th className="text-right font-medium px-4 py-3">输入</th>
-                  <th className="text-right font-medium px-4 py-3">输出</th>
-                  <th className="text-left font-medium px-4 py-3">最后使用</th>
-                  <th className="sticky right-0 z-20 min-w-[11.75rem] border-l border-border/60 bg-card px-4 py-3 text-right font-medium">
-                    操作
+                  <th
+                    className="border-l border-border/60 text-right font-medium px-4 py-3"
+                    title="不随月份选择器变化"
+                  >
+                    总调用
                   </th>
+                  <th className="text-right font-medium px-4 py-3" title="不随月份选择器变化">输入</th>
+                  <th className="text-right font-medium px-4 py-3" title="不随月份选择器变化">输出</th>
+                  <th className="text-left font-medium px-4 py-3" title="不随月份选择器变化">最后使用</th>
                 </tr>
               </thead>
               <tbody>
@@ -567,7 +598,7 @@ export function ClientKeysPage() {
                         <Badge variant="success">启用</Badge>
                       )}
                     </td>
-                    <td className="px-4 py-3 text-right tabular-nums">{k.totalCalls}</td>
+                    <td className="border-l border-border/60 px-4 py-3 text-right tabular-nums">{k.totalCalls}</td>
                     <td className="px-4 py-3 text-right tabular-nums">{formatTokens(k.totalInputTokens)}</td>
                     <td className="px-4 py-3 text-right tabular-nums">{formatTokens(k.totalOutputTokens)}</td>
                     <td className="px-4 py-3 text-[12px] text-muted-foreground">

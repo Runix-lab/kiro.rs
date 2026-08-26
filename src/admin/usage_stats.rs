@@ -338,14 +338,19 @@ pub struct PricingAdvice {
     pub current_price_per_credit: Option<f64>,
     /// 保本线 = 成本 ÷ 官方牌价
     pub breakeven_discount: Option<f64>,
-    /// 当前毛利率（按当前折扣算）
-    pub current_margin_rate: Option<f64>,
+    /// 当前毛利率**百分数**（0-100），与 `BillingTotals.marginRate` 同口径。
+    ///
+    /// 命名带 `_pct` 是因为这个仓里两种口径都存在过：`targetMargin` 查询参数是
+    /// 0-1 的小数，而 `BillingTotals.marginRate` 是百分数。前端曾用
+    /// 「≤1 就当小数」的启发式去猜，那在毛利率正好 100% 时会被当成 1%。
+    /// 字段名里写死单位，比任何注释都可靠。
+    pub current_margin_rate_pct: Option<f64>,
     /// 达到目标毛利率所需的折扣系数；超过 1.0 时已被夹到 1.0
     pub recommended_discount: Option<f64>,
     /// 目标毛利率在该客户的成本结构下是否根本达不到
     pub target_unreachable: bool,
-    /// 折扣取上限 1.0 时能拿到的最高毛利率（即这个客户的天花板）
-    pub max_achievable_margin_rate: Option<f64>,
+    /// 折扣取上限 1.0 时能拿到的最高毛利率**百分数**（0-100）
+    pub max_achievable_margin_rate_pct: Option<f64>,
     /// 按建议折扣计算的应收
     pub recommended_receivable_usd: Option<f64>,
     /// 相对当前应收的变化额
@@ -379,12 +384,16 @@ pub fn pricing_advice(rows: &[KeyBillingRow], target_margin_rate: f64) -> Vec<Pr
             // 按上限折扣能拿到的最高毛利率——够不到目标时告诉运营天花板在哪
             let max_margin = official.map(|o| {
                 let recv = o * MAX_BILLING_DISCOUNT;
-                if recv > 0.0 { (recv - r.credit_usd) / recv } else { 0.0 }
+                if recv > 0.0 {
+                    (recv - r.credit_usd) / recv * 100.0
+                } else {
+                    0.0
+                }
             });
             let current_margin = r
                 .receivable_usd
                 .filter(|v| *v > 0.0)
-                .map(|v| (v - r.credit_usd) / v);
+                .map(|v| (v - r.credit_usd) / v * 100.0);
 
             let verdict = if unreachable {
                 "🔴 该客户成本结构下达不到这个毛利率，已按上限 1.0 折算"
@@ -412,10 +421,10 @@ pub fn pricing_advice(rows: &[KeyBillingRow], target_margin_rate: f64) -> Vec<Pr
                 current_discount: r.billing_discount,
                 current_price_per_credit: r.price_per_credit,
                 breakeven_discount: breakeven,
-                current_margin_rate: current_margin,
+                current_margin_rate_pct: current_margin,
                 recommended_discount: recommended,
                 target_unreachable: unreachable,
-                max_achievable_margin_rate: max_margin,
+                max_achievable_margin_rate_pct: max_margin,
                 recommended_receivable_usd: rec_receivable,
                 receivable_delta_usd: rec_receivable
                     .zip(r.receivable_usd)
@@ -1722,7 +1731,8 @@ mod tests {
         assert!((a.recommended_receivable_usd.unwrap() - 200.0).abs() < 1e-9);
         assert!((a.receivable_delta_usd.unwrap() - 50.0).abs() < 1e-9);
         // 验算：毛利率 = (200-100)/200 = 0.5 ✓
-        assert!((a.current_margin_rate.unwrap() - (150.0 - 100.0) / 150.0).abs() < 1e-9);
+        // 百分数口径：与 BillingTotals.marginRate 一致，前端不必再猜单位
+        assert!((a.current_margin_rate_pct.unwrap() - (150.0 - 100.0) / 150.0 * 100.0).abs() < 1e-9);
     }
 
     /// 低于保本线必须明确标红，不能只给个数字让人自己看出来
