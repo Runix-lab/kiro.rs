@@ -36,6 +36,21 @@ pub struct ModelPrice {
 
 impl ModelPrice {
     /// 按官方缓存倍率（写 1.25×、读 0.1×）从输入/输出单价推出完整价。
+    /// 无「缓存写入溢价」的价表：`cache_write = input`。
+    ///
+    /// GPT-5.6 **之前**的 OpenAI 型号（gpt-5.5 / 5.4 / 4o…）官方定价页的
+    /// "cache writes" 列是破折号 —— 写缓存不额外收费。用 `standard()` 会派生出
+    /// `input × 1.25`，把这些模型的缓存写虚高 25%。
+    /// （1.25× 的写入溢价是 GPT-5.6 起才有的，对 5.6 系用 `standard()` 是对的。）
+    const fn no_cache_write_premium(input: f64, output: f64) -> Self {
+        Self {
+            input_per_mtok: input,
+            output_per_mtok: output,
+            cache_write_per_mtok: input,
+            cache_read_per_mtok: input * 0.1,
+        }
+    }
+
     const fn standard(input: f64, output: f64) -> Self {
         Self {
             input_per_mtok: input,
@@ -84,7 +99,8 @@ const BUILTIN_PRICES: &[(&str, ModelPrice)] = &[
     ("gpt-5-6-sol", ModelPrice::standard(4.0, 20.0)),
     ("gpt-5-6-terra", ModelPrice::standard(2.0, 12.0)),
     ("gpt-5-6-luna", ModelPrice::standard(0.2, 1.2)),
-    ("gpt-5-5", ModelPrice::standard(5.0, 30.0)),
+    // GPT-5.6 之前无写入溢价（官方定价页该列为破折号），不能用 standard()
+    ("gpt-5-5", ModelPrice::no_cache_write_premium(5.0, 30.0)),
     // 以下非 Anthropic/OpenAI 家族的价格于 2026-08-25 从各家官方定价页抓取并二次复核。
     // MiniMax / Qwen 的缓存价是官方published（恰好等于 1.25×/0.1×）；GLM-5 只公布了
     // 缓存读（$0.2），缓存写按 1.25× 推导——它实际按小时计缓存存储费，此处不建模。
@@ -617,5 +633,31 @@ mod websearch_correction_tests {
                 m
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod cache_write_premium_tests {
+    use super::*;
+
+    /// GPT-5.6 起有 1.25× 写入溢价，5.6 之前没有。混用会让老型号虚高 25%。
+    #[test]
+    fn only_gpt_5_6_and_later_carry_a_cache_write_premium() {
+        let t = PricingTable::from_config(&PricingConfig::default());
+        let sol = t.price_for("gpt-5.6-sol").expect("sol 应已配价");
+        assert!(
+            (sol.cache_write_per_mtok - sol.input_per_mtok * 1.25).abs() < 1e-9,
+            "gpt-5.6 应有 1.25x 写入溢价"
+        );
+        let g55 = t.price_for("gpt-5.5").expect("gpt-5.5 应已配价");
+        assert!(
+            (g55.cache_write_per_mtok - g55.input_per_mtok).abs() < 1e-9,
+            "gpt-5.5 不该有写入溢价，实得 {} vs input {}",
+            g55.cache_write_per_mtok,
+            g55.input_per_mtok
+        );
+        // 缓存读两者都是 0.1x（官方定价页逐档核对过）
+        assert!((sol.cache_read_per_mtok - sol.input_per_mtok * 0.1).abs() < 1e-9);
+        assert!((g55.cache_read_per_mtok - g55.input_per_mtok * 0.1).abs() < 1e-9);
     }
 }
