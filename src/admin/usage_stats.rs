@@ -297,6 +297,104 @@ pub struct ScanOutcome {
     pub malformed: u64,
 }
 
+/// 一个 Key 的定价建议。
+///
+/// # 口径
+///
+/// 折扣口径下：应收 = 官方牌价 × 折扣系数，成本与折扣无关。所以
+///
+/// ```text
+/// 毛利率 = (应收 − 成本) / 应收 = 1 − 成本 / (官方 × 折扣)
+/// ```
+///
+/// 反解出达到目标毛利率所需的折扣：
+///
+/// ```text
+/// 折扣 = 成本 / (官方 × (1 − 目标毛利率)) = 保本线 / (1 − 目标毛利率)
+/// ```
+///
+/// **保本线 = 成本 ÷ 官方牌价**，是这个客户的流量结构决定的下限，与商务谈判无关。
+/// 折扣系数低于保本线，无论卖多少都在亏。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PricingAdvice {
+    pub key_id: u64,
+    pub calls: u64,
+    pub cost_usd: f64,
+    /// 官方牌价合计；全部模型未配价时为 `None`，此时无法给建议
+    pub official_usd: Option<f64>,
+    /// 当前折扣系数
+    pub current_discount: Option<f64>,
+    /// 当前对客单价（与折扣二选一）
+    pub current_price_per_credit: Option<f64>,
+    /// 保本线 = 成本 ÷ 官方牌价
+    pub breakeven_discount: Option<f64>,
+    /// 当前毛利率（按当前折扣算）
+    pub current_margin_rate: Option<f64>,
+    /// 达到目标毛利率所需的折扣系数
+    pub recommended_discount: Option<f64>,
+    /// 按建议折扣计算的应收
+    pub recommended_receivable_usd: Option<f64>,
+    /// 相对当前应收的变化额
+    pub receivable_delta_usd: Option<f64>,
+    /// 人话结论
+    pub verdict: &'static str,
+}
+
+/// 按目标毛利率给出每个 Key 的折扣建议。
+///
+/// 无法给建议的情况一律返回 `recommended_discount: None` 并在 `verdict` 说明原因，
+/// 绝不用猜的值填上——定价建议被当成结论直接套用的风险太高。
+pub fn pricing_advice(rows: &[KeyBillingRow], target_margin_rate: f64) -> Vec<PricingAdvice> {
+    // 目标毛利率必须在 [0, 1)：等于 1 意味着成本为零，反解会除零炸上天
+    let m = target_margin_rate.clamp(0.0, 0.95);
+    rows.iter()
+        .map(|r| {
+            let official = r.official_usd.filter(|o| *o > 0.0);
+            let breakeven = official.map(|o| r.credit_usd / o);
+            let recommended = breakeven.map(|b| b / (1.0 - m));
+            let rec_receivable = official.zip(recommended).map(|(o, d)| o * d);
+            let current_margin = r
+                .receivable_usd
+                .filter(|v| *v > 0.0)
+                .map(|v| (v - r.credit_usd) / v);
+
+            let verdict = match (official, r.billing_discount, r.price_per_credit) {
+                (None, _, _) => "该 Key 的模型全部未配官方价，算不出保本线",
+                (_, None, None) => "未设置对客定价，先定价才能谈毛利",
+                (_, _, Some(_)) => "走单价口径，毛利与折扣无关，建议仅供参考",
+                (Some(_), Some(d), None) => {
+                    let b = breakeven.unwrap_or(0.0);
+                    if d < b {
+                        "🔴 当前折扣低于保本线，每笔都在亏"
+                    } else if recommended.is_some_and(|rec| d < rec) {
+                        "当前有毛利但低于目标，建议上调"
+                    } else {
+                        "已达到或超过目标毛利率"
+                    }
+                }
+            };
+
+            PricingAdvice {
+                key_id: r.key_id,
+                calls: r.calls,
+                cost_usd: r.credit_usd,
+                official_usd: r.official_usd,
+                current_discount: r.billing_discount,
+                current_price_per_credit: r.price_per_credit,
+                breakeven_discount: breakeven,
+                current_margin_rate: current_margin,
+                recommended_discount: recommended,
+                recommended_receivable_usd: rec_receivable,
+                receivable_delta_usd: rec_receivable
+                    .zip(r.receivable_usd)
+                    .map(|(rec, cur)| rec - cur),
+                verdict,
+            }
+        })
+        .collect()
+}
+
 /// 按北京自然日区间，从用量日志直接算出每个 Key 的月结账目。
 ///
 /// 为什么不用内存聚合器（[`UsageAggregator::query_billing`]）：聚合器只保留 31 个
@@ -1557,6 +1655,104 @@ mod tests {
             (sonnet.official_usd.unwrap() - expect_sonnet).abs() < 1e-9,
             "sonnet-5 被误补偿了，等于凭空多收"
         );
+    }
+
+    /// 目标毛利率反解：折扣 = 保本线 / (1 − 目标毛利率)。
+    /// 这是要直接拿去改客户价的数，算错就是真金白银。
+    #[test]
+    fn pricing_advice_solves_for_the_target_margin() {
+        let row = KeyBillingRow {
+            key_id: 1,
+            calls: 100,
+            errors: 0,
+            upstream_calls: 100,
+            unpriced_calls: 0,
+            unpriced_credits: 0.0,
+            error_credits: 0.0,
+            input_tokens: 0,
+            output_tokens: 0,
+            cache_creation_tokens: 0,
+            cache_read_tokens: 0,
+            credits: 5000.0,
+            credit_usd: 100.0,
+            official_usd: Some(1000.0),
+            billing_discount: Some(0.15),
+            price_per_credit: None,
+            receivable_usd: Some(150.0),
+            receivable_basis: Some("discount"),
+            margin_usd: Some(50.0),
+        };
+        let a = &pricing_advice(&[row], 0.5)[0];
+        // 保本线 = 100/1000 = 0.10
+        assert!((a.breakeven_discount.unwrap() - 0.10).abs() < 1e-9);
+        // 50% 毛利 → 折扣 = 0.10 / 0.5 = 0.20
+        assert!((a.recommended_discount.unwrap() - 0.20).abs() < 1e-9);
+        // 应收 = 1000 × 0.20 = 200，比当前 150 多 50
+        assert!((a.recommended_receivable_usd.unwrap() - 200.0).abs() < 1e-9);
+        assert!((a.receivable_delta_usd.unwrap() - 50.0).abs() < 1e-9);
+        // 验算：毛利率 = (200-100)/200 = 0.5 ✓
+        assert!((a.current_margin_rate.unwrap() - (150.0 - 100.0) / 150.0).abs() < 1e-9);
+    }
+
+    /// 低于保本线必须明确标红，不能只给个数字让人自己看出来
+    #[test]
+    fn pricing_advice_flags_below_breakeven() {
+        let mut row = KeyBillingRow {
+            key_id: 2,
+            calls: 10,
+            errors: 0,
+            upstream_calls: 10,
+            unpriced_calls: 0,
+            unpriced_credits: 0.0,
+            error_credits: 0.0,
+            input_tokens: 0,
+            output_tokens: 0,
+            cache_creation_tokens: 0,
+            cache_read_tokens: 0,
+            credits: 5000.0,
+            credit_usd: 100.0,
+            official_usd: Some(500.0), // 保本线 0.20
+            billing_discount: Some(0.15), // 低于保本线
+            price_per_credit: None,
+            receivable_usd: Some(75.0),
+            receivable_basis: Some("discount"),
+            margin_usd: Some(-25.0),
+        };
+        assert!(pricing_advice(&[row.clone()], 0.5)[0].verdict.contains("亏"));
+        // 提到 0.40 就达标了（0.20 / 0.5）
+        row.billing_discount = Some(0.40);
+        row.receivable_usd = Some(200.0);
+        let a = &pricing_advice(&[row], 0.5)[0];
+        assert!(a.verdict.contains("达到"), "实得: {}", a.verdict);
+    }
+
+    /// 官方价算不出来时不许瞎给建议
+    #[test]
+    fn no_advice_without_an_official_price() {
+        let row = KeyBillingRow {
+            key_id: 3,
+            calls: 1,
+            errors: 0,
+            upstream_calls: 1,
+            unpriced_calls: 1,
+            unpriced_credits: 1.0,
+            error_credits: 0.0,
+            input_tokens: 0,
+            output_tokens: 0,
+            cache_creation_tokens: 0,
+            cache_read_tokens: 0,
+            credits: 1.0,
+            credit_usd: 0.02,
+            official_usd: None,
+            billing_discount: Some(0.3),
+            price_per_credit: None,
+            receivable_usd: None,
+            receivable_basis: None,
+            margin_usd: None,
+        };
+        let a = &pricing_advice(&[row], 0.5)[0];
+        assert!(a.recommended_discount.is_none(), "无官方价却给了建议");
+        assert!(a.verdict.contains("未配官方价"));
     }
 
     /// 损坏的行（负 credits / NaN）不能污染账单，也不能让整个导出失败。

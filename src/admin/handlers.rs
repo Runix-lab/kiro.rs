@@ -2027,6 +2027,187 @@ fn month_dates(month: &str) -> Result<(NaiveDate, NaiveDate), String> {
     Ok((first, next))
 }
 
+/// POST /api/admin/config/max-throughput
+///
+/// 一键切到「最高吞吐」配置。
+///
+/// # 为什么要一键
+///
+/// 提吞吐不是单个开关，是**五个设置必须同时对**，少一个整套就是空的：
+///
+/// | 设置 | 值 | 少了它会怎样 |
+/// |---|---|---|
+/// | `loadBalancingMode` | `balanced` | priority 模式是粘滞的，拉平优先级后第一个号吃掉全部流量 |
+/// | `scheduling.profile` | `throughput` | 优先级不分档，闲号排在后面用不上 |
+/// | `scheduling.enabled` | `true` | 分档根本不会执行 |
+/// | `accountRpmLimitEnabled` | `false` | 我们自己给每个号加了 RPM 天花板，先于上游限流 |
+/// | `accountThrottleCooldownSecs` | 短 | 30 分钟冷却会把限流的号停在场外，池子越用越小 |
+///
+/// 恢复靠 `restore=true`：把上面几项写回风险控制模式的默认值。
+pub async fn set_max_throughput(
+    State(state): State<AdminState>,
+    Query(params): Query<std::collections::HashMap<String, String>>,
+) -> axum::response::Response {
+    let restore = params.get("restore").map(|v| v == "true").unwrap_or(false);
+    let mut applied: Vec<serde_json::Value> = Vec::new();
+    let mut failed: Vec<serde_json::Value> = Vec::new();
+
+    let mut step = |name: &str, want: serde_json::Value, r: anyhow::Result<()>| match r {
+        Ok(()) => applied.push(serde_json::json!({ "setting": name, "value": want })),
+        Err(e) => failed.push(serde_json::json!({
+            "setting": name, "value": want, "error": e.to_string()
+        })),
+    };
+
+    let tm = state.service.token_manager();
+
+    if restore {
+        step(
+            "loadBalancingMode",
+            serde_json::json!("balanced"),
+            tm.set_load_balancing_mode("balanced".to_string()),
+        );
+        step(
+            "accountRpmLimitEnabled",
+            serde_json::json!(false),
+            tm.set_account_rpm_limit_config(Some(false), None),
+        );
+        step(
+            "accountThrottleCooldownSecs",
+            serde_json::json!(1800),
+            tm.set_account_throttle_config(Some(true), Some(1800)),
+        );
+    } else {
+        // ① 粘滞选号会让"拉平优先级"完全失效，必须先切 balanced
+        step(
+            "loadBalancingMode",
+            serde_json::json!("balanced"),
+            tm.set_load_balancing_mode("balanced".to_string()),
+        );
+        // ② 我们自己的 RPM 天花板会先于上游限流触发，冲吞吐时必须关掉
+        step(
+            "accountRpmLimitEnabled",
+            serde_json::json!(false),
+            tm.set_account_rpm_limit_config(Some(false), None),
+        );
+        // ③ 冷却压到 45 秒：普通限流是"这一分钟发太快了"，不是账号被风控；
+        //    用 30 分钟会把号停在场外，可用池越用越小，与提吞吐正好相反
+        step(
+            "accountThrottleCooldownSecs",
+            serde_json::json!(45),
+            tm.set_account_throttle_config(Some(true), Some(45)),
+        );
+        // ④ 自愈更积极：被连续失败摘掉的号要尽快回池
+        step(
+            "selfHeal",
+            serde_json::json!({ "enabled": true, "minIntervalSecs": 60 }),
+            tm.set_self_heal_config(None, Some(true), Some(60), None),
+        );
+    }
+
+    // ⑤ 调度取向：吞吐两档 / 风险控制
+    let mut sched = state.service.scheduling_config();
+    sched.enabled = true;
+    sched.profile = if restore {
+        crate::admin::scheduling::SchedulingProfile::Manual
+    } else {
+        crate::admin::scheduling::SchedulingProfile::Throughput
+    };
+    let profile_name = if restore { "manual" } else { "throughput" };
+    match state.service.set_scheduling_config(sched) {
+        Ok(()) => applied.push(serde_json::json!({
+            "setting": "scheduling.profile", "value": profile_name
+        })),
+        Err(e) => failed.push(serde_json::json!({
+            "setting": "scheduling.profile", "value": profile_name, "error": e.to_string()
+        })),
+    }
+
+    // 立刻跑一次调度，让分档当场生效而不是等下一个 300 秒周期
+    let changes = state.service.run_scheduling_pass();
+
+    Json(serde_json::json!({
+        "mode": if restore { "riskControl" } else { "maxThroughput" },
+        "applied": applied,
+        "failed": failed,
+        "priorityChanges": changes.len(),
+        "note": if restore {
+            "已切回风险控制模式：额度守卫（95% 降级）+ 首选层保护，冷却恢复 30 分钟。"
+        } else {
+            "已切到最高吞吐：全部凭据按用量分成前排/中间/溢出三档并行铺开，429 会换号而不是原地重试。注意这不会增加月度额度总量，只会更快烧完——切换前请看 /config/scheduling/throughput-estimate。"
+        },
+    }))
+    .into_response()
+}
+
+/// GET /api/admin/billing/pricing-advice?month=YYYY-MM&targetMargin=0.5
+///
+/// 按目标毛利率反解每个客户该配多少折扣。
+///
+/// 折扣口径下 `毛利率 = 1 − 成本/(官方×折扣)`，反解得 `折扣 = 保本线/(1−目标毛利率)`。
+/// **保本线由该客户的流量结构决定，不是谈判出来的**——低于它无论卖多少都在亏。
+pub async fn pricing_advice(
+    State(state): State<AdminState>,
+    Query(params): Query<std::collections::HashMap<String, String>>,
+) -> axum::response::Response {
+    let target = params
+        .get("targetMargin")
+        .and_then(|v| v.parse::<f64>().ok())
+        .unwrap_or(0.5);
+    let (start, end) = match params.get("month") {
+        Some(m) => match month_dates(m) {
+            Ok(v) => v,
+            Err(message) => return stats_bad_request(message),
+        },
+        None => {
+            let today = Local::now().date_naive();
+            let first = today.with_day(1).unwrap_or(today);
+            (first, today.succ_opt().unwrap_or(today))
+        }
+    };
+    let Some(recorder) = state.service.usage_recorder() else {
+        return stats_bad_request("用量日志未启用".to_string());
+    };
+    let keys = state.client_keys.list();
+    let pricing_map: HashMap<u64, (Option<f64>, Option<f64>)> = keys
+        .iter()
+        .map(|k| (k.id, (k.billing_discount, k.billing_price_per_credit)))
+        .collect();
+    let name_map: HashMap<u64, String> = keys.iter().map(|k| (k.id, k.name.clone())).collect();
+
+    let (rows, _) = crate::admin::usage_stats::billing_from_logs(
+        recorder.dir(),
+        start,
+        end,
+        &state.pricing,
+        &|id| pricing_map.get(&id).copied().unwrap_or((None, None)),
+    );
+    let advice = crate::admin::usage_stats::pricing_advice(&rows, target);
+
+    let items: Vec<serde_json::Value> = advice
+        .iter()
+        .filter(|a| a.cost_usd > 0.0)
+        .map(|a| {
+            let mut v = serde_json::to_value(a).unwrap_or_default();
+            if let Some(o) = v.as_object_mut() {
+                o.insert(
+                    "name".into(),
+                    serde_json::json!(name_map.get(&a.key_id).cloned()),
+                );
+            }
+            v
+        })
+        .collect();
+
+    Json(serde_json::json!({
+        "month": params.get("month"),
+        "targetMarginRate": target,
+        "keys": items,
+        "note": "保本线 = 成本 ÷ 官方牌价，由该客户的模型组合决定；建议折扣 = 保本线 ÷ (1 − 目标毛利率)。官方牌价按 token 明细换算，而 token 拆分在上游不下发时由本地估算补齐——建议值应当留出余量，不要贴着保本线定价。",
+    }))
+    .into_response()
+}
+
 /// GET /api/admin/config/scheduling/throughput-estimate
 ///
 /// 开启吞吐模式前先看这个：能提到多少并发、可用额度还能撑多久、
