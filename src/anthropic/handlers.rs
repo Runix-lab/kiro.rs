@@ -72,6 +72,9 @@ impl UsageRecordHook {
         }
     }
 
+    /// 记录一次请求的用量。`rounds` 缺省 1；websearch 循环走
+    /// [`record_with_rounds`](Self::record_with_rounds) 传真实轮数。
+    #[allow(clippy::too_many_arguments)]
     pub fn record(
         &self,
         credential_id: u64,
@@ -81,6 +84,35 @@ impl UsageRecordHook {
         cache_read_tokens: i32,
         credits: f64,
         status: &str,
+    ) {
+        self.record_with_rounds(
+            credential_id,
+            input_tokens,
+            output_tokens,
+            cache_creation_tokens,
+            cache_read_tokens,
+            credits,
+            status,
+            1,
+        );
+    }
+
+    /// 带上游调用轮数的记录。
+    ///
+    /// websearch 循环每轮都把**完整上下文**重发一次，而缓存对 GPT 不打折
+    /// —— 轮数直接等比放大我方成本。不落盘就无法量化，也就无法判断
+    /// "降低轮数上限"值不值得做。
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_with_rounds(
+        &self,
+        credential_id: u64,
+        input_tokens: i32,
+        output_tokens: i32,
+        cache_creation_tokens: i32,
+        cache_read_tokens: i32,
+        credits: f64,
+        status: &str,
+        rounds: u32,
     ) {
         let rec = UsageRecord {
             ts: Utc::now().to_rfc3339(),
@@ -98,6 +130,7 @@ impl UsageRecordHook {
             },
             duration_ms: self.started_at.elapsed().as_millis() as u64,
             status: status.to_string(),
+            rounds: rounds.max(1),
         };
         if let Some(r) = &self.recorder {
             r.record(&rec);

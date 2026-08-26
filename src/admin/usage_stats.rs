@@ -49,6 +49,15 @@ pub struct UsageRecord {
     pub duration_ms: u64,
     /// "success" 或 "error"
     pub status: String,
+    /// 上游调用轮数。websearch 循环每轮都把**完整上下文**重发一次，
+    /// 而缓存对 GPT 不打折 —— 轮数直接等比放大我方成本。
+    /// 不落盘就无法量化，也就无法判断"降低轮数"值不值得做。缺省 1（单轮）。
+    #[serde(default = "default_rounds")]
+    pub rounds: u32,
+}
+
+fn default_rounds() -> u32 {
+    1
 }
 
 /// 按天 rotate 的 JSONL writer
@@ -1826,6 +1835,7 @@ mod tests {
             credits,
             duration_ms: 10,
             status: "success".to_string(),
+            rounds: 1,
         };
         agg.ingest(&rec(1, 100.0)); // 只配单价
         agg.ingest(&rec(2, 100.0)); // 只配折扣
@@ -1874,6 +1884,7 @@ mod tests {
             credits: 10.0,
             duration_ms: 10,
             status: "success".to_string(),
+            rounds: 1,
         });
         let pricing = crate::common::pricing::PricingTable::default();
         let window = StatsQueryWindow::preset(Range::Last24h, StatsGranularity::Hour);
@@ -1901,6 +1912,7 @@ mod tests {
             credits: 1.0,
             duration_ms: 10,
             status: "success".to_string(),
+            rounds: 1,
         };
         agg.ingest(&mk("claude-opus-4-8")); // $5/M input
         agg.ingest(&mk("claude-haiku-4-5")); // $1/M input
@@ -1931,6 +1943,7 @@ mod tests {
             credits: 0.05,
             duration_ms: 1500,
             status: "success".to_string(),
+            rounds: 1,
         };
         agg.ingest(&rec);
         agg.ingest(&rec);
@@ -1970,6 +1983,7 @@ mod tests {
             credits: 0.01,
             duration_ms: 100,
             status: "success".to_string(),
+            rounds: 1,
         };
         let rec_b = UsageRecord {
             ts: now,
@@ -1983,6 +1997,7 @@ mod tests {
             credits: 0.02,
             duration_ms: 200,
             status: "error".to_string(),
+            rounds: 1,
         };
         agg.ingest(&rec_a);
         agg.ingest(&rec_b);
@@ -2038,6 +2053,7 @@ mod tests {
             credits: 0.01,
             duration_ms: 100,
             status: "success".to_string(),
+            rounds: 1,
         };
         let rec_today = UsageRecord {
             ts: today_noon,
@@ -2051,6 +2067,7 @@ mod tests {
             credits: 0.02,
             duration_ms: 100,
             status: "success".to_string(),
+            rounds: 1,
         };
         agg.ingest(&rec_yesterday);
         agg.ingest(&rec_today);
@@ -2101,6 +2118,7 @@ mod tests {
             credits: 0.0,
             duration_ms: 100,
             status: "error".to_string(),
+            rounds: 1,
         };
         agg.ingest(&rec);
         let ov = agg.overview();

@@ -755,9 +755,10 @@ fn record_aggregated_usage(
     usage: TokenUsage,
     credits: f64,
     status: &str,
+    rounds: u32,
 ) {
     let usage = usage.sanitized();
-    hook.record(
+    hook.record_with_rounds(
         credential_id,
         usage.uncached_input_tokens,
         usage.output_tokens,
@@ -765,6 +766,7 @@ fn record_aggregated_usage(
         usage.cache_read_input_tokens,
         credits,
         status,
+        rounds,
     );
 }
 
@@ -820,7 +822,11 @@ pub(super) async fn run_web_search_loop(
     let mut latest_metering: Option<MeteringEvent> = None;
     let mut all_thinking = String::new();
 
+    // 实际用掉的轮数。websearch 每轮重发完整上下文，而缓存对 GPT 不打折，
+    // 所以轮数直接等比放大我方成本 —— 落盘才能量化"降轮数值不值得做"。
+    let mut rounds_used: u32 = 1;
     for round_idx in 0..=MAX_WEB_SEARCH_ROUNDS {
+        rounds_used = (round_idx as u32).saturating_add(1);
         let mut empty_retries = 0usize;
         let round = loop {
             let round_fallback_input_tokens = token::count_all_tokens(
@@ -855,6 +861,7 @@ pub(super) async fn run_web_search_loop(
                         total_token_usage,
                         total_credits,
                         "error",
+                        (round_idx as u32).saturating_add(1),
                     );
                     finalize_aggregated_trace(
                         tracer.as_ref(),
@@ -897,6 +904,7 @@ pub(super) async fn run_web_search_loop(
                         total_token_usage,
                         total_credits,
                         "error",
+                        (round_idx as u32).saturating_add(1),
                     );
                     finalize_aggregated_trace(
                         tracer.as_ref(),
@@ -973,6 +981,7 @@ pub(super) async fn run_web_search_loop(
                             total_token_usage,
                             total_credits,
                             "error",
+                            (round_idx as u32).saturating_add(1),
                         );
                         finalize_aggregated_trace(
                             tracer.as_ref(),
@@ -1037,6 +1046,7 @@ pub(super) async fn run_web_search_loop(
                             total_token_usage,
                             total_credits,
                             "error",
+                            (round_idx as u32).saturating_add(1),
                         );
                         finalize_aggregated_trace(
                             tracer.as_ref(),
@@ -1078,6 +1088,7 @@ pub(super) async fn run_web_search_loop(
             final_usage,
             total_credits,
             "success",
+            rounds_used,
         );
         finalize_aggregated_trace(
             tracer.as_ref(),
@@ -1115,6 +1126,7 @@ pub(super) async fn run_web_search_loop(
         total_token_usage,
         total_credits,
         "error",
+        rounds_used,
     );
     finalize_aggregated_trace(
         tracer.as_ref(),
