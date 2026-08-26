@@ -331,8 +331,12 @@ pub struct PricingAdvice {
     pub breakeven_discount: Option<f64>,
     /// 当前毛利率（按当前折扣算）
     pub current_margin_rate: Option<f64>,
-    /// 达到目标毛利率所需的折扣系数
+    /// 达到目标毛利率所需的折扣系数；超过 1.0 时已被夹到 1.0
     pub recommended_discount: Option<f64>,
+    /// 目标毛利率在该客户的成本结构下是否根本达不到
+    pub target_unreachable: bool,
+    /// 折扣取上限 1.0 时能拿到的最高毛利率（即这个客户的天花板）
+    pub max_achievable_margin_rate: Option<f64>,
     /// 按建议折扣计算的应收
     pub recommended_receivable_usd: Option<f64>,
     /// 相对当前应收的变化额
@@ -345,6 +349,9 @@ pub struct PricingAdvice {
 ///
 /// 无法给建议的情况一律返回 `recommended_discount: None` 并在 `verdict` 说明原因，
 /// 绝不用猜的值填上——定价建议被当成结论直接套用的风险太高。
+/// 折扣系数上限。收超过官方牌价就不叫折扣了，客户直接去厂商买更便宜。
+pub const MAX_BILLING_DISCOUNT: f64 = 1.0;
+
 pub fn pricing_advice(rows: &[KeyBillingRow], target_margin_rate: f64) -> Vec<PricingAdvice> {
     // 目标毛利率必须在 [0, 1)：等于 1 意味着成本为零，反解会除零炸上天
     let m = target_margin_rate.clamp(0.0, 0.95);
@@ -352,14 +359,27 @@ pub fn pricing_advice(rows: &[KeyBillingRow], target_margin_rate: f64) -> Vec<Pr
         .map(|r| {
             let official = r.official_usd.filter(|o| *o > 0.0);
             let breakeven = official.map(|o| r.credit_usd / o);
-            let recommended = breakeven.map(|b| b / (1.0 - m));
+            // 折扣系数的物理上限是 1.0：应收 = 官方牌价 × 折扣，收超过官方牌价
+            // 就不叫折扣了，客户直接去厂商买更便宜。所以目标毛利率高到反解出
+            // >1.0 时，那个目标**在这个客户的成本结构下根本达不到**，
+            // 必须明说而不是给一个填不进去的数。
+            let raw = breakeven.map(|b| b / (1.0 - m));
+            let unreachable = raw.is_some_and(|d| d > MAX_BILLING_DISCOUNT);
+            let recommended = raw.map(|d| d.min(MAX_BILLING_DISCOUNT));
             let rec_receivable = official.zip(recommended).map(|(o, d)| o * d);
+            // 按上限折扣能拿到的最高毛利率——够不到目标时告诉运营天花板在哪
+            let max_margin = official.map(|o| {
+                let recv = o * MAX_BILLING_DISCOUNT;
+                if recv > 0.0 { (recv - r.credit_usd) / recv } else { 0.0 }
+            });
             let current_margin = r
                 .receivable_usd
                 .filter(|v| *v > 0.0)
                 .map(|v| (v - r.credit_usd) / v);
 
-            let verdict = match (official, r.billing_discount, r.price_per_credit) {
+            let verdict = if unreachable {
+                "🔴 该客户成本结构下达不到这个毛利率，已按上限 1.0 折算"
+            } else { match (official, r.billing_discount, r.price_per_credit) {
                 (None, _, _) => "该 Key 的模型全部未配官方价，算不出保本线",
                 (_, None, None) => "未设置对客定价，先定价才能谈毛利",
                 (_, _, Some(_)) => "走单价口径，毛利与折扣无关，建议仅供参考",
@@ -373,7 +393,7 @@ pub fn pricing_advice(rows: &[KeyBillingRow], target_margin_rate: f64) -> Vec<Pr
                         "已达到或超过目标毛利率"
                     }
                 }
-            };
+            } };
 
             PricingAdvice {
                 key_id: r.key_id,
@@ -385,6 +405,8 @@ pub fn pricing_advice(rows: &[KeyBillingRow], target_margin_rate: f64) -> Vec<Pr
                 breakeven_discount: breakeven,
                 current_margin_rate: current_margin,
                 recommended_discount: recommended,
+                target_unreachable: unreachable,
+                max_achievable_margin_rate: max_margin,
                 recommended_receivable_usd: rec_receivable,
                 receivable_delta_usd: rec_receivable
                     .zip(r.receivable_usd)
