@@ -2154,6 +2154,15 @@ pub async fn pricing_advice(
         .get("targetMargin")
         .and_then(|v| v.parse::<f64>().ok())
         .unwrap_or(0.5);
+    // raiseOnly：只对**低于**目标毛利率的客户给出调整建议。
+    //
+    // 默认开启，因为"目标 50%"绝大多数时候的意思是"至少 50%"，而不是"正好 50%"。
+    // 实测：把当前四个客户统一压到 50%，一个月少收约 $850——其中三家现在是
+    // 60%~75% 毛利。把已经赚钱的客户按目标降价，是这个工具最容易造成的损失。
+    let raise_only = params
+        .get("raiseOnly")
+        .map(|v| v != "false")
+        .unwrap_or(true);
     let (start, end) = match params.get("month") {
         Some(m) => match month_dates(m) {
             Ok(v) => v,
@@ -2184,16 +2193,49 @@ pub async fn pricing_advice(
     );
     let advice = crate::admin::usage_stats::pricing_advice(&rows, target);
 
+    // 汇总口径变化，让"按目标调整"的总代价一眼可见
+    let mut cur_total = 0.0f64;
+    let mut new_total = 0.0f64;
     let items: Vec<serde_json::Value> = advice
         .iter()
         .filter(|a| a.cost_usd > 0.0)
         .map(|a| {
+            let below_target = match (a.current_discount, a.recommended_discount) {
+                (Some(cur), Some(rec)) => cur < rec,
+                // 还没定价的一律算"低于目标"，需要处理
+                (None, Some(_)) => true,
+                _ => false,
+            };
+            let suppressed = raise_only && !below_target;
+            let cur_recv = a
+                .current_price_per_credit
+                .is_none()
+                .then_some(a.official_usd.zip(a.current_discount).map(|(o, d)| o * d))
+                .flatten();
+            if let Some(c) = cur_recv {
+                cur_total += c;
+                new_total += if suppressed {
+                    c
+                } else {
+                    a.recommended_receivable_usd.unwrap_or(c)
+                };
+            }
             let mut v = serde_json::to_value(a).unwrap_or_default();
             if let Some(o) = v.as_object_mut() {
                 o.insert(
                     "name".into(),
                     serde_json::json!(name_map.get(&a.key_id).cloned()),
                 );
+                o.insert("belowTarget".into(), serde_json::json!(below_target));
+                // raiseOnly 下，已达标的客户明确标出"建议不动"，而不是把降价建议
+                // 混在同一列里等人自己分辨
+                o.insert("actionSuggested".into(), serde_json::json!(!suppressed));
+                if suppressed {
+                    o.insert(
+                        "verdict".into(),
+                        serde_json::json!("已超过目标毛利率，建议维持不动"),
+                    );
+                }
             }
             v
         })
@@ -2202,7 +2244,13 @@ pub async fn pricing_advice(
     Json(serde_json::json!({
         "month": params.get("month"),
         "targetMarginRate": target,
+        "raiseOnly": raise_only,
         "keys": items,
+        "impact": {
+            "currentReceivableUsd": cur_total,
+            "afterAdviceReceivableUsd": new_total,
+            "deltaUsd": new_total - cur_total,
+        },
         "note": "保本线 = 成本 ÷ 官方牌价，由该客户的模型组合决定；建议折扣 = 保本线 ÷ (1 − 目标毛利率)。官方牌价按 token 明细换算，而 token 拆分在上游不下发时由本地估算补齐——建议值应当留出余量，不要贴着保本线定价。",
     }))
     .into_response()
