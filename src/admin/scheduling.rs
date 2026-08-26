@@ -693,6 +693,38 @@ mod tests {
         assert_eq!(ch.first().map(|c| c.to), Some(THROUGHPUT_FRONT));
     }
 
+    /// 高并发模式下，用量全部低于阈值时**每一个**号都该被拉到前排。
+    ///
+    /// 这条对应一个真实事故：磁盘上 profile 已经是 highConcurrency、7 个号
+    /// 用量全在 95% 以下，跑一轮却产生 0 条变更 —— 因为运行时读的还是启动快照。
+    /// 配置持久化与运行时生效是两件事，少做后者就是"改了没反应，重启才生效"。
+    #[test]
+    fn high_concurrency_pulls_every_healthy_credential_to_the_front() {
+        let cfg = on(SchedulingProfile::HighConcurrency);
+        // 复刻事故现场的优先级分布
+        let creds = vec![
+            cred(6, 40, Some(75.0)),
+            cred(2, 40, Some(49.1)),
+            cred(10, 48, Some(9.5)),
+            cred(5, 49, Some(81.8)),
+            cred(7, 49, Some(18.8)),
+            cred(3, 51, Some(88.7)),
+            cred(4, 55, Some(93.0)),
+        ];
+        let ch = plan_changes(&cfg, &creds);
+        // 已经在 40 的两个不产生变更，其余五个都该被拉到 40
+        assert_eq!(ch.len(), 5, "应有 5 条变更，实得 {:?}", ch);
+        for c in &ch {
+            assert_eq!(
+                c.to, THROUGHPUT_FRONT,
+                "凭据 #{} 未被拉到前排（{}）",
+                c.id, c.to
+            );
+        }
+        // 93% 的那个也在前排 —— 高并发不减速，这是与 Throughput 的分野
+        assert!(ch.iter().any(|c| c.id == 4 && c.to == THROUGHPUT_FRONT));
+    }
+
     #[test]
     fn disabled_config_plans_nothing() {
         let cfg = SchedulingConfig::default(); // enabled = false

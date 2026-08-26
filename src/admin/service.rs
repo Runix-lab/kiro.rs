@@ -1161,8 +1161,11 @@ impl AdminService {
         &self,
         cfg: crate::admin::scheduling::SchedulingConfig,
     ) -> Result<(), AdminServiceError> {
+        // 先落盘（重启后仍生效），再更新运行时（当场生效）。
+        // 少了后半步就是"改了没反应，重启才生效"——这个 bug 真发生过。
         let to_write = cfg.clone();
         self.update_config_file(move |c| c.scheduling = to_write.clone());
+        self.token_manager.set_scheduling_runtime(cfg);
         Ok(())
     }
 
@@ -1173,7 +1176,8 @@ impl AdminService {
 
     /// 当前调度配置（从 config.json 读取，运行时可改）
     pub fn scheduling_config(&self) -> crate::admin::scheduling::SchedulingConfig {
-        self.token_manager.config().scheduling.clone()
+        // 读运行时值而不是启动快照：改完要重启才生效的话，整个调度界面就是摆设
+        self.token_manager.scheduling_config()
     }
 
     /// 启动余额后台刷新调度器

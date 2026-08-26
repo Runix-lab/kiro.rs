@@ -1165,6 +1165,14 @@ pub struct MultiTokenManager {
     /// 负载均衡模式（运行时可修改）
     load_balancing_mode: Mutex<String>,
     /// 账号级 429 风控故障转移开关（运行时可修改）
+    /// 调度配置（运行时可修改）。
+    ///
+    /// **必须放在运行时容器里，不能直接读 `self.config.scheduling`。**
+    /// `update_config_file` 只做「读文件 → 改 → 写回」，从不更新进程内存里的
+    /// `config`，所以从 `config` 读的字段改完要重启才生效——整个调度界面因此
+    /// 静默失效过：磁盘上 profile 已经是 highConcurrency，跑一轮却 0 条变更，
+    /// 因为进程内还是启动时的 manual。
+    scheduling: Mutex<crate::admin::scheduling::SchedulingConfig>,
     account_throttle_failover: AtomicBool,
     /// 账号级风控冷却时长（秒，运行时可修改）
     account_throttle_cooldown_secs: AtomicU64,
@@ -1395,6 +1403,8 @@ impl MultiTokenManager {
             .unwrap_or(0);
 
         let load_balancing_mode = config.load_balancing_mode.clone();
+        // 启动时快照一份调度配置进运行时容器；之后由 set_scheduling_runtime 更新
+        let scheduling_snapshot = config.scheduling.clone();
         let throttle_failover = config.account_throttle_failover;
         let throttle_cooldown_secs = config.account_throttle_cooldown_secs;
         let rpm_limit_enabled = config.account_rpm_limit_enabled;
@@ -1416,6 +1426,7 @@ impl MultiTokenManager {
             runtime_config_update_lock: Mutex::new(()),
             is_multiple_format: AtomicBool::new(is_multiple_format),
             load_balancing_mode: Mutex::new(load_balancing_mode),
+            scheduling: Mutex::new(scheduling_snapshot),
             account_throttle_failover: AtomicBool::new(throttle_failover),
             account_throttle_cooldown_secs: AtomicU64::new(throttle_cooldown_secs),
             account_rpm_limit_enabled: AtomicBool::new(rpm_limit_enabled),
@@ -4370,12 +4381,22 @@ impl MultiTokenManager {
     /// 常态路径会在同一个号上退避重试，把重试预算烧光也不碰第二个号。
     pub fn throughput_mode_active(&self) -> bool {
         use crate::admin::scheduling::SchedulingProfile;
-        let sched = &self.config.scheduling;
+        let sched = self.scheduling.lock();
         sched.enabled
             && matches!(
                 sched.profile,
                 SchedulingProfile::Throughput | SchedulingProfile::HighConcurrency
             )
+    }
+
+    /// 当前生效的调度配置（运行时值，不是启动快照）
+    pub fn scheduling_config(&self) -> crate::admin::scheduling::SchedulingConfig {
+        self.scheduling.lock().clone()
+    }
+
+    /// 更新运行时调度配置。**持久化由调用方负责**——这里只管让它当场生效。
+    pub fn set_scheduling_runtime(&self, cfg: crate::admin::scheduling::SchedulingConfig) {
+        *self.scheduling.lock() = cfg;
     }
 
     /// 吞吐模式下普通限流的冷却时长：远短于账号级风控的默认 30 分钟。
