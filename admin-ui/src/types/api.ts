@@ -813,13 +813,23 @@ export interface MinuteSample {
 // ============ 调度策略 ============
 
 /**
- * 调度取向：决定「按取向铺排」这条自动规则怎么排优先级。
+ * 调度取向：决定「按取向铺排」这条自动规则怎么排优先级，以及一批运行时设置
+ * （负载均衡模式 / RPM 上限 / 限流冷却 / 429 是否换号）该配成什么样。
  * - manual：只运行额度守卫 + 首选层保护两条规则，手工设置的优先级不受影响
- * - throughput：把所有凭据拉平到 50，配合均衡负载模式打散流量
+ * - throughput：按 80%/95% 分三档（前排/中间/溢出），接近耗尽的号提前减速
+ * - highConcurrency：一条线两档，95% 以下全部并列跑满，击穿才退后排——冲峰值用
  * - conserve：剩余额度最多的排最前，几个账号一起匀速消耗
  * - drain：剩余额度最少的排最前，优先烧完这部分再轮到额度充足的账号
+ *
+ * 具体每档的推荐数值不在前端维护，见 `SchedulingProfilePreset` ——
+ * 单一事实源在后端，前端只负责渲染。
  */
-export type SchedulingProfile = 'manual' | 'throughput' | 'conserve' | 'drain'
+export type SchedulingProfile =
+  | 'manual'
+  | 'throughput'
+  | 'highConcurrency'
+  | 'conserve'
+  | 'drain'
 
 /** GET/PUT /api/admin/config/scheduling 的配置体 */
 export interface SchedulingConfig {
@@ -831,8 +841,124 @@ export interface SchedulingConfig {
   demoteTo: number
   /** 首选层保护：至少保留几个凭据共享最小（最优先）优先级值 */
   minTopTier: number
+  /** 吞吐模式专用：用量低于该百分比的凭据进前排 */
+  throughputBurnBelowPct: number
+  /** 吞吐模式专用：用量达到该百分比的凭据退到溢出储备档 */
+  throughputReserveAtPct: number
   /** 调度取向 */
   profile: SchedulingProfile
+}
+
+/**
+ * GET /api/admin/config/scheduling/presets 里的一档推荐配置。
+ *
+ * 单一事实源：切换调度取向时，界面上所有联动的阈值与运行时设置都从这里取值，
+ * 不在前端另外硬编码一套——两边迟早会对不上，且对不上时不会报错，只会表现为
+ * 「界面显示的和实际路由行为不一致」。
+ */
+export interface SchedulingProfilePreset {
+  profile: SchedulingProfile
+  /** 界面上显示的名字 */
+  label: string
+  /** 一句话说明这个取向在干什么 */
+  summary: string
+  demoteThresholdPct: number
+  demoteTo: number
+  minTopTier: number
+  throughputBurnBelowPct: number
+  throughputReserveAtPct: number
+  /** 这个取向要求的负载均衡模式（priority 是粘滞的，吞吐类必须 balanced） */
+  loadBalancingMode: 'priority' | 'balanced'
+  /** 是否启用单账号 RPM 上限 */
+  accountRpmLimitEnabled: boolean
+  /** 限流冷却秒数 */
+  throttleCooldownSecs: number
+  /** 普通 429 是否换号（而不是原地重试） */
+  spillOnRateLimit: boolean
+  /** 给运营看的注意事项，每一条都是真实的代价或风险 */
+  caveat: string
+}
+
+/** GET /api/admin/config/scheduling/presets 的响应 */
+export interface SchedulingPresetsResponse {
+  presets: SchedulingProfilePreset[]
+  note: string
+}
+
+/** 一键应用（或恢复默认）里单条设置的应用结果 */
+export interface MaxThroughputAppliedItem {
+  setting: string
+  value: unknown
+  /** dryRun 探测时为 true；真正执行后这个字段不存在 */
+  dryRun?: boolean
+}
+
+/** 一键应用（或恢复默认）里单条设置的失败结果 */
+export interface MaxThroughputFailedItem {
+  setting: string
+  value: unknown
+  error: string
+}
+
+/** POST /api/admin/config/max-throughput 的请求参数 */
+export interface MaxThroughputParams {
+  /** 传 'highConcurrency' 走两档；不传走三档吞吐 */
+  profile?: 'highConcurrency'
+  /** 目标 RPM，按企业凭据数均摊（含 50% 余量） */
+  targetRpm?: number
+  /** 只回报会改什么，不真改 */
+  dryRun?: boolean
+  /** 回退到风险控制默认值，忽略 profile / targetRpm */
+  restore?: boolean
+}
+
+/** POST /api/admin/config/max-throughput 的响应 */
+export interface MaxThroughputResult {
+  mode: 'maxThroughput' | 'riskControl'
+  dryRun: boolean
+  applied: MaxThroughputAppliedItem[]
+  failed: MaxThroughputFailedItem[]
+  priorityChanges: number
+  note: string
+}
+
+/** GET /api/admin/config/scheduling/throughput-estimate 里的预估数值 */
+export interface ThroughputEstimate {
+  /** 前排档（尽情烧）凭据数 */
+  frontTier: number
+  /** 中间档凭据数 */
+  midTier: number
+  /** 溢出储备档凭据数 */
+  reserveTier: number
+  /** 预估并发上限 = 参与主力的凭据数 × 单凭据实测并发 */
+  estimatedConcurrency: number
+  /** 当前并发上限（按当前实际参与主力的凭据数算） */
+  currentConcurrency: number
+  /** 相对当前的提升倍数 */
+  concurrencyGain: number
+  /** 前排 + 中间档剩余额度合计 */
+  usableCredits: number
+  /** 按当前烧速还能撑多少小时；无烧速数据为 null */
+  runwayHours: number | null
+  /** 距离额度重置还有多少小时 */
+  hoursToReset: number | null
+  /** 可持续 TPM：可用额度 ÷ 距重置时间换算成 token */
+  sustainableTpm: number | null
+  /** 人话说明，直接显示给运营——断供缺口/溢出档数量都在这里 */
+  notes: string[]
+}
+
+/** GET /api/admin/config/scheduling/throughput-estimate 的响应 */
+export interface ThroughputEstimateResponse {
+  estimate: ThroughputEstimate
+  observations: {
+    perCredentialConcurrency: number
+    tokensPerCredit: number
+    creditsPerHour: number
+    hoursToReset: number
+  }
+  /** 口径说明：并发是能力上限不是保证值，可持续 TPM 由额度决定 */
+  caveat: string
 }
 
 /** 单条调度变更的原因 */

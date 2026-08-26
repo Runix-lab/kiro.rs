@@ -38,6 +38,10 @@ import type {
   UpdateAdminKeyRequest,
   SchedulingConfig,
   SchedulingRunResult,
+  SchedulingPresetsResponse,
+  MaxThroughputParams,
+  MaxThroughputResult,
+  ThroughputEstimateResponse,
 } from '@/types/api'
 
 // 创建 axios 实例
@@ -541,6 +545,37 @@ export async function setSchedulingConfig(
 // 立即执行一轮调度
 export async function runScheduling(): Promise<SchedulingRunResult> {
   const { data } = await api.post<SchedulingRunResult>('/config/scheduling/run')
+  return data
+}
+
+// 获取各调度取向的推荐配置（单一事实源，前端不硬编码具体数值）
+export async function getSchedulingPresets(): Promise<SchedulingPresetsResponse> {
+  const { data } = await api.get<SchedulingPresetsResponse>('/config/scheduling/presets')
+  return data
+}
+
+// 吞吐模式开启前的预估：能提到多少并发、可用额度还能撑多久
+export async function getThroughputEstimate(): Promise<ThroughputEstimateResponse> {
+  const { data } = await api.get<ThroughputEstimateResponse>(
+    '/config/scheduling/throughput-estimate',
+  )
+  return data
+}
+
+// 一键应用整套配置（或 restore=true 时回退到风险控制默认值）。
+// 除调度阈值外，还会一并改动负载均衡模式 / RPM 上限 / 限流冷却等运行时设置——
+// 单独 PUT /config/scheduling 覆盖不到这些字段。
+export async function applyMaxThroughput(
+  params: MaxThroughputParams,
+): Promise<MaxThroughputResult> {
+  const { data } = await api.post<MaxThroughputResult>('/config/max-throughput', null, {
+    params: {
+      profile: params.profile,
+      targetRpm: params.targetRpm,
+      dryRun: params.dryRun ? 'true' : undefined,
+      restore: params.restore ? 'true' : undefined,
+    },
+  })
   return data
 }
 

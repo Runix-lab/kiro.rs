@@ -121,6 +121,120 @@ pub enum SchedulingProfile {
     HighConcurrency,
 }
 
+/// 某个调度取向的推荐配置。
+///
+/// 存在的意义是**单一事实源**：界面上切换取向时下面的阈值要跟着联动，
+/// 如果这套推荐值在前端硬编码一份、后端逻辑再写一份，两边迟早对不上，
+/// 而且对不上的时候没有任何报错——只是路由行为和界面显示不一致。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProfilePreset {
+    pub profile: SchedulingProfile,
+    /// 界面上显示的名字
+    pub label: &'static str,
+    /// 一句话说明这个取向在干什么
+    pub summary: &'static str,
+    pub demote_threshold_pct: f64,
+    pub demote_to: u32,
+    pub min_top_tier: usize,
+    pub throughput_burn_below_pct: f64,
+    pub throughput_reserve_at_pct: f64,
+    /// 这个取向要求的负载均衡模式（priority 模式是粘滞的，吞吐类必须 balanced）
+    pub load_balancing_mode: &'static str,
+    /// 是否启用我们自己的单账号 RPM 上限
+    pub account_rpm_limit_enabled: bool,
+    /// 限流冷却秒数
+    pub throttle_cooldown_secs: u64,
+    /// 普通 429 是否换号（而不是在同一个号上重试）
+    pub spill_on_rate_limit: bool,
+    /// 给运营看的注意事项
+    pub caveat: &'static str,
+}
+
+/// 全部取向的推荐配置。界面直接渲染这个列表。
+pub fn profile_presets() -> Vec<ProfilePreset> {
+    vec![
+        ProfilePreset {
+            profile: SchedulingProfile::Manual,
+            label: "手动",
+            summary: "只跑额度守卫与首选层保护，人工设的优先级完全保留",
+            demote_threshold_pct: 95.0,
+            demote_to: 60,
+            min_top_tier: 2,
+            throughput_burn_below_pct: 80.0,
+            throughput_reserve_at_pct: 95.0,
+            load_balancing_mode: "priority",
+            account_rpm_limit_enabled: true,
+            throttle_cooldown_secs: 1800,
+            spill_on_rate_limit: false,
+            caveat: "priority 是粘滞的：流量会集中在最优先那一个号上，直到它出错才换。",
+        },
+        ProfilePreset {
+            profile: SchedulingProfile::Throughput,
+            label: "提升吞吐",
+            summary: "按 80%/95% 分三档，接近耗尽的号提前减速，击穿的退到溢出档",
+            demote_threshold_pct: 95.0,
+            demote_to: 60,
+            min_top_tier: 2,
+            throughput_burn_below_pct: 80.0,
+            throughput_reserve_at_pct: 95.0,
+            load_balancing_mode: "balanced",
+            account_rpm_limit_enabled: false,
+            throttle_cooldown_secs: 45,
+            spill_on_rate_limit: true,
+            caveat: "不增加月度额度总量，只会更快烧完。开之前先看吞吐预估里的断供缺口。",
+        },
+        ProfilePreset {
+            profile: SchedulingProfile::HighConcurrency,
+            label: "高并发",
+            summary: "一条线两档：95% 以下全部并列跑满，击穿才退后排接溢出",
+            demote_threshold_pct: 95.0,
+            demote_to: 70,
+            min_top_tier: 2,
+            throughput_burn_below_pct: 95.0, // 与储备阈值同值 = 没有中间档
+            throughput_reserve_at_pct: 95.0,
+            load_balancing_mode: "balanced",
+            account_rpm_limit_enabled: false,
+            throttle_cooldown_secs: 45,
+            spill_on_rate_limit: true,
+            caveat: "不给任何号减速，一直用到击穿。冲峰值用，不适合常态开着。",
+        },
+        ProfilePreset {
+            profile: SchedulingProfile::Conserve,
+            label: "节约额度",
+            summary: "余额多的排前面，让各号见底时间趋于一致，避免某个号先饿死",
+            // 更早降级：省额度的取向就是别把任何一个号用到贴边
+            demote_threshold_pct: 85.0,
+            demote_to: 70,
+            min_top_tier: 2,
+            throughput_burn_below_pct: 80.0,
+            throughput_reserve_at_pct: 95.0,
+            load_balancing_mode: "balanced",
+            // 留着 RPM 上限：省额度时不需要冲峰值，上限能挡住跑飞
+            account_rpm_limit_enabled: true,
+            throttle_cooldown_secs: 1800,
+            spill_on_rate_limit: false,
+            caveat: "限流时不换号、冷却 30 分钟——省额度的代价是失败率会高一些。",
+        },
+        ProfilePreset {
+            profile: SchedulingProfile::Drain,
+            label: "优先烧完",
+            summary: "余额少的排前面，月末先把要作废的零头用掉",
+            // 几乎不降级：目的就是把零头烧干净
+            demote_threshold_pct: 99.0,
+            demote_to: 60,
+            min_top_tier: 2,
+            throughput_burn_below_pct: 80.0,
+            throughput_reserve_at_pct: 99.0,
+            load_balancing_mode: "balanced",
+            account_rpm_limit_enabled: true,
+            throttle_cooldown_secs: 300,
+            spill_on_rate_limit: true,
+            caveat: "适合额度重置前几天。平时开着会让余额少的号先挂，可用池提前缩小。",
+        },
+    ]
+}
+
 /// 一个凭据参与调度决策所需的输入。
 #[derive(Debug, Clone, PartialEq)]
 pub struct CredentialSchedulingInput {

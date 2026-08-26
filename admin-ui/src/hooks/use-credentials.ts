@@ -29,12 +29,16 @@ import {
   getSchedulingConfig,
   setSchedulingConfig,
   runScheduling,
+  getSchedulingPresets,
+  getThroughputEstimate,
+  applyMaxThroughput,
 } from '@/api/credentials'
 import type {
   AddCredentialRequest,
   UpdateCredentialRequest,
   UpdateRefreshTokenRequest,
   SchedulingConfig,
+  MaxThroughputParams,
 } from '@/types/api'
 
 // 查询凭据列表
@@ -332,6 +336,43 @@ export function useRunScheduling() {
     mutationFn: () => runScheduling(),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['credentials'] })
+    },
+  })
+}
+
+// 各调度取向的推荐配置：单一事实源在后端，档位定义只随发版变化，不需要频繁刷新
+export function useSchedulingPresets() {
+  return useQuery({
+    queryKey: ['schedulingPresets'],
+    queryFn: getSchedulingPresets,
+    staleTime: 5 * 60 * 1000,
+  })
+}
+
+// 吞吐预估：只在操作员正看着「提升吞吐 / 高并发」取向时才需要，按需拉取
+export function useThroughputEstimate(enabled: boolean) {
+  return useQuery({
+    queryKey: ['throughputEstimate'],
+    queryFn: getThroughputEstimate,
+    enabled,
+    refetchInterval: enabled ? 30000 : false,
+  })
+}
+
+// 一键应用整套配置：会改动优先级 + 负载均衡模式 + RPM 上限 + 限流冷却等一整批运行时设置，
+// 成功后要把所有相关查询都失效，否则界面会显示改之前的值
+export function useApplyMaxThroughput() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: (params: MaxThroughputParams) => applyMaxThroughput(params),
+    onSuccess: (result) => {
+      if (result.dryRun) return
+      queryClient.invalidateQueries({ queryKey: ['schedulingConfig'] })
+      queryClient.invalidateQueries({ queryKey: ['loadBalancingMode'] })
+      queryClient.invalidateQueries({ queryKey: ['accountThrottleConfig'] })
+      queryClient.invalidateQueries({ queryKey: ['accountRpmLimitConfig'] })
+      queryClient.invalidateQueries({ queryKey: ['credentials'] })
+      queryClient.invalidateQueries({ queryKey: ['throughputEstimate'] })
     },
   })
 }

@@ -2331,6 +2331,19 @@ pub async fn pricing_advice(
     .into_response()
 }
 
+/// GET /api/admin/config/scheduling/presets
+///
+/// 各调度取向的推荐配置。界面切换取向时按这个联动下面的阈值。
+/// 放在后端是为了**单一事实源** —— 前端硬编码一套、后端逻辑另一套的话，
+/// 对不上时不会报错，只会表现为"界面显示的和实际路由行为不一致"。
+pub async fn scheduling_presets() -> axum::response::Response {
+    Json(serde_json::json!({
+        "presets": crate::admin::scheduling::profile_presets(),
+        "note": "切换取向会同时改动调度阈值与运行时设置（负载均衡模式 / RPM 上限 / 限流冷却 / 429 是否换号）。这些不是各自独立的开关——少调一个，整套取向就不成立。",
+    }))
+    .into_response()
+}
+
 /// GET /api/admin/config/scheduling/throughput-estimate
 ///
 /// 开启吞吐模式前先看这个：能提到多少并发、可用额度还能撑多久、
