@@ -2049,15 +2049,27 @@ pub async fn set_max_throughput(
     Query(params): Query<std::collections::HashMap<String, String>>,
 ) -> axum::response::Response {
     let restore = params.get("restore").map(|v| v == "true").unwrap_or(false);
+    // dryRun：只回报会改什么，不真改。切换吞吐模式会改变生产路由，
+    // 上线前必须能在不动生产的前提下验证这个接口本身是对的。
+    let dry_run = params.get("dryRun").map(|v| v == "true").unwrap_or(false);
     let mut applied: Vec<serde_json::Value> = Vec::new();
     let mut failed: Vec<serde_json::Value> = Vec::new();
 
-    let mut step = |name: &str, want: serde_json::Value, r: anyhow::Result<()>| match r {
-        Ok(()) => applied.push(serde_json::json!({ "setting": name, "value": want })),
-        Err(e) => failed.push(serde_json::json!({
+    let mut step = |name: &str, want: serde_json::Value, r: Option<anyhow::Result<()>>| match r {
+        None => applied.push(serde_json::json!({
+            "setting": name, "value": want, "dryRun": true
+        })),
+        Some(Ok(())) => applied.push(serde_json::json!({ "setting": name, "value": want })),
+        Some(Err(e)) => failed.push(serde_json::json!({
             "setting": name, "value": want, "error": e.to_string()
         })),
     };
+    // dry-run 时把动作包成 None，一个分支都不会真的执行
+    macro_rules! act {
+        ($e:expr) => {
+            if dry_run { None } else { Some($e) }
+        };
+    }
 
     let tm = state.service.token_manager();
 
@@ -2065,43 +2077,43 @@ pub async fn set_max_throughput(
         step(
             "loadBalancingMode",
             serde_json::json!("balanced"),
-            tm.set_load_balancing_mode("balanced".to_string()),
+            act!(tm.set_load_balancing_mode("balanced".to_string())),
         );
         step(
             "accountRpmLimitEnabled",
             serde_json::json!(false),
-            tm.set_account_rpm_limit_config(Some(false), None),
+            act!(tm.set_account_rpm_limit_config(Some(false), None)),
         );
         step(
             "accountThrottleCooldownSecs",
             serde_json::json!(1800),
-            tm.set_account_throttle_config(Some(true), Some(1800)),
+            act!(tm.set_account_throttle_config(Some(true), Some(1800))),
         );
     } else {
         // ① 粘滞选号会让"拉平优先级"完全失效，必须先切 balanced
         step(
             "loadBalancingMode",
             serde_json::json!("balanced"),
-            tm.set_load_balancing_mode("balanced".to_string()),
+            act!(tm.set_load_balancing_mode("balanced".to_string())),
         );
         // ② 我们自己的 RPM 天花板会先于上游限流触发，冲吞吐时必须关掉
         step(
             "accountRpmLimitEnabled",
             serde_json::json!(false),
-            tm.set_account_rpm_limit_config(Some(false), None),
+            act!(tm.set_account_rpm_limit_config(Some(false), None)),
         );
         // ③ 冷却压到 45 秒：普通限流是"这一分钟发太快了"，不是账号被风控；
         //    用 30 分钟会把号停在场外，可用池越用越小，与提吞吐正好相反
         step(
             "accountThrottleCooldownSecs",
             serde_json::json!(45),
-            tm.set_account_throttle_config(Some(true), Some(45)),
+            act!(tm.set_account_throttle_config(Some(true), Some(45))),
         );
         // ④ 自愈更积极：被连续失败摘掉的号要尽快回池
         step(
             "selfHeal",
             serde_json::json!({ "enabled": true, "minIntervalSecs": 60 }),
-            tm.set_self_heal_config(None, Some(true), Some(60), None),
+            act!(tm.set_self_heal_config(None, Some(true), Some(60), None)),
         );
     }
 
@@ -2114,20 +2126,31 @@ pub async fn set_max_throughput(
         crate::admin::scheduling::SchedulingProfile::Throughput
     };
     let profile_name = if restore { "manual" } else { "throughput" };
-    match state.service.set_scheduling_config(sched) {
-        Ok(()) => applied.push(serde_json::json!({
-            "setting": "scheduling.profile", "value": profile_name
-        })),
-        Err(e) => failed.push(serde_json::json!({
-            "setting": "scheduling.profile", "value": profile_name, "error": e.to_string()
-        })),
+    if dry_run {
+        applied.push(serde_json::json!({
+            "setting": "scheduling.profile", "value": profile_name, "dryRun": true
+        }));
+    } else {
+        match state.service.set_scheduling_config(sched) {
+            Ok(()) => applied.push(serde_json::json!({
+                "setting": "scheduling.profile", "value": profile_name
+            })),
+            Err(e) => failed.push(serde_json::json!({
+                "setting": "scheduling.profile", "value": profile_name, "error": e.to_string()
+            })),
+        }
     }
 
     // 立刻跑一次调度，让分档当场生效而不是等下一个 300 秒周期
-    let changes = state.service.run_scheduling_pass();
+    let changes = if dry_run {
+        Vec::new()
+    } else {
+        state.service.run_scheduling_pass()
+    };
 
     Json(serde_json::json!({
         "mode": if restore { "riskControl" } else { "maxThroughput" },
+        "dryRun": dry_run,
         "applied": applied,
         "failed": failed,
         "priorityChanges": changes.len(),
