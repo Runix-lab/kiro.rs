@@ -4369,8 +4369,13 @@ impl MultiTokenManager {
     /// `USER_REQUEST_RATE_EXCEEDED` 不含账号级风控那两个字面量，
     /// 常态路径会在同一个号上退避重试，把重试预算烧光也不碰第二个号。
     pub fn throughput_mode_active(&self) -> bool {
+        use crate::admin::scheduling::SchedulingProfile;
         let sched = &self.config.scheduling;
-        sched.enabled && sched.profile == crate::admin::scheduling::SchedulingProfile::Throughput
+        sched.enabled
+            && matches!(
+                sched.profile,
+                SchedulingProfile::Throughput | SchedulingProfile::HighConcurrency
+            )
     }
 
     /// 吞吐模式下普通限流的冷却时长：远短于账号级风控的默认 30 分钟。

@@ -2049,6 +2049,14 @@ pub async fn set_max_throughput(
     Query(params): Query<std::collections::HashMap<String, String>>,
 ) -> axum::response::Response {
     let restore = params.get("restore").map(|v| v == "true").unwrap_or(false);
+    // profile=highConcurrency 走两档（95% 一条线），缺省 throughput 走三档
+    let high_concurrency = params
+        .get("profile")
+        .map(|v| v == "highConcurrency")
+        .unwrap_or(false);
+    // targetRpm：想要的全池每分钟请求数。按**企业账号数**均摊到每个凭据的
+    // RPM 上限——个人账号（social）额度与稳定性都不同，不计入承载规划。
+    let target_rpm = params.get("targetRpm").and_then(|v| v.parse::<u32>().ok());
     // dryRun：只回报会改什么，不真改。切换吞吐模式会改变生产路由，
     // 上线前必须能在不动生产的前提下验证这个接口本身是对的。
     let dry_run = params.get("dryRun").map(|v| v == "true").unwrap_or(false);
@@ -2096,12 +2104,29 @@ pub async fn set_max_throughput(
             serde_json::json!("balanced"),
             act!(tm.set_load_balancing_mode("balanced".to_string())),
         );
-        // ② 我们自己的 RPM 天花板会先于上游限流触发，冲吞吐时必须关掉
-        step(
-            "accountRpmLimitEnabled",
-            serde_json::json!(false),
-            act!(tm.set_account_rpm_limit_config(Some(false), None)),
-        );
+        // ② 我们自己的 RPM 天花板会先于上游限流触发。
+        //    给了 targetRpm 就按企业账号数均摊并留 50% 余量；没给就直接关掉。
+        match target_rpm {
+            Some(rpm) => {
+                let ent = enterprise_credential_count(&state);
+                // 留 50% 余量：分钟级流量本来就不均匀，贴着目标设会在波峰误伤
+                let per = ((rpm as f64 / ent.max(1) as f64) * 1.5).ceil() as u32;
+                let per = per.clamp(1, 100_000);
+                step(
+                    "accountRpmLimit",
+                    serde_json::json!({
+                        "perCredential": per, "enterpriseCredentials": ent,
+                        "poolCeiling": per as u64 * ent as u64, "targetRpm": rpm
+                    }),
+                    act!(tm.set_account_rpm_limit_config(Some(true), Some(per))),
+                );
+            }
+            None => step(
+                "accountRpmLimitEnabled",
+                serde_json::json!(false),
+                act!(tm.set_account_rpm_limit_config(Some(false), None)),
+            ),
+        }
         // ③ 冷却压到 45 秒：普通限流是"这一分钟发太快了"，不是账号被风控；
         //    用 30 分钟会把号停在场外，可用池越用越小，与提吞吐正好相反
         step(
@@ -2122,10 +2147,18 @@ pub async fn set_max_throughput(
     sched.enabled = true;
     sched.profile = if restore {
         crate::admin::scheduling::SchedulingProfile::Manual
+    } else if high_concurrency {
+        crate::admin::scheduling::SchedulingProfile::HighConcurrency
     } else {
         crate::admin::scheduling::SchedulingProfile::Throughput
     };
-    let profile_name = if restore { "manual" } else { "throughput" };
+    let profile_name = if restore {
+        "manual"
+    } else if high_concurrency {
+        "highConcurrency"
+    } else {
+        "throughput"
+    };
     if dry_run {
         applied.push(serde_json::json!({
             "setting": "scheduling.profile", "value": profile_name, "dryRun": true
@@ -2161,6 +2194,25 @@ pub async fn set_max_throughput(
         },
     }))
     .into_response()
+}
+
+/// 企业凭据数（provider = Enterprise）。
+///
+/// 承载规划只算企业账号：个人账号（social）的额度、稳定性与限流策略都不同，
+/// 混进来算会把每账号的 RPM 上限算低，白白压住企业账号的承载力。
+fn enterprise_credential_count(state: &AdminState) -> usize {
+    state
+        .service
+        .get_all_credentials()
+        .credentials
+        .iter()
+        .filter(|c| {
+            !c.disabled
+                && c.provider
+                    .as_deref()
+                    .is_some_and(|p| p.eq_ignore_ascii_case("enterprise"))
+        })
+        .count()
 }
 
 /// GET /api/admin/billing/pricing-advice?month=YYYY-MM&targetMargin=0.5

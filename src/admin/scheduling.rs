@@ -109,6 +109,16 @@ pub enum SchedulingProfile {
     /// **烧消耗**：余额少的排前面，优先把零头用掉。
     /// 适合月末——反正到期清零，先烧将要作废的额度。
     Drain,
+    /// **高并发**：只按一条线分两档，越简单越不容易配错。
+    ///
+    /// - 用量 < `throughput_reserve_at_pct`（默认 95%）→ **全部并列在前排**，
+    ///   每个账号都用最高负载承接
+    /// - 用量 ≥ 阈值（额度被击穿）→ 退到后排，接住前排溢出的流量
+    ///
+    /// 与 [`Throughput`](SchedulingProfile::Throughput) 的区别是**没有中间档**：
+    /// Throughput 按 80%/95% 分三档，让接近耗尽的号提前减速；HighConcurrency
+    /// 不减速，一直用到击穿为止。冲峰值用这个，日常用 Throughput。
+    HighConcurrency,
 }
 
 /// 一个凭据参与调度决策所需的输入。
@@ -168,7 +178,10 @@ pub fn plan_changes(
     // 吞吐模式跳过这条：它的分档本身就把 >= reserve_at_pct 的号放到了比
     // demote_to 更靠后的溢出档。两条规则同时跑会互相拉锯——守卫把号拽到 60、
     // 分档又把它推到 70，每轮都产生一次变更，日志里全是抖动。
-    let quota_guard_active = cfg.profile != SchedulingProfile::Throughput;
+    let quota_guard_active = !matches!(
+        cfg.profile,
+        SchedulingProfile::Throughput | SchedulingProfile::HighConcurrency
+    );
     for c in effective.iter_mut() {
         if !quota_guard_active {
             break;
@@ -228,7 +241,10 @@ fn plan_profile(
     // 吞吐模式接管全部优先级，包括此前被额度守卫降级的号——它自己会把
     // 高用量的号放进溢出档，不需要守卫的记账。其它取向仍然避开守卫降级的号，
     // 否则两条规则拉锯。
-    let takes_over = cfg.profile == SchedulingProfile::Throughput;
+    let takes_over = matches!(
+        cfg.profile,
+        SchedulingProfile::Throughput | SchedulingProfile::HighConcurrency
+    );
     let mut eligible: Vec<usize> = effective
         .iter()
         .enumerate()
@@ -249,6 +265,19 @@ fn plan_profile(
         // 取不到用量的号放中间档：把"不知道"当"快用完了"会平白少掉一个主力，
         // 当成"还很空"又会把流量压给一个可能已经见底的号。中间档是唯一不做
         // 假设的位置。
+        // 高并发：一条线两档，击穿才退后排
+        SchedulingProfile::HighConcurrency => eligible
+            .iter()
+            .map(|&i| {
+                let target = match effective[i].usage_pct {
+                    Some(pct) if pct >= cfg.throughput_reserve_at_pct => THROUGHPUT_RESERVE,
+                    // 用量未知的也放前排：高并发的取向就是"先用满再说"，
+                    // 而且取不到余额时把号排到后排等于平白少一个主力
+                    _ => THROUGHPUT_FRONT,
+                };
+                (i, target)
+            })
+            .collect(),
         SchedulingProfile::Throughput => eligible
             .iter()
             .map(|&i| {
@@ -315,7 +344,10 @@ fn plan_top_tier_refill(
     // 吞吐模式下额外排除**溢出储备档**：那一档的存在意义就是"不接主力流量、
     // 只接前排 429 之后溢出的部分"。把它提回首选层等于取消了储备，前排一撑不住
     // 就连储备一起烧穿，整池同时见底。
-    let reserve_excluded = cfg.profile == SchedulingProfile::Throughput;
+    let reserve_excluded = matches!(
+        cfg.profile,
+        SchedulingProfile::Throughput | SchedulingProfile::HighConcurrency
+    );
     let mut usable: Vec<usize> = effective
         .iter()
         .enumerate()
@@ -494,6 +526,57 @@ mod tests {
         for c in &ch {
             assert_eq!(c.to, THROUGHPUT_MID, "用量未知的号不该被猜到任何一端");
         }
+    }
+
+    /// 高并发：一条线两档，95% 以下全部并列在前排，击穿的退后排。
+    /// 关键是**没有中间档**——不给接近耗尽的号减速，一直用到击穿。
+    #[test]
+    fn high_concurrency_uses_a_single_threshold() {
+        let cfg = on(SchedulingProfile::HighConcurrency);
+        let creds = vec![
+            cred(1, 50, Some(8.1)),   // 很空
+            cred(2, 50, Some(73.2)),  // 用了七成
+            cred(3, 50, Some(93.0)),  // 逼近但没击穿 → 仍在前排
+            cred(4, 50, Some(96.0)),  // 击穿 → 后排
+        ];
+        let ch = plan_changes(&cfg, &creds);
+        let to = |id: u64| ch.iter().find(|c| c.id == id).map(|c| c.to);
+        assert_eq!(to(1), Some(THROUGHPUT_FRONT));
+        assert_eq!(to(2), Some(THROUGHPUT_FRONT));
+        assert_eq!(
+            to(3),
+            Some(THROUGHPUT_FRONT),
+            "93% 还没击穿，高并发模式不该给它减速（这正是与 Throughput 的区别）"
+        );
+        assert_eq!(to(4), Some(THROUGHPUT_RESERVE), "击穿的该退后排");
+    }
+
+    /// 同一批凭据，Throughput 会给 93% 的号减速到中间档，HighConcurrency 不会。
+    #[test]
+    fn high_concurrency_differs_from_throughput_on_the_middle_band() {
+        // 从前排档起步：这样"被减速到中间档"会产生一条真实变更，
+        // 而不是因为目标值恰好等于原值被 dedupe 丢掉
+        let creds = vec![cred(1, THROUGHPUT_FRONT, Some(93.0))];
+        let t = plan_changes(&on(SchedulingProfile::Throughput), &creds);
+        let h = plan_changes(&on(SchedulingProfile::HighConcurrency), &creds);
+        assert_eq!(
+            t.first().map(|c| c.to),
+            Some(THROUGHPUT_MID),
+            "Throughput 应把 93% 的号减速到中间档"
+        );
+        assert!(
+            h.is_empty(),
+            "HighConcurrency 不减速：它本来就该留在前排，不产生任何变更，实得 {:?}",
+            h
+        );
+    }
+
+    /// 用量取不到时高并发放前排（与 Throughput 的中间档不同）：
+    /// 排后排等于平白少一个主力，而这个模式的取向就是先用满。
+    #[test]
+    fn high_concurrency_puts_unknown_usage_up_front() {
+        let ch = plan_changes(&on(SchedulingProfile::HighConcurrency), &[cred(1, 70, None)]);
+        assert_eq!(ch.first().map(|c| c.to), Some(THROUGHPUT_FRONT));
     }
 
     #[test]
