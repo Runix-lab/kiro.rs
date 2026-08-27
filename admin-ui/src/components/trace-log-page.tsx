@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useMemo, useState } from 'react'
 import { toast } from 'sonner'
 import {
   ScrollText,
@@ -11,6 +11,8 @@ import {
   Unplug,
   Settings2,
   Calendar,
+  FileText,
+  Copy,
 } from 'lucide-react'
 import { Card, CardContent } from '@/components/ui/card'
 import { Button } from '@/components/ui/button'
@@ -36,7 +38,7 @@ import {
   SelectContent as UiSelectContent,
   SelectItem as UiSelectItem,
 } from '@/components/ui/select'
-import { useTraces, useTraceSummary } from '@/hooks/use-traces'
+import { useTraces, useTraceSummary, useTracePrompt } from '@/hooks/use-traces'
 import { useClientKeys } from '@/hooks/use-client-keys'
 import { useGroupOptions } from '@/hooks/use-groups'
 import {
@@ -45,6 +47,8 @@ import {
 } from '@/hooks/use-credentials'
 import {
   extractErrorMessage,
+  formatBeijingDateTime,
+  formatBytes,
   formatCredits,
   formatDiscount,
   formatNumber,
@@ -421,11 +425,113 @@ function CacheBillingPanel({ rec }: { rec: TraceRecord }) {
   )
 }
 
-/** 展开后的链路详情：计费/缓存效率 + 错误摘要 + 每跳时间线 */
+/**
+ * 原文按 JSON 美化后展示：源头就是 JSON 字符串，`JSON.parse` 再 `JSON.stringify`
+ * 不会丢信息，不算"有损重排"。解析失败（不是合法 JSON）时原样展示，不强行处理。
+ */
+function prettyPrintPrompt(body: string): string {
+  try {
+    return JSON.stringify(JSON.parse(body), null, 2)
+  } catch {
+    return body
+  }
+}
+
+async function copyToClipboard(text: string) {
+  try {
+    await navigator.clipboard.writeText(text)
+    toast.success('已复制到剪贴板')
+  } catch {
+    toast.error('复制失败，请手动选择文本')
+  }
+}
+
+/** 请求体正文：JSON 美化 + 等宽可滚动展示 + 复制按钮 */
+function PromptBody({ traceId, tsEpoch, model, rawBytes, body }: {
+  traceId: string
+  tsEpoch: number
+  model: string | null
+  rawBytes: number
+  body: string
+}) {
+  const pretty = useMemo(() => prettyPrintPrompt(body), [body])
+  return (
+    <div className="mt-2 space-y-1.5">
+      <div className="flex flex-wrap items-center justify-between gap-2 text-[11px] text-muted-foreground">
+        <span className="tabular-nums">
+          {formatBytes(rawBytes)}（压缩前）· {model ?? '—'} · {formatBeijingDateTime(tsEpoch * 1000)}（北京时间）
+        </span>
+        <Button
+          size="sm"
+          variant="ghost"
+          className="h-6 gap-1 px-2 text-[11px]"
+          onClick={() => copyToClipboard(pretty)}
+        >
+          <Copy className="h-3 w-3" />
+          复制
+        </Button>
+      </div>
+      <pre className="max-h-96 overflow-auto whitespace-pre rounded-md bg-background/60 p-2.5 font-mono text-[11px] leading-relaxed">
+        {pretty}
+      </pre>
+      <p className="text-[10px] text-muted-foreground/70">
+        原文未脱敏，请勿外传或粘贴到第三方工具。
+      </p>
+      <p className="text-[10px] text-muted-foreground/50">trace_id: {traceId}</p>
+    </div>
+  )
+}
+
+/**
+ * 「查看原始请求」：懒加载，仅在点击时才向 /traces/{traceId}/prompt 发请求。
+ *
+ * 404 不当异常处理——`useTracePrompt` 把它编码进 `found: false` 分支，这里原样
+ * 展示后端给的 `hint`（留存未开启 / 超保留期 / 超体积上限，三种原因文案不同），
+ * 而不是套一句通用的"未找到"，运营需要靠这句话判断要不要去开关那边开一下。
+ */
+function RawPromptViewer({ traceId }: { traceId: string }) {
+  const { data, isFetching, isFetched, refetch } = useTracePrompt(traceId)
+
+  return (
+    <div className="rounded-lg border border-border/50 bg-secondary/30 p-3">
+      <div className="flex items-center justify-between gap-2">
+        <div className="text-[12px] font-medium text-muted-foreground">原始请求体</div>
+        <Button
+          size="sm"
+          variant="outline"
+          className="h-7 text-xs"
+          disabled={isFetching}
+          onClick={() => refetch()}
+        >
+          <FileText className="h-3.5 w-3.5" />
+          {isFetching ? '查询中…' : isFetched ? '重新查询' : '查看原始请求'}
+        </Button>
+      </div>
+      {isFetched && data && (
+        data.found ? (
+          <PromptBody
+            traceId={data.prompt.traceId}
+            tsEpoch={data.prompt.tsEpoch}
+            model={data.prompt.model}
+            rawBytes={data.prompt.rawBytes}
+            body={data.prompt.body}
+          />
+        ) : (
+          <div className="mt-2 rounded-md border border-border/40 bg-background/60 p-2.5 text-[12px] text-muted-foreground">
+            {data.notFound.hint}
+          </div>
+        )
+      )}
+    </div>
+  )
+}
+
+/** 展开后的链路详情：计费/缓存效率 + 原始请求体 + 错误摘要 + 每跳时间线 */
 function ExpandedDetail({ rec }: { rec: TraceRecord }) {
   return (
     <div className="space-y-3">
       <CacheBillingPanel rec={rec} />
+      <RawPromptViewer traceId={rec.traceId} />
       {rec.errorMessage && (
         <div className="rounded-lg border border-destructive/30 bg-destructive/5 p-3 text-[13px] text-destructive">
           {rec.errorMessage}

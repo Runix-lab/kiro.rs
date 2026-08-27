@@ -32,6 +32,8 @@ import {
   getSchedulingPresets,
   getThroughputEstimate,
   applyMaxThroughput,
+  getPromptCaptureConfig,
+  setPromptCaptureConfig,
 } from '@/api/credentials'
 import type {
   AddCredentialRequest,
@@ -306,6 +308,25 @@ export function useSetLogGovernanceConfig() {
     mutationFn: setLogGovernanceConfig,
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['logGovernanceConfig'] })
+    },
+  })
+}
+
+// 获取原始请求体留存配置与容量统计
+export function usePromptCaptureConfig() {
+  return useQuery({
+    queryKey: ['promptCaptureConfig'],
+    queryFn: getPromptCaptureConfig,
+  })
+}
+
+// 更新原始请求体留存配置（开关 / 保留天数）
+export function useSetPromptCaptureConfig() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: setPromptCaptureConfig,
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['promptCaptureConfig'] })
     },
   })
 }

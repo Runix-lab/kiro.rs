@@ -236,6 +236,37 @@ export function formatBeijingMd(ms: number): string {
   return `${pad2(p.month)}-${pad2(p.day)}`
 }
 
+/** `YYYY-MM-DD HH:mm`，北京时间。用于展示某条记录的具体产生时间（非图表横轴场景）。 */
+export function formatBeijingDateTime(ms: number): string {
+  const p = toBeijingParts(ms)
+  return `${p.year}-${pad2(p.month)}-${pad2(p.day)} ${pad2(p.hour)}:${pad2(p.minute)}`
+}
+
+/**
+ * 北京时间下"今天是当月第几天"（1-31），默认当前时刻。
+ * 用于按月至今用量做线性外推之类的粗略投影，不用于计费或精确统计。
+ */
+export function beijingDayOfMonth(ms: number = Date.now()): number {
+  return toBeijingParts(ms).day
+}
+
+/**
+ * 字节数展示（B/KB/MB/GB/TB，1024 进制）。用于数据库文件体积、请求体大小这类场景。
+ * < 1024 取整到 B；否则保留 1 位小数。
+ */
+export function formatBytes(value: number | null | undefined): string {
+  if (value == null || Number.isNaN(value) || value < 0) return '—'
+  if (value < 1024) return `${Math.round(value)} B`
+  const units = ['KB', 'MB', 'GB', 'TB', 'PB']
+  let v = value / 1024
+  let i = 0
+  while (v >= 1024 && i < units.length - 1) {
+    v /= 1024
+    i++
+  }
+  return `${v.toFixed(1)} ${units[i]}`
+}
+
 /**
  * 脱敏代理 URL：将 user:pass@host 中的认证信息替换为 xxx****xxx
  */

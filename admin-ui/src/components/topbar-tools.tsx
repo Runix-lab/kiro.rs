@@ -2,7 +2,7 @@ import { forwardRef, useEffect, useState, type ComponentPropsWithoutRef } from '
 import {
   Activity, RefreshCw, UploadCloud, Settings, Key, Wand2, Eye, EyeOff, Copy,
   MoreHorizontal, ShieldAlert, ShieldCheck, Boxes, HeartPulse, HeartCrack,
-  Gauge, Receipt, PieChart,
+  Gauge, Receipt, PieChart, HardDrive,
 } from 'lucide-react'
 import { useQueryClient } from '@tanstack/react-query'
 import { toast } from 'sonner'
@@ -30,6 +30,7 @@ import { ImageUpdateDialog } from '@/components/image-update-dialog'
 import { AvailableModelsDialog } from '@/components/available-models-dialog'
 import { MonthlySettlementDialog } from '@/components/monthly-settlement-dialog'
 import { ModelCostAnalysisDialog } from '@/components/model-cost-analysis-dialog'
+import { PromptCaptureDialog } from '@/components/prompt-capture-dialog'
 
 /**
  * 顶栏右侧通用工具栏：负载均衡切换、可用模型、刷新、在线更新、设置（Key 管理）。
@@ -53,6 +54,7 @@ export function TopbarTools({ compact = false }: TopbarToolsProps) {
   const [modelsDialogOpen, setModelsDialogOpen] = useState(false)
   const [settlementDialogOpen, setSettlementDialogOpen] = useState(false)
   const [costAnalysisDialogOpen, setCostAnalysisDialogOpen] = useState(false)
+  const [promptCaptureDialogOpen, setPromptCaptureDialogOpen] = useState(false)
   const [keyDialogOpen, setKeyDialogOpen] = useState(false)
   const [newKey, setNewKey] = useState('')
   const [showPlain, setShowPlain] = useState(false)
@@ -126,6 +128,7 @@ export function TopbarTools({ compact = false }: TopbarToolsProps) {
     openKeyDialog,
     openSettlementDialog: () => setSettlementDialogOpen(true),
     openCostAnalysisDialog: () => setCostAnalysisDialogOpen(true),
+    openPromptCaptureDialog: () => setPromptCaptureDialogOpen(true),
     throttleConfig,
     updateCheck,
     updateCooldown: (secs: number) =>
@@ -151,6 +154,10 @@ export function TopbarTools({ compact = false }: TopbarToolsProps) {
       <ModelCostAnalysisDialog
         open={costAnalysisDialogOpen}
         onOpenChange={setCostAnalysisDialogOpen}
+      />
+      <PromptCaptureDialog
+        open={promptCaptureDialogOpen}
+        onOpenChange={setPromptCaptureDialogOpen}
       />
 
       <Dialog
@@ -261,6 +268,7 @@ interface ToolControls {
   openModels: () => void
   openSettlementDialog: () => void
   openCostAnalysisDialog: () => void
+  openPromptCaptureDialog: () => void
   throttleConfig?: { failover: boolean; cooldownSecs: number }
   updateCheck?: { hasUpdate: boolean; latestVersion: string; currentVersion: string }
   updateCooldown: (secs: number) => void
@@ -286,6 +294,7 @@ function FullTools({ controls }: { controls: ToolControls }) {
         onOpenKeyDialog={controls.openKeyDialog}
         onOpenSettlement={controls.openSettlementDialog}
         onOpenCostAnalysis={controls.openCostAnalysisDialog}
+        onOpenPromptCapture={controls.openPromptCaptureDialog}
       />
     </>
   )
@@ -341,6 +350,10 @@ function CompactTools({ controls }: { controls: ToolControls }) {
         </DropdownMenuItem>
         <DropdownMenuItem onSelect={controls.openCostAnalysisDialog}>
           <PieChart />模型成本分析
+        </DropdownMenuItem>
+        <DropdownMenuLabel>数据</DropdownMenuLabel>
+        <DropdownMenuItem onSelect={controls.openPromptCaptureDialog}>
+          <HardDrive />原始请求体留存
         </DropdownMenuItem>
         <DropdownMenuLabel>密钥管理</DropdownMenuLabel>
         <DropdownMenuItem onSelect={controls.openKeyDialog}>
@@ -407,10 +420,12 @@ function KeySettingsMenu({
   onOpenKeyDialog,
   onOpenSettlement,
   onOpenCostAnalysis,
+  onOpenPromptCapture,
 }: {
   onOpenKeyDialog: () => void
   onOpenSettlement: () => void
   onOpenCostAnalysis: () => void
+  onOpenPromptCapture: () => void
 }) {
   return (
     <DropdownMenu>
@@ -426,6 +441,11 @@ function KeySettingsMenu({
         </DropdownMenuItem>
         <DropdownMenuItem onSelect={onOpenCostAnalysis}>
           <PieChart />模型成本分析
+        </DropdownMenuItem>
+        <DropdownMenuSeparator />
+        <DropdownMenuLabel>数据</DropdownMenuLabel>
+        <DropdownMenuItem onSelect={onOpenPromptCapture}>
+          <HardDrive />原始请求体留存
         </DropdownMenuItem>
         <DropdownMenuSeparator />
         <DropdownMenuLabel>密钥管理</DropdownMenuLabel>

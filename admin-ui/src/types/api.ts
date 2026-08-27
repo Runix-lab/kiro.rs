@@ -1129,3 +1129,72 @@ export interface RateSnapshot {
   /** 逐分钟序列，时间升序、缺口补零。 */
   series: MinuteSample[]
 }
+
+// ============ 原始请求体留存 ============
+
+/** GET /api/admin/config/prompt-capture 里的容量统计 */
+export interface PromptCaptureStats {
+  count: number
+  /** 压缩前合计字节数 */
+  rawBytes: number
+  /** 库文件（prompts.db）实际占用字节数 */
+  fileBytes: number
+  /** 最早一条记录的时间（Unix 秒）；无记录时为 null */
+  oldestTsEpoch: number | null
+}
+
+/** GET /api/admin/config/prompt-capture 响应 */
+export interface PromptCaptureConfig {
+  enabled: boolean
+  retentionDays: number
+  stats: PromptCaptureStats
+  /** 后端固定文案：留存范围（只存请求体不存请求头）与生效方式（需重启）说明 */
+  note: string
+  /** 后端固定文案：实测的月度体量基线，没有实测数据时用它兜底估算存储投影 */
+  sizing: string
+}
+
+/** PUT /api/admin/config/prompt-capture 请求体 */
+export interface SetPromptCaptureRequest {
+  enabled?: boolean
+  retentionDays?: number
+}
+
+/**
+ * PUT /api/admin/config/prompt-capture 响应。
+ *
+ * `enabled` / `retentionDays` 只回显本次请求里实际传了的字段，未传的一侧是
+ * `null`——不能把它当"保存后的当前配置"读，保存后应重新 GET 一次拿权威值。
+ */
+export interface SetPromptCaptureResponse {
+  success: boolean
+  enabled: boolean | null
+  retentionDays: number | null
+  /** 恒为 true：留存在请求处理链路的构造期挂载，不能热切，必须重启 */
+  requiresRestart: true
+  message: string
+}
+
+/** GET /api/admin/traces/{traceId}/prompt 命中时的记录（原始请求体，未脱敏） */
+export interface StoredPrompt {
+  traceId: string
+  tsEpoch: number
+  keyId: number
+  model: string | null
+  /** 压缩前字节数 */
+  rawBytes: number
+  /** 原始请求体 JSON（未脱敏） */
+  body: string
+}
+
+/** GET /api/admin/traces/{traceId}/prompt 未命中（404）时的响应体 */
+export interface TracePromptNotFound {
+  error: string
+  /** 说明具体是哪种原因（留存未开启 / 留存开启前发生 / 超过保留期 / 超过体积上限），据此判断要不要去开关关关 */
+  hint: string
+}
+
+/** 请求体查询结果：显式区分"找到了"与"没找到"，后者必须把 hint 原样展示给运营 */
+export type TracePromptResult =
+  | { found: true; prompt: StoredPrompt }
+  | { found: false; notFound: TracePromptNotFound }

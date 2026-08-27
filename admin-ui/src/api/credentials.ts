@@ -42,6 +42,9 @@ import type {
   MaxThroughputParams,
   MaxThroughputResult,
   ThroughputEstimateResponse,
+  PromptCaptureConfig,
+  SetPromptCaptureRequest,
+  SetPromptCaptureResponse,
 } from '@/types/api'
 
 // 创建 axios 实例
@@ -523,6 +526,23 @@ export async function setLogGovernanceConfig(
   patch: Partial<LogGovernanceConfig>,
 ): Promise<LogGovernanceConfig> {
   const { data } = await api.put<LogGovernanceConfig>('/config/log-governance', patch)
+  return data
+}
+
+// ============ 原始请求体留存 ============
+
+// 获取原始请求体留存开关、保留天数与容量统计
+export async function getPromptCaptureConfig(): Promise<PromptCaptureConfig> {
+  const { data } = await api.get<PromptCaptureConfig>('/config/prompt-capture')
+  return data
+}
+
+// 更新原始请求体留存配置（开关 / 保留天数）。返回 requiresRestart 恒为 true——
+// 留存在请求处理链路构造期挂载，改动不会热生效。
+export async function setPromptCaptureConfig(
+  patch: SetPromptCaptureRequest,
+): Promise<SetPromptCaptureResponse> {
+  const { data } = await api.put<SetPromptCaptureResponse>('/config/prompt-capture', patch)
   return data
 }
 

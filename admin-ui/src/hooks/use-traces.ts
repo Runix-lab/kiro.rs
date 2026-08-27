@@ -1,5 +1,5 @@
 import { keepPreviousData, useQuery } from '@tanstack/react-query'
-import { getTraces, getFailureStats, getTraceSummary } from '@/api/traces'
+import { getTraces, getFailureStats, getTraceSummary, getTracePrompt } from '@/api/traces'
 import type { TraceQuery } from '@/types/api'
 
 /**
@@ -33,6 +33,25 @@ export function useTraceSummary(query: TraceQuery, enabled = true) {
     staleTime: 10_000,
     placeholderData: keepPreviousData,
     refetchOnWindowFocus: false,
+  })
+}
+
+/**
+ * 单条请求的原始请求体（懒加载）。
+ *
+ * `enabled: false` 使其挂载时不随查询失效自动重新发起请求——请求体可能有几百 KB，
+ * 展开一行 trace 不该顺带拉取它；仅在运营点击「查看原始请求」调用 `refetch()`
+ * 时才会真正发出。404（留存未开启 / 超保留期 / 超体积上限）不当 react-query 的
+ * error 处理，而是编码进 `getTracePrompt` 返回值的 `found: false` 分支，
+ * 所以这里不需要处理 `isError`。
+ */
+export function useTracePrompt(traceId: string) {
+  return useQuery({
+    queryKey: ['traces', 'prompt', traceId],
+    queryFn: () => getTracePrompt(traceId),
+    enabled: false,
+    retry: false,
+    staleTime: Infinity,
   })
 }
 
