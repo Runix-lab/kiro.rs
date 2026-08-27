@@ -2,7 +2,7 @@ import { forwardRef, useEffect, useState, type ComponentPropsWithoutRef } from '
 import {
   Activity, RefreshCw, UploadCloud, Settings, Key, Wand2, Eye, EyeOff, Copy,
   MoreHorizontal, ShieldAlert, ShieldCheck, Boxes, HeartPulse, HeartCrack,
-  Gauge, Receipt,
+  Gauge, Receipt, PieChart,
 } from 'lucide-react'
 import { useQueryClient } from '@tanstack/react-query'
 import { toast } from 'sonner'
@@ -29,6 +29,7 @@ import { extractErrorMessage, generateApiKey } from '@/lib/utils'
 import { ImageUpdateDialog } from '@/components/image-update-dialog'
 import { AvailableModelsDialog } from '@/components/available-models-dialog'
 import { MonthlySettlementDialog } from '@/components/monthly-settlement-dialog'
+import { ModelCostAnalysisDialog } from '@/components/model-cost-analysis-dialog'
 
 /**
  * 顶栏右侧通用工具栏：负载均衡切换、可用模型、刷新、在线更新、设置（Key 管理）。
@@ -51,6 +52,7 @@ export function TopbarTools({ compact = false }: TopbarToolsProps) {
   const [imageUpdateOpen, setImageUpdateOpen] = useState(false)
   const [modelsDialogOpen, setModelsDialogOpen] = useState(false)
   const [settlementDialogOpen, setSettlementDialogOpen] = useState(false)
+  const [costAnalysisDialogOpen, setCostAnalysisDialogOpen] = useState(false)
   const [keyDialogOpen, setKeyDialogOpen] = useState(false)
   const [newKey, setNewKey] = useState('')
   const [showPlain, setShowPlain] = useState(false)
@@ -123,6 +125,7 @@ export function TopbarTools({ compact = false }: TopbarToolsProps) {
     openModels: () => setModelsDialogOpen(true),
     openKeyDialog,
     openSettlementDialog: () => setSettlementDialogOpen(true),
+    openCostAnalysisDialog: () => setCostAnalysisDialogOpen(true),
     throttleConfig,
     updateCheck,
     updateCooldown: (secs: number) =>
@@ -144,6 +147,10 @@ export function TopbarTools({ compact = false }: TopbarToolsProps) {
       <MonthlySettlementDialog
         open={settlementDialogOpen}
         onOpenChange={setSettlementDialogOpen}
+      />
+      <ModelCostAnalysisDialog
+        open={costAnalysisDialogOpen}
+        onOpenChange={setCostAnalysisDialogOpen}
       />
 
       <Dialog
@@ -253,6 +260,7 @@ interface ToolControls {
   openKeyDialog: () => void
   openModels: () => void
   openSettlementDialog: () => void
+  openCostAnalysisDialog: () => void
   throttleConfig?: { failover: boolean; cooldownSecs: number }
   updateCheck?: { hasUpdate: boolean; latestVersion: string; currentVersion: string }
   updateCooldown: (secs: number) => void
@@ -277,6 +285,7 @@ function FullTools({ controls }: { controls: ToolControls }) {
       <KeySettingsMenu
         onOpenKeyDialog={controls.openKeyDialog}
         onOpenSettlement={controls.openSettlementDialog}
+        onOpenCostAnalysis={controls.openCostAnalysisDialog}
       />
     </>
   )
@@ -329,6 +338,9 @@ function CompactTools({ controls }: { controls: ToolControls }) {
         <DropdownMenuLabel>账务</DropdownMenuLabel>
         <DropdownMenuItem onSelect={controls.openSettlementDialog}>
           <Receipt />月度总账
+        </DropdownMenuItem>
+        <DropdownMenuItem onSelect={controls.openCostAnalysisDialog}>
+          <PieChart />模型成本分析
         </DropdownMenuItem>
         <DropdownMenuLabel>密钥管理</DropdownMenuLabel>
         <DropdownMenuItem onSelect={controls.openKeyDialog}>
@@ -394,9 +406,11 @@ function ImageUpdateButton({ controls }: { controls: ToolControls }) {
 function KeySettingsMenu({
   onOpenKeyDialog,
   onOpenSettlement,
+  onOpenCostAnalysis,
 }: {
   onOpenKeyDialog: () => void
   onOpenSettlement: () => void
+  onOpenCostAnalysis: () => void
 }) {
   return (
     <DropdownMenu>
@@ -409,6 +423,9 @@ function KeySettingsMenu({
         <DropdownMenuLabel>账务</DropdownMenuLabel>
         <DropdownMenuItem onSelect={onOpenSettlement}>
           <Receipt />月度总账
+        </DropdownMenuItem>
+        <DropdownMenuItem onSelect={onOpenCostAnalysis}>
+          <PieChart />模型成本分析
         </DropdownMenuItem>
         <DropdownMenuSeparator />
         <DropdownMenuLabel>密钥管理</DropdownMenuLabel>

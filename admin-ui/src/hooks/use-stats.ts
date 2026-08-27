@@ -1,6 +1,6 @@
 import { keepPreviousData, useMutation, useQuery } from '@tanstack/react-query'
 import { toast } from 'sonner'
-import { exportBilling, getBilling, getByCredential, getByModel, getOverview, getPricingAdvice, getRate, getTimeSeries, getTpm } from '@/api/stats'
+import { exportBilling, getBilling, getByCredential, getByModel, getModelCostAnalysis, getOverview, getPricingAdvice, getRate, getTimeSeries, getTpm } from '@/api/stats'
 import { extractErrorMessage } from '@/lib/utils'
 import type { StatsFilter, StatsTimeFilter, TpmDim } from '@/types/api'
 
@@ -147,6 +147,19 @@ export function usePricingAdvice(month: string, targetMarginRate: number, raiseO
   return useQuery({
     queryKey: ['stats', 'pricing-advice', month, targetMarginRate, raiseOnly],
     queryFn: () => getPricingAdvice({ month, targetMargin: targetMarginRate, raiseOnly }),
+    ...COMMON,
+  })
+}
+
+/**
+ * 模型成本分析：按模型汇总成本/折扣/缓存表现，月份选择器（YYYY-MM）驱动，
+ * 与「月度总账」共用同一种月份心智但各自持有独立的 month 状态（两个弹窗不会
+ * 同时打开，没有联动必要）。
+ */
+export function useModelCostAnalysis(month: string) {
+  return useQuery({
+    queryKey: ['stats', 'model-cost-analysis', month],
+    queryFn: () => getModelCostAnalysis({ month }),
     ...COMMON,
   })
 }

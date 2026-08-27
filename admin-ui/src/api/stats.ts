@@ -3,6 +3,7 @@ import { storage } from '@/lib/storage'
 import type {
   BillingResponse,
   CredentialDistribution,
+  ModelCostAnalysisResponse,
   ModelDistribution,
   OverviewStats,
   PricingAdviceResponse,
@@ -142,6 +143,16 @@ export async function getPricingAdvice(params: {
       raiseOnly: params.raiseOnly,
     },
   })
+  return data
+}
+
+/**
+ * 模型成本分析：按模型汇总本期成本、我方买入折扣与上游缓存折扣，运营用它把
+ * 「每个模型到底赚不赚」看清楚。月份选择器（YYYY-MM）驱动，不接受自定义窗口——
+ * 与月度总账保持同一种月份心智模型。
+ */
+export async function getModelCostAnalysis(params: { month: string }): Promise<ModelCostAnalysisResponse> {
+  const { data } = await api.get<ModelCostAnalysisResponse>('/models/cost-analysis', { params })
   return data
 }
 

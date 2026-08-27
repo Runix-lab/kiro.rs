@@ -1,5 +1,5 @@
 import { useMemo, useState } from 'react'
-import { AlertTriangle, Calendar, ChevronDown, Info, Receipt } from 'lucide-react'
+import { ChevronDown, Info, Receipt } from 'lucide-react'
 import {
   Dialog,
   DialogContent,
@@ -8,65 +8,13 @@ import {
   DialogDescription,
 } from '@/components/ui/dialog'
 import { Button } from '@/components/ui/button'
-import { Input } from '@/components/ui/input'
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@/components/ui/tooltip'
 import { useBilling } from '@/hooks/use-stats'
 import { cn, formatCredits, formatUsd } from '@/lib/utils'
 import { PricingAdvicePanel } from '@/components/pricing-advice-panel'
+import { MonthPicker, currentMonthValue } from '@/components/month-picker'
+import { WarningBanner } from '@/components/warning-banner'
 import type { BillingTotals, UnpricedKey, ZeroCreditKey } from '@/types/api'
-
-function currentMonthValue(): string {
-  const d = new Date()
-  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`
-}
-
-function shiftMonth(month: string, delta: number): string {
-  const [y, m] = month.split('-').map(Number)
-  const d = new Date(y, m - 1 + delta, 1)
-  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`
-}
-
-function MonthPicker({
-  month,
-  onChange,
-}: {
-  month: string
-  onChange: (value: string) => void
-}) {
-  const thisMonth = useMemo(() => currentMonthValue(), [])
-  const lastMonth = useMemo(() => shiftMonth(thisMonth, -1), [thisMonth])
-  return (
-    <div className="flex items-center gap-2">
-      <div className="relative min-w-0">
-        <Calendar className="pointer-events-none absolute left-2.5 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-muted-foreground" />
-        <Input
-          type="month"
-          value={month}
-          onChange={(e) => e.target.value && onChange(e.target.value)}
-          className="h-8 w-[150px] rounded-md pl-8 text-xs"
-        />
-      </div>
-      <div className="flex items-center gap-1 rounded-md border border-border/60 p-0.5">
-        <Button
-          size="sm"
-          variant={month === thisMonth ? 'default' : 'ghost'}
-          className="h-7 rounded-md px-2.5 text-xs"
-          onClick={() => onChange(thisMonth)}
-        >
-          本月
-        </Button>
-        <Button
-          size="sm"
-          variant={month === lastMonth ? 'default' : 'ghost'}
-          className="h-7 rounded-md px-2.5 text-xs"
-          onClick={() => onChange(lastMonth)}
-        >
-          上月
-        </Button>
-      </div>
-    </div>
-  )
-}
 
 function StatBlock({
   label,
@@ -91,41 +39,6 @@ function StatBlock({
         {value}
       </div>
       <div className="mt-1 text-[11px] text-muted-foreground">{caption}</div>
-    </div>
-  )
-}
-
-/**
- * 统一的警示条外壳：月结前需要人工处理的信号都走这一个组件，读起来是一叠按严重度
- * 排列的警示，而不是三四个互不相关的盒子。red = 最高危（数据看似正常实则失真），
- * amber = 已知的、有明确处理路径的缺口。
- */
-function WarningBanner({
-  tone,
-  title,
-  children,
-}: {
-  tone: 'red' | 'amber'
-  title: string
-  children: React.ReactNode
-}) {
-  return (
-    <div
-      className={cn(
-        'rounded-md border p-3 sm:p-4',
-        tone === 'red' ? 'border-destructive/40 bg-destructive/5' : 'border-amber-500/40 bg-amber-500/10',
-      )}
-    >
-      <div
-        className={cn(
-          'mb-1.5 flex items-center gap-2',
-          tone === 'red' ? 'text-destructive' : 'text-amber-600 dark:text-amber-400',
-        )}
-      >
-        <AlertTriangle className="h-4 w-4 shrink-0" />
-        <h3 className="text-[13px] font-semibold">{title}</h3>
-      </div>
-      {children}
     </div>
   )
 }

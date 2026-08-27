@@ -644,6 +644,70 @@ export interface PricingAdviceResponse {
   note: string
 }
 
+// ============ 模型成本分析 ============
+
+/**
+ * 单个模型的月度成本分析行。
+ *
+ * 信任度不是均匀的——`credits` 与 `upstreamCacheReadRatio` 是上游真值 / 实测；
+ * `cacheHitRate`、`officialUsd` 以及依赖它的 `effectiveDiscount` 建立在上游不下发
+ * token 明细时由本地估算补齐的拆分之上。UI 必须在读到这些字段的地方就标出来，
+ * 不能只在页脚写一句免责声明。
+ */
+export interface ModelCostAnalysisRow {
+  model: string
+  calls: number
+  errors: number
+  /** 上游计费量（真值） */
+  credits: number
+  /** 成本 = credits × creditUsdRate，可信 */
+  costUsd: number
+  /** 该模型成本占本期总成本的百分比（0-100） */
+  costSharePct: number
+  /** 官方牌价美金；ESTIMATED——上游未下发 token 明细时由本地估算补齐 */
+  officialUsd: number | null
+  /** 我方买入折扣 = 实付 ÷ 官方牌价（0.13 = 1.3 折）；继承 officialUsd 的估算属性 */
+  effectiveDiscount: number | null
+  inputTokens: number
+  outputTokens: number
+  cacheWriteTokens: number
+  cacheReadTokens: number
+  /** 缓存命中率 = 缓存读 ÷ (输入 + 缓存写 + 缓存读)，0-1；ESTIMATED */
+  cacheHitRate: number | null
+  tokensPerCredit: number | null
+  avgRounds: number
+  /** 上游缓存折扣：缓存读 credits ÷ 缓存写 credits，0-1；MEASURED，非估算 */
+  upstreamCacheReadRatio: number | null
+  /** 该模型的上游缓存折扣是否已通过实测校验 */
+  upstreamCacheVerified: boolean | null
+  /** 预写好的中文建议，emoji 严重度标记已内置，原样渲染 */
+  advice: string
+}
+
+/** 上游缓存折扣的实测方法说明——单次实测曾把我们带偏过一次，因此每个数值都被重新核实过 */
+export interface CacheMeasurementInfo {
+  measuredAt: string
+  method: string
+  finding: string
+  caveat: string
+}
+
+/** GET /api/admin/models/cost-analysis 响应 */
+export interface ModelCostAnalysisResponse {
+  month: string
+  windowStart: string
+  windowEnd: string
+  timezone: string
+  totalCostUsd: number
+  /** 账期内没有日志文件的日期。"那天没日志" ≠ "那天没消费" */
+  missingDays: string[]
+  /** 账期内无法解析的用量日志行数；这些请求的金额未知 */
+  malformedLines: number
+  models: ModelCostAnalysisRow[]
+  cacheMeasurement: CacheMeasurementInfo
+  note: string
+}
+
 // ============ 请求链路追踪 ============
 
 /** 单次上游尝试 */
