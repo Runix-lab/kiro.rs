@@ -30,6 +30,11 @@ pub mod scheduling;
 pub mod usage_stats;
 pub mod trace_db;
 pub mod prompt_store;
+pub mod alerts;
+pub mod fleet_health;
+pub mod group_rules;
+#[cfg(test)]
+pub mod fleet_bench;
 
 pub use client_keys::ClientKeyManager;
 pub use groups::GroupManager;
