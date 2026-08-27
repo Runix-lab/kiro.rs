@@ -215,7 +215,7 @@ impl PricingTable {
 }
 
 /// 模型名归一化：小写 + 点号转横线。
-fn normalize_model(model: &str) -> String {
+pub fn normalize_model(model: &str) -> String {
     model.trim().to_ascii_lowercase().replace('.', "-")
 }
 

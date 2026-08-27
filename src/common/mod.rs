@@ -2,3 +2,4 @@
 
 pub mod auth;
 pub mod pricing;
+pub mod upstream_cache;

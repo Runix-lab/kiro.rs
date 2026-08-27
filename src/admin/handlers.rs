@@ -2215,6 +2215,164 @@ fn enterprise_credential_count(state: &AdminState) -> usize {
         .count()
 }
 
+/// GET /api/admin/models/cost-analysis?month=YYYY-MM
+///
+/// 逐模型的成本全景：实测的上游缓存折扣 + 线上真实命中率 + 实付/牌价折扣 + 选型建议。
+///
+/// 为什么要有这一页：上游对不同模型的缓存计费规则**完全不同且不公开**
+/// （Claude 系 5.3 折、非 Claude 一分不打），而缓存重的 agent 负载里缓存占比
+/// 高达 95%+ —— 这条规则直接决定同样一段对话在哪个模型上跑贵一倍。
+/// 这个信息在任何官方文档里都查不到，只能实测，所以固化成报表。
+pub async fn model_cost_analysis(
+    State(state): State<AdminState>,
+    Query(params): Query<std::collections::HashMap<String, String>>,
+) -> axum::response::Response {
+    use crate::common::upstream_cache;
+
+    let (start, end) = match params.get("month") {
+        Some(m) => match month_dates(m) {
+            Ok(v) => v,
+            Err(message) => return stats_bad_request(message),
+        },
+        None => {
+            let today = Local::now().date_naive();
+            let first = today.with_day(1).unwrap_or(today);
+            (first, today.succ_opt().unwrap_or(today))
+        }
+    };
+    let Some(recorder) = state.service.usage_recorder() else {
+        return stats_bad_request("用量日志未启用".to_string());
+    };
+
+    #[derive(Default)]
+    struct Acc {
+        calls: u64,
+        errors: u64,
+        input: u64,
+        output: u64,
+        cache_write: u64,
+        cache_read: u64,
+        credits: f64,
+        rounds: u64,
+    }
+    let mut per: HashMap<String, Acc> = HashMap::new();
+    let scan = crate::admin::usage_stats::scan_usage_records(
+        recorder.dir(),
+        start,
+        end,
+        None,
+        |rec| {
+            let a = per.entry(rec.model.clone()).or_default();
+            a.calls += 1;
+            if rec.status != "success" {
+                a.errors += 1;
+            }
+            a.credits += crate::admin::usage_stats::sane_credits(rec.credits);
+            a.input += rec.input_tokens;
+            a.output += rec.output_tokens;
+            a.cache_write += rec.cache_creation_tokens;
+            a.cache_read += rec.cache_read_tokens;
+            a.rounds += rec.rounds.max(1) as u64;
+        },
+    );
+
+    let total_cost: f64 = per
+        .values()
+        .map(|a| state.pricing.credit_usd(a.credits))
+        .sum();
+
+    let mut items: Vec<serde_json::Value> = per
+        .iter()
+        .filter(|(_, a)| a.credits > 0.0)
+        .map(|(model, a)| {
+            let cost = state.pricing.credit_usd(a.credits);
+            let prompt_total = a.input + a.cache_write + a.cache_read;
+            let cache_hit = if prompt_total > 0 {
+                Some(a.cache_read as f64 / prompt_total as f64)
+            } else {
+                None
+            };
+            let official =
+                state
+                    .pricing
+                    .official_usd(model, a.input, a.output, a.cache_write, a.cache_read);
+            // 实际折扣 = 我方实付 ÷ 官方牌价。这是"我们买得多便宜"，
+            // 与卖给客户的折扣系数是两回事。
+            let effective = official.filter(|o| *o > 0.0).map(|o| cost / o);
+            let cp = upstream_cache::profile_for(model);
+            let tokens_per_credit = if a.credits > 0.0 {
+                Some((prompt_total + a.output) as f64 / a.credits)
+            } else {
+                None
+            };
+            let avg_rounds = if a.calls > 0 {
+                a.rounds as f64 / a.calls as f64
+            } else {
+                1.0
+            };
+
+            // 选型建议：缓存重的负载上，「有缓存折扣」比单价更决定成本
+            let advice = match (cp.map(|p| p.cache_read_ratio), cache_hit) {
+                (Some(r), Some(h)) if r >= 0.9 && h > 0.7 => {
+                    "🔴 缓存占比高但上游不打折 —— 这类负载换到 Claude 系成本可降近一半"
+                }
+                (Some(r), Some(h)) if r < 0.9 && h > 0.7 => "✅ 缓存重且能拿到折扣，成本结构健康",
+                (Some(r), _) if r >= 0.9 => "⚠️ 上游不给缓存折扣，长上下文重复对话会很贵",
+                (Some(_), _) => "缓存可打折，适合长上下文",
+                (None, _) => "未实测该模型的缓存折扣",
+            };
+
+            serde_json::json!({
+                "model": model,
+                "calls": a.calls,
+                "errors": a.errors,
+                "credits": a.credits,
+                "costUsd": cost,
+                "costSharePct": if total_cost > 0.0 { cost / total_cost * 100.0 } else { 0.0 },
+                "officialUsd": official,
+                // 我方实付 ÷ 官方牌价（越小说明买得越便宜）
+                "effectiveDiscount": effective,
+                "inputTokens": a.input,
+                "outputTokens": a.output,
+                "cacheWriteTokens": a.cache_write,
+                "cacheReadTokens": a.cache_read,
+                "cacheHitRate": cache_hit,
+                "tokensPerCredit": tokens_per_credit,
+                "avgRounds": avg_rounds,
+                // 实测值：缓存读 ÷ 缓存写
+                "upstreamCacheReadRatio": cp.map(|p| p.cache_read_ratio),
+                "upstreamCacheVerified": cp.map(|p| p.verified),
+                "advice": advice,
+            })
+        })
+        .collect();
+    items.sort_by(|a, b| {
+        b["costUsd"]
+            .as_f64()
+            .unwrap_or(0.0)
+            .total_cmp(&a["costUsd"].as_f64().unwrap_or(0.0))
+    });
+
+    Json(serde_json::json!({
+        "month": params.get("month"),
+        "windowStart": start.format("%Y-%m-%d").to_string(),
+        "windowEnd": end.format("%Y-%m-%d").to_string(),
+        "timezone": "Asia/Shanghai",
+        "models": items,
+        "totalCostUsd": total_cost,
+        "missingDays": scan.missing_days,
+        "malformedLines": scan.malformed,
+        "cacheMeasurement": {
+            "measuredAt": upstream_cache::MEASURED_AT,
+            "method": "同一段 ~20K token 的 prompt（带 cache_control）连发 3 次：第 1 次写缓存、第 2/3 次读缓存，比较上游回报的 credits。只依赖 credits（唯一的上游真值），不依赖任何本地估算的 token 字段。",
+            "finding": "Claude 系一律约 5.3 折，非 Claude 系（GPT / deepseek / glm / qwen / minimax）一律 10 折即一分不打。界限干净到不像巧合——很可能上游只对 Anthropic 链路透传了缓存计费。",
+            "caveat": "上游不公开这套规则也没有接口可查，只能实测，所以会过期。首轮 claude-opus-4.7 曾测出 2.76 折，复测两轮后是 5.30/5.36 折，与同族一致——单点数据不可信，表内每个值都至少两轮一致。",
+        },
+        "note": "缓存命中率由本地估算补齐（上游不逐条下发 token 明细），仅供参考；上游缓存折扣与 credits 是实测/真值。",
+    }))
+    .into_response()
+}
+
 /// GET /api/admin/billing/pricing-advice?month=YYYY-MM&targetMargin=0.5
 ///
 /// 按目标毛利率反解每个客户该配多少折扣。
