@@ -2295,6 +2295,11 @@ impl MultiTokenManager {
         let tmp = path.with_extension("json.tmp");
         let write_atomic = || -> std::io::Result<()> {
             std::fs::write(&tmp, &json)?;
+            // 权限收到 0600 **再** rename：凭据文件里是 refresh token，
+            // 默认 umask 会落成 0644，同机任何用户可读。这台是共享机
+            // （还跑着别的服务），644 等于把上游凭据摊开给同机所有进程。
+            // 先改权限后改名，避免出现"已在最终路径但还是 644"的时间窗。
+            crate::common::secret_file::restrict_permissions(&tmp)?;
             std::fs::rename(&tmp, path)
         };
         let write_result = if tokio::runtime::Handle::try_current().is_ok() {

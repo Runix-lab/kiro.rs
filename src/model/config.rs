@@ -519,6 +519,10 @@ impl Config {
         let content = serde_json::to_string_pretty(self).context("序列化配置失败")?;
         fs::write(path, content)
             .with_context(|| format!("写入配置文件失败: {}", path.display()))?;
+        // config.json 里有 adminApiKey / apiKey，默认 umask 会落成 0644。
+        // 生产是共享机，644 等于把管理凭据摊开给同机所有进程。
+        crate::common::secret_file::restrict_permissions(path)
+            .with_context(|| format!("收紧配置文件权限失败: {}", path.display()))?;
         Ok(())
     }
 }
