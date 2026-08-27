@@ -2251,16 +2251,14 @@ pub async fn get_trace_prompt(
 /// GET /api/admin/config/prompt-capture —— 留存开关与容量统计
 pub async fn get_prompt_capture(State(state): State<AdminState>) -> axum::response::Response {
     let cfg = state.service.token_manager().config();
-    let stats = state
-        .prompt_store
-        .as_ref()
-        .map(|s| s.stats())
-        .unwrap_or_default();
+    let store = state.prompt_store.as_ref();
+    let stats = store.map(|s| s.stats()).unwrap_or_default();
     Json(serde_json::json!({
-        "enabled": cfg.prompt_capture_enabled,
+        // 读运行时值而不是启动快照：开关是热切的，读配置会显示成"改了没生效"
+        "enabled": store.map(|s| s.is_enabled()).unwrap_or(cfg.prompt_capture_enabled),
         "retentionDays": cfg.prompt_retention_days,
         "stats": stats,
-        "note": "留存的是原始请求体（未脱敏），不含任何请求头——Authorization / x-api-key 一个字节都不落盘。开关改动需重启生效。",
+        "note": "留存的是原始请求体（未脱敏），不含任何请求头——Authorization / x-api-key 一个字节都不落盘。开关即时生效，无需重启。",
         "sizing": "实测量级：约 11.9 万次请求/月，原始 23.8GB、gzip 后约 5.9GB。",
     }))
     .into_response()
@@ -2279,6 +2277,8 @@ pub async fn set_prompt_capture(
     if enabled.is_none() && retention.is_none() {
         return stats_bad_request("需要 enabled 或 retentionDays".to_string());
     }
+    // 先落盘（重启后仍生效），再切运行时（当场生效）。
+    // 少了后半步就是"改了没反应，重启才生效"——调度配置上已经踩过这个坑。
     state.service.update_config_file(move |c| {
         if let Some(e) = enabled {
             c.prompt_capture_enabled = e;
@@ -2287,14 +2287,19 @@ pub async fn set_prompt_capture(
             c.prompt_retention_days = r;
         }
     });
+    if let (Some(store), Some(e)) = (state.prompt_store.as_ref(), enabled) {
+        store.set_enabled(e);
+    }
     Json(serde_json::json!({
         "success": true,
         "enabled": enabled,
         "retentionDays": retention,
-        // 留存要在请求收尾路径上挂一个 SQLite 写入，涉及 AppState 的构造，
-        // 不像限流阈值那样能热切。说清楚比让人以为改完就生效强。
-        "requiresRestart": true,
-        "message": "已保存。留存开关需重启服务后生效（它在请求处理链路的构造期挂载）。",
+        "requiresRestart": false,
+        "message": match enabled {
+            Some(true) => "已开启，即时生效。从现在起的新请求会被记录；此前已发生的请求无法追溯。",
+            Some(false) => "已关闭，即时生效。已存的记录仍保留至保留期结束。",
+            None => "已保存。",
+        },
     }))
     .into_response()
 }

@@ -237,24 +237,25 @@ async fn main() {
         }
     };
 
-    // 原始请求体留存（独立 prompts.db）。默认关闭；开启后可在请求日志里看原文。
+    // 原始请求体留存（独立 prompts.db）。
+    //
+    // 无条件建实例、开关由配置播种：关闭时它不碰磁盘（连库都不建），
+    // 打开时热切即时生效。让一个设置开关要人 SSH 上去重启，
+    // 是把实现的限制转嫁给使用者。
+    //
     // 独立库是刻意的：大 blob 放进 traces.db 会拖慢在线的分钟级聚合，
     // 而那个查询占着写入路径的锁。
-    let prompt_store: Option<std::sync::Arc<admin::prompt_store::PromptStore>> =
-        if config.prompt_capture_enabled {
-            match admin::prompt_store::PromptStore::open(&cache_dir) {
-                Ok(s) => {
-                    tracing::info!("原始请求体留存已开启，保留 {} 天", config.prompt_retention_days);
-                    Some(std::sync::Arc::new(s))
-                }
-                Err(e) => {
-                    tracing::warn!("打开 prompts.db 失败，请求体留存不可用: {}", e);
-                    None
-                }
-            }
-        } else {
-            None
-        };
+    let prompt_store = std::sync::Arc::new(admin::prompt_store::PromptStore::new(
+        &cache_dir,
+        config.prompt_capture_enabled,
+    ));
+    if config.prompt_capture_enabled {
+        tracing::info!(
+            retention_days = config.prompt_retention_days,
+            "原始请求体留存已开启"
+        );
+    }
+    let prompt_store = Some(prompt_store);
 
     // 启动后定期清理过期 usage_log 与 trace 记录
     {

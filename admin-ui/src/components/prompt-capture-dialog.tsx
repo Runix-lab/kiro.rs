@@ -79,7 +79,7 @@ interface PromptCaptureDialogProps {
  * 三条不能省的语境，操作员看不到就会踩坑：
  * 1. `traces.db` 从来不存请求体——开启这个开关是从这一刻起才开始记录，
  *    此前已发生的历史请求没有原文可查，这一点必须在开关旁边说清楚。
- * 2. 后端把开关挂在请求处理链路的构造期，PUT 成功不代表已生效，必须重启；
+ * 2. 开关是热切的：PUT 成功即生效，不需要重启（后端返回的 message 会说明具体行为）；
  *    这条提示在保存成功后要用后端原话显眼地弹出来，不能只在 note 里带一句。
  * 3. 留存的是客户未脱敏的原始请求内容，属于有合同分量的决定——开关本身
  *    不直接触发保存，要看到红色警示 + 勾选确认后「保存」按钮才会真的提交。
@@ -246,8 +246,10 @@ export function PromptCaptureDialog({ open, onOpenChange }: PromptCaptureDialogP
                 </WarningBanner>
               )}
 
+              {/* 后端已改成热切，PUT 成功即生效。仍读后端返回的 message
+                  而不是写死文案：生效方式是后端的实现细节，它变了这里应该跟着变。 */}
               {restartNotice && (
-                <WarningBanner tone="amber" title="需要重启服务后生效">
+                <WarningBanner tone="emerald" title="已生效">
                   <p className="text-[12px] leading-relaxed">{restartNotice}</p>
                 </WarningBanner>
               )}

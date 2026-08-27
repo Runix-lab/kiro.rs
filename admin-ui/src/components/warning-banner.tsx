@@ -14,7 +14,7 @@ export function WarningBanner({
   title,
   children,
 }: {
-  tone: 'red' | 'amber'
+  tone: 'red' | 'amber' | 'emerald'
   title: string
   children: React.ReactNode
 }) {
@@ -22,13 +22,21 @@ export function WarningBanner({
     <div
       className={cn(
         'rounded-md border p-3 sm:p-4',
-        tone === 'red' ? 'border-destructive/40 bg-destructive/5' : 'border-amber-500/40 bg-amber-500/10',
+        tone === 'red'
+          ? 'border-destructive/40 bg-destructive/5'
+          : tone === 'emerald'
+            ? 'border-emerald-500/40 bg-emerald-500/10'
+            : 'border-amber-500/40 bg-amber-500/10',
       )}
     >
       <div
         className={cn(
           'mb-1.5 flex items-center gap-2',
-          tone === 'red' ? 'text-destructive' : 'text-amber-600 dark:text-amber-400',
+          tone === 'red'
+            ? 'text-destructive'
+            : tone === 'emerald'
+              ? 'text-emerald-600 dark:text-emerald-400'
+              : 'text-amber-600 dark:text-amber-400',
         )}
       >
         <AlertTriangle className="h-4 w-4 shrink-0" />

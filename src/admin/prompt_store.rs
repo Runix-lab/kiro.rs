@@ -24,6 +24,7 @@
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use parking_lot::Mutex;
 use rusqlite::{Connection, OptionalExtension, params};
@@ -35,14 +36,51 @@ use rusqlite::{Connection, OptionalExtension, params};
 const MAX_BODY_BYTES: usize = 8 * 1024 * 1024;
 
 pub struct PromptStore {
-    conn: Mutex<Connection>,
+    /// 延迟打开：关闭状态下不创建 prompts.db，磁盘上干干净净。
+    conn: Mutex<Option<Connection>>,
     path: PathBuf,
+    /// 运行时开关。**必须能热切** —— 让一个设置开关要人 SSH 上去重启服务，
+    /// 是把实现的限制转嫁给了使用者。
+    enabled: AtomicBool,
 }
 
 impl PromptStore {
-    pub fn open(dir: &Path) -> anyhow::Result<Self> {
-        let path = dir.join("prompts.db");
-        let conn = Connection::open(&path)?;
+    /// 建一个留存实例。`enabled=false` 时不碰磁盘，直到被打开并写入第一条。
+    pub fn new(dir: &Path, enabled: bool) -> Self {
+        Self {
+            conn: Mutex::new(None),
+            path: dir.join("prompts.db"),
+            enabled: AtomicBool::new(enabled),
+        }
+    }
+
+    pub fn is_enabled(&self) -> bool {
+        self.enabled.load(Ordering::Relaxed)
+    }
+
+    /// 热切开关，立即生效，不需要重启。
+    pub fn set_enabled(&self, on: bool) {
+        self.enabled.store(on, Ordering::Relaxed);
+        tracing::info!(enabled = on, "原始请求体留存开关已切换（即时生效）");
+    }
+
+    /// 取到连接；首次调用时才真正建库建表。
+    fn with_conn<T>(&self, f: impl FnOnce(&Connection) -> T) -> Option<T> {
+        let mut slot = self.conn.lock();
+        if slot.is_none() {
+            match Self::open_db(&self.path) {
+                Ok(c) => *slot = Some(c),
+                Err(e) => {
+                    tracing::warn!("打开 prompts.db 失败: {}", e);
+                    return None;
+                }
+            }
+        }
+        slot.as_ref().map(f)
+    }
+
+    fn open_db(path: &Path) -> anyhow::Result<Connection> {
+        let conn = Connection::open(path)?;
         // WAL：写入与读取不互相阻塞。这个库的写入在请求收尾路径上，不能被读查询顶住。
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "synchronous", "NORMAL")?;
@@ -58,14 +96,14 @@ impl PromptStore {
             );
             CREATE INDEX IF NOT EXISTS idx_prompts_ts ON prompts(ts_epoch);",
         )?;
-        Ok(Self {
-            conn: Mutex::new(conn),
-            path,
-        })
+        Ok(conn)
     }
 
     /// 存一条请求体。失败只 warn 不影响请求——留存是辅助能力，不能让它拖垮主路径。
     pub fn put(&self, trace_id: &str, key_id: u64, model: &str, body: &[u8]) {
+        if !self.is_enabled() {
+            return;
+        }
         if body.len() > MAX_BODY_BYTES {
             tracing::debug!(
                 trace_id,
@@ -82,20 +120,25 @@ impl PromptStore {
             }
         };
         let ts = chrono::Utc::now().timestamp();
-        let conn = self.conn.lock();
-        if let Err(e) = conn.execute(
-            "INSERT OR REPLACE INTO prompts (trace_id, ts_epoch, key_id, model, raw_bytes, body_gz)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            params![trace_id, ts, key_id as i64, model, body.len() as i64, gz],
-        ) {
-            tracing::warn!(trace_id, "请求体落盘失败: {}", e);
-        }
+        self.with_conn(|conn| {
+            if let Err(e) = conn.execute(
+                "INSERT OR REPLACE INTO prompts (trace_id, ts_epoch, key_id, model, raw_bytes, body_gz)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![trace_id, ts, key_id as i64, model, body.len() as i64, gz],
+            ) {
+                tracing::warn!(trace_id, "请求体落盘失败: {}", e);
+            }
+        });
     }
 
     /// 取回一条请求体（已解压）。
     pub fn get(&self, trace_id: &str) -> Option<StoredPrompt> {
-        let conn = self.conn.lock();
-        let row = conn
+        // 库还没建过就直接没有记录，不必为一次查询把文件创建出来
+        if !self.path.exists() {
+            return None;
+        }
+        let row = self.with_conn(|conn| {
+            conn
             .query_row(
                 "SELECT ts_epoch, key_id, model, raw_bytes, body_gz FROM prompts WHERE trace_id = ?1",
                 params![trace_id],
@@ -111,7 +154,8 @@ impl PromptStore {
             )
             .optional()
             .ok()
-            .flatten()?;
+            .flatten()
+        })??;
         let body = gunzip(&row.4).ok()?;
         Some(StoredPrompt {
             trace_id: trace_id.to_string(),
@@ -128,38 +172,49 @@ impl PromptStore {
     /// 不在这里 VACUUM：那会重写整个文件，几 GB 的库上要几十秒，
     /// 期间占着锁。空间由 WAL 复用，真要回收让运维脚本单独做。
     pub fn cleanup(&self, retention_days: i64) -> usize {
-        let cutoff = chrono::Utc::now().timestamp() - retention_days.max(1) * 86400;
-        let conn = self.conn.lock();
-        match conn.execute("DELETE FROM prompts WHERE ts_epoch < ?1", params![cutoff]) {
-            Ok(n) => {
-                if n > 0 {
-                    tracing::info!(deleted = n, retention_days, "已清理过期请求体");
-                }
-                n
-            }
-            Err(e) => {
-                tracing::warn!("清理请求体失败: {}", e);
-                0
-            }
+        if !self.path.exists() {
+            return 0;
         }
+        let cutoff = chrono::Utc::now().timestamp() - retention_days.max(1) * 86400;
+        self.with_conn(|conn| {
+            match conn.execute("DELETE FROM prompts WHERE ts_epoch < ?1", params![cutoff]) {
+                Ok(n) => {
+                    if n > 0 {
+                        tracing::info!(deleted = n, retention_days, "已清理过期请求体");
+                    }
+                    n
+                }
+                Err(e) => {
+                    tracing::warn!("清理请求体失败: {}", e);
+                    0
+                }
+            }
+        })
+        .unwrap_or(0)
     }
 
     /// 统计：条数、原始字节合计、压缩后库大小。
     pub fn stats(&self) -> PromptStoreStats {
-        let conn = self.conn.lock();
-        let (count, raw): (i64, i64) = conn
-            .query_row(
-                "SELECT COUNT(*), COALESCE(SUM(raw_bytes), 0) FROM prompts",
-                [],
-                |r| Ok((r.get(0)?, r.get(1)?)),
-            )
-            .unwrap_or((0, 0));
-        let oldest: Option<i64> = conn
-            .query_row("SELECT MIN(ts_epoch) FROM prompts", [], |r| r.get(0))
-            .optional()
-            .ok()
-            .flatten();
-        drop(conn);
+        if !self.path.exists() {
+            return PromptStoreStats::default();
+        }
+        let (count, raw, oldest) = self
+            .with_conn(|conn| {
+                let (c, r): (i64, i64) = conn
+                    .query_row(
+                        "SELECT COUNT(*), COALESCE(SUM(raw_bytes), 0) FROM prompts",
+                        [],
+                        |r| Ok((r.get(0)?, r.get(1)?)),
+                    )
+                    .unwrap_or((0, 0));
+                let o: Option<i64> = conn
+                    .query_row("SELECT MIN(ts_epoch) FROM prompts", [], |r| r.get(0))
+                    .optional()
+                    .ok()
+                    .flatten();
+                (c, r, o)
+            })
+            .unwrap_or((0, 0, None));
         let file_bytes = std::fs::metadata(&self.path).map(|m| m.len()).unwrap_or(0);
         PromptStoreStats {
             count: count as u64,
@@ -222,7 +277,7 @@ mod tests {
     #[test]
     fn round_trips_a_body() {
         let d = tmp("rt");
-        let s = PromptStore::open(&d).unwrap();
+        let s = PromptStore::new(&d, true);
         let body = r#"{"model":"claude-opus-5","messages":[{"role":"user","content":"你好"}]}"#
             .as_bytes();
         s.put("t1", 7, "claude-opus-5", body);
@@ -233,12 +288,33 @@ mod tests {
         let _ = std::fs::remove_dir_all(&d);
     }
 
+    /// 开关热切：关掉就不写，打开立刻写，不需要重启。
+    /// 让一个设置开关要人 SSH 上去重启服务，是把实现的限制转嫁给使用者。
+    #[test]
+    fn toggling_takes_effect_without_a_restart() {
+        let d = tmp("toggle");
+        let s = PromptStore::new(&d, false);
+        s.put("off", 1, "m", b"{}");
+        assert!(s.get("off").is_none(), "关闭状态不该落盘");
+        assert!(!d.join("prompts.db").exists(), "关闭时连库都不该建");
+
+        s.set_enabled(true);
+        s.put("on", 1, "m", b"{}");
+        assert!(s.get("on").is_some(), "打开后应立即开始记录");
+
+        s.set_enabled(false);
+        s.put("off2", 1, "m", b"{}");
+        assert!(s.get("off2").is_none(), "再关掉应立即停止");
+        assert!(s.get("on").is_some(), "关掉不影响已存的记录");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
     /// 超大请求体不存：一个异常的巨型请求能瞬间吃掉几百 MB，
     /// 而它对排查的价值并不比截断版高。
     #[test]
     fn oversized_bodies_are_skipped() {
         let d = tmp("big");
-        let s = PromptStore::open(&d).unwrap();
+        let s = PromptStore::new(&d, true);
         let big = vec![b'x'; MAX_BODY_BYTES + 1];
         s.put("t2", 1, "m", &big);
         assert!(s.get("t2").is_none(), "超限的不该落盘");
@@ -249,18 +325,20 @@ mod tests {
     #[test]
     fn cleanup_only_removes_expired() {
         let d = tmp("clean");
-        let s = PromptStore::open(&d).unwrap();
+        let s = PromptStore::new(&d, true);
         s.put("new", 1, "m", b"{}");
         {
             // 手工塞一条 40 天前的
-            let conn = s.conn.lock();
             let old = chrono::Utc::now().timestamp() - 40 * 86400;
-            conn.execute(
-                "INSERT INTO prompts (trace_id, ts_epoch, key_id, model, raw_bytes, body_gz)
-                 VALUES ('old', ?1, 1, 'm', 2, ?2)",
-                params![old, gzip(b"{}").unwrap()],
-            )
-            .unwrap();
+            s.with_conn(|conn| {
+                conn.execute(
+                    "INSERT INTO prompts (trace_id, ts_epoch, key_id, model, raw_bytes, body_gz)
+                     VALUES ('old', ?1, 1, 'm', 2, ?2)",
+                    params![old, gzip(b"{}").unwrap()],
+                )
+                .unwrap();
+            })
+            .expect("应能拿到连接");
         }
         assert_eq!(s.cleanup(30), 1, "应只删掉 40 天前那条");
         assert!(s.get("old").is_none());
@@ -272,7 +350,7 @@ mod tests {
     #[test]
     fn compression_actually_shrinks_realistic_bodies() {
         let d = tmp("gz");
-        let s = PromptStore::open(&d).unwrap();
+        let s = PromptStore::new(&d, true);
         // 真实 prompt 高度重复（agent 每轮重发全量上下文），压缩比很高
         let body = "The quick brown fox jumps over the lazy dog. ".repeat(2000);
         s.put("t3", 1, "m", body.as_bytes());
