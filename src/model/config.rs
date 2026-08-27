@@ -259,6 +259,18 @@ pub struct Config {
     #[serde(default = "default_usage_log_retention_days")]
     pub usage_log_retention_days: u32,
 
+    /// 是否留存原始请求体（默认关闭）。
+    ///
+    /// 打开后每次请求的完整 body 会 gzip 后写进独立的 `prompts.db`，
+    /// 可在请求日志里查看原文。**这是留存客户数据**，开之前确认对客条款覆盖。
+    /// 实测量级：11.9 万次/月 ≈ 原始 23.8GB、压缩后 5.9GB。
+    #[serde(default)]
+    pub prompt_capture_enabled: bool,
+
+    /// 请求体保留天数（默认 30）。到期自动删除。
+    #[serde(default = "default_prompt_retention_days")]
+    pub prompt_retention_days: u32,
+
     /// 端点特定的配置
     ///
     /// 键为端点名（如 "ide" / "cli"），值为该端点自由定义的参数对象。
@@ -389,6 +401,10 @@ fn default_trace_retention_days() -> u32 {
 /// 月结对账要能回看整个上一个自然月。31 天不够——月初 5 号结上个月的账时，
 /// 上月 1 号已经是 35 天前，日志早被清了，那几天会被当成"零消费"结进账单。
 /// 70 天 = 一个完整月 + 一个完整月的缓冲。
+fn default_prompt_retention_days() -> u32 {
+    30
+}
+
 fn default_usage_log_retention_days() -> u32 {
     70
 }
@@ -435,6 +451,8 @@ impl Default for Config {
             trace_enabled: default_trace_enabled(),
             trace_retention_days: default_trace_retention_days(),
             usage_log_retention_days: default_usage_log_retention_days(),
+            prompt_capture_enabled: false,
+            prompt_retention_days: default_prompt_retention_days(),
             endpoints: HashMap::new(),
             custom_models: Vec::new(),
             scheduling: crate::admin::scheduling::SchedulingConfig::default(),

@@ -237,10 +237,31 @@ async fn main() {
         }
     };
 
+    // 原始请求体留存（独立 prompts.db）。默认关闭；开启后可在请求日志里看原文。
+    // 独立库是刻意的：大 blob 放进 traces.db 会拖慢在线的分钟级聚合，
+    // 而那个查询占着写入路径的锁。
+    let prompt_store: Option<std::sync::Arc<admin::prompt_store::PromptStore>> =
+        if config.prompt_capture_enabled {
+            match admin::prompt_store::PromptStore::open(&cache_dir) {
+                Ok(s) => {
+                    tracing::info!("原始请求体留存已开启，保留 {} 天", config.prompt_retention_days);
+                    Some(std::sync::Arc::new(s))
+                }
+                Err(e) => {
+                    tracing::warn!("打开 prompts.db 失败，请求体留存不可用: {}", e);
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
     // 启动后定期清理过期 usage_log 与 trace 记录
     {
         let recorder = usage_recorder.clone();
         let trace_store = trace_store.clone();
+        let prompt_store_cleanup = prompt_store.clone();
+        let prompt_retention = config.prompt_retention_days as i64;
         tokio::spawn(async move {
             let day = std::time::Duration::from_secs(24 * 3600);
             tokio::time::sleep(std::time::Duration::from_secs(60)).await;
@@ -248,6 +269,9 @@ async fn main() {
                 recorder.cleanup_old_logs();
                 if let Some(ts) = &trace_store {
                     ts.cleanup();
+                }
+                if let Some(ps) = &prompt_store_cleanup {
+                    ps.cleanup(prompt_retention);
                 }
                 tokio::time::sleep(day).await;
             }
@@ -281,6 +305,7 @@ async fn main() {
         Some(usage_aggregator.clone()),
         Some(cache_meter.clone()),
         trace_store.clone(),
+        prompt_store.clone(),
     );
 
     // 构建 Admin API 路由（配置了非空 adminApiKey 时启用）
@@ -314,6 +339,8 @@ async fn main() {
             // 与 API 侧共用同一个速率环（anthropic 路由装配时建立并塞进 provider），
             // 否则两侧各建一个环、各只数到一半流量。
             .with_rate_ring(kiro_provider.rate_ring())
+            // 与 API 侧共用同一个留存实例，否则两侧各开一个库、各写一半
+            .with_prompt_store(prompt_store.clone())
             .with_pricing(common::pricing::PricingTable::from_config(&config.pricing));
 
             // 启动余额后台刷新调度器（每 5 分钟一次，与缓存 TTL 对齐）

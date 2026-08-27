@@ -29,6 +29,7 @@ pub mod groups;
 pub mod scheduling;
 pub mod usage_stats;
 pub mod trace_db;
+pub mod prompt_store;
 
 pub use client_keys::ClientKeyManager;
 pub use groups::GroupManager;

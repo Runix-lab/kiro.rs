@@ -2215,6 +2215,90 @@ fn enterprise_credential_count(state: &AdminState) -> usize {
         .count()
 }
 
+/// GET /api/admin/traces/{trace_id}/prompt
+///
+/// 取回某次请求的原始请求体。只在留存开关打开、且该请求在保留期内时有内容。
+///
+/// **未脱敏**：脱敏放在"转走"那一步做。入库就脱敏的话原始证据就没了，
+/// 真要追责时反而说不清。
+pub async fn get_trace_prompt(
+    State(state): State<AdminState>,
+    Path(trace_id): Path<String>,
+) -> axum::response::Response {
+    let Some(store) = state.prompt_store.as_ref() else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({
+                "error": "请求体留存未开启",
+                "hint": "在设置里打开「原始请求体留存」后，新产生的请求才会被记录；已发生的请求无法追溯。",
+            })),
+        )
+            .into_response();
+    };
+    match store.get(&trace_id) {
+        Some(p) => Json(p).into_response(),
+        None => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({
+                "error": "没有该请求的留存记录",
+                "hint": "可能是留存开启之前发生的、超过保留期已清理、或请求体超过 8MB 上限被跳过。",
+            })),
+        )
+            .into_response(),
+    }
+}
+
+/// GET /api/admin/config/prompt-capture —— 留存开关与容量统计
+pub async fn get_prompt_capture(State(state): State<AdminState>) -> axum::response::Response {
+    let cfg = state.service.token_manager().config();
+    let stats = state
+        .prompt_store
+        .as_ref()
+        .map(|s| s.stats())
+        .unwrap_or_default();
+    Json(serde_json::json!({
+        "enabled": cfg.prompt_capture_enabled,
+        "retentionDays": cfg.prompt_retention_days,
+        "stats": stats,
+        "note": "留存的是原始请求体（未脱敏），不含任何请求头——Authorization / x-api-key 一个字节都不落盘。开关改动需重启生效。",
+        "sizing": "实测量级：约 11.9 万次请求/月，原始 23.8GB、gzip 后约 5.9GB。",
+    }))
+    .into_response()
+}
+
+/// PUT /api/admin/config/prompt-capture —— 开关留存
+pub async fn set_prompt_capture(
+    State(state): State<AdminState>,
+    Json(req): Json<serde_json::Value>,
+) -> axum::response::Response {
+    let enabled = req.get("enabled").and_then(|v| v.as_bool());
+    let retention = req
+        .get("retentionDays")
+        .and_then(|v| v.as_u64())
+        .map(|v| v.clamp(1, 365) as u32);
+    if enabled.is_none() && retention.is_none() {
+        return stats_bad_request("需要 enabled 或 retentionDays".to_string());
+    }
+    state.service.update_config_file(move |c| {
+        if let Some(e) = enabled {
+            c.prompt_capture_enabled = e;
+        }
+        if let Some(r) = retention {
+            c.prompt_retention_days = r;
+        }
+    });
+    Json(serde_json::json!({
+        "success": true,
+        "enabled": enabled,
+        "retentionDays": retention,
+        // 留存要在请求收尾路径上挂一个 SQLite 写入，涉及 AppState 的构造，
+        // 不像限流阈值那样能热切。说清楚比让人以为改完就生效强。
+        "requiresRestart": true,
+        "message": "已保存。留存开关需重启服务后生效（它在请求处理链路的构造期挂载）。",
+    }))
+    .into_response()
+}
+
 /// GET /api/admin/models/cost-analysis?month=YYYY-MM
 ///
 /// 逐模型的成本全景：实测的上游缓存折扣 + 线上真实命中率 + 实付/牌价折扣 + 选型建议。

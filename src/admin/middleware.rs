@@ -33,6 +33,8 @@ pub struct AdminState {
     pub usage_aggregator: SharedAggregator,
     /// 请求链路追踪存储（与 anthropic 路由共享）
     pub trace_store: SharedTraceStore,
+    /// 原始请求体留存（与 anthropic 路由共享；未开启时为 None）
+    pub prompt_store: Option<Arc<crate::admin::prompt_store::PromptStore>>,
     /// 账号分组注册表（持久化到 groups.json）
     pub groups: SharedGroupManager,
     /// 分钟级速率环（与 anthropic 路由共享），RPM/TPM 的唯一数据源。
@@ -60,8 +62,18 @@ impl AdminState {
             trace_store,
             groups,
             rate_ring: None,
+            prompt_store: None,
             pricing: Arc::new(crate::common::pricing::PricingTable::default()),
         }
+    }
+
+    /// 注入原始请求体留存（与 anthropic 路由共享同一个实例）。
+    pub fn with_prompt_store(
+        mut self,
+        store: Option<Arc<crate::admin::prompt_store::PromptStore>>,
+    ) -> Self {
+        self.prompt_store = store;
+        self
     }
 
     /// 注入按配置解析的计价表（缺省时用内置默认表）。

@@ -44,6 +44,7 @@ pub fn create_router_with_provider(
         None,
         None,
         None,
+        None,
     )
 }
 
@@ -58,6 +59,7 @@ pub fn create_router(
     usage_aggregator: Option<SharedAggregator>,
     cache_meter: Option<SharedCacheMeter>,
     trace_store: Option<SharedTraceStore>,
+    prompt_store: Option<Arc<crate::admin::prompt_store::PromptStore>>,
 ) -> Router {
     create_router_with_shared_provider(
         kiro_provider.map(Arc::new),
@@ -68,6 +70,7 @@ pub fn create_router(
         usage_aggregator,
         cache_meter,
         trace_store,
+        prompt_store,
     )
 }
 
@@ -82,6 +85,7 @@ pub fn create_router_with_shared_provider(
     usage_aggregator: Option<SharedAggregator>,
     cache_meter: Option<SharedCacheMeter>,
     trace_store: Option<SharedTraceStore>,
+    prompt_store: Option<Arc<crate::admin::prompt_store::PromptStore>>,
 ) -> Router {
     let mut state = AppState::new(extract_thinking, tool_compatibility_mode);
     // RPM/TPM 采集层。无条件建立：既不依赖 Admin，也不依赖 trace 开关 ——
@@ -96,6 +100,7 @@ pub fn create_router_with_shared_provider(
     state = state.with_usage(client_keys, usage_recorder, usage_aggregator);
     state = state.with_cache_meter(cache_meter);
     state = state.with_trace_store(trace_store);
+    state.prompt_store = prompt_store;
     state = state.with_rate_ring(Some(rate_ring));
 
     // 需要认证的 /v1 路由

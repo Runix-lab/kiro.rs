@@ -51,6 +51,9 @@ pub struct AppState {
     pub cache_meter: Option<SharedCacheMeter>,
     /// 请求链路追踪存储（SQLite，可选）
     pub trace_store: Option<SharedTraceStore>,
+    /// 原始请求体留存（独立 SQLite，默认关闭）。
+    /// 用独立库是为了不让大 blob 拖慢 traces.db 的在线查询。
+    pub prompt_store: Option<std::sync::Arc<crate::admin::prompt_store::PromptStore>>,
     /// 分钟级速率环（RPM / TPM 采集层）
     ///
     /// 刻意不挂在 `trace_store` 之下：traces.db 可被用户从面板关掉，而 RPM/TPM 是
@@ -74,6 +77,7 @@ impl AppState {
             usage_aggregator: None,
             cache_meter: None,
             trace_store: None,
+            prompt_store: None,
             rate_ring: None,
         }
     }

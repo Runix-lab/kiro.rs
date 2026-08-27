@@ -182,6 +182,8 @@ pub(crate) struct RequestTracer {
     /// 首个上游 chunk 到达时刻（仅流式标记；取第一次）
     first_token_at: parking_lot::Mutex<Option<Instant>>,
     attempts: parking_lot::Mutex<Vec<TraceAttempt>>,
+    /// 原始请求体留存（默认关闭）。只在开启时为 Some。
+    prompt_store: Option<std::sync::Arc<crate::admin::prompt_store::PromptStore>>,
 }
 
 /// 本次请求的用量快照（落入 trace 行，与 usage_log 同源）
@@ -220,6 +222,21 @@ impl RequestTracer {
             started_at: Instant::now(),
             first_token_at: parking_lot::Mutex::new(None),
             attempts: parking_lot::Mutex::new(Vec::new()),
+            prompt_store: state.prompt_store.clone(),
+        }
+    }
+
+    /// 留存原始请求体（仅在留存开关打开时生效）。
+    ///
+    /// 只存 body，**不存任何请求头** —— `Authorization` / `x-api-key` 一个字节都不落盘。
+    /// 序列化失败或超限只跳过，不影响请求本身：留存是辅助能力，不能拖垮主路径。
+    pub fn capture_prompt<T: serde::Serialize>(&self, payload: &T) {
+        let Some(store) = &self.prompt_store else {
+            return;
+        };
+        match serde_json::to_vec(payload) {
+            Ok(bytes) => store.put(&self.trace_id, self.key_id, &self.model, &bytes),
+            Err(e) => tracing::debug!(trace_id = %self.trace_id, "请求体序列化失败，跳过留存: {}", e),
         }
     }
 
@@ -833,6 +850,8 @@ pub async fn post_messages(
                 is_stream: payload_stream,
             },
         ));
+// 留存原始请求体（默认关闭，开关在设置里）
+tracer.capture_prompt(&payload);
         // 缓存覆盖比例必须在进 websearch 分支前算好：这条路的兜底从前硬写
         // cache_read/write = 0，把整个 prompt 当新鲜 token 计价（单价是缓存读的
         // 10 倍），方向上是我方多收客户的钱。
@@ -945,6 +964,8 @@ pub async fn post_messages(
                 is_stream: true,
             },
         ));
+// 留存原始请求体（默认关闭，开关在设置里）
+tracer.capture_prompt(&payload);
         handle_stream_request(
             provider,
             &request_body,
@@ -970,6 +991,8 @@ pub async fn post_messages(
                 is_stream: false,
             },
         ));
+// 留存原始请求体（默认关闭，开关在设置里）
+tracer.capture_prompt(&payload);
         handle_non_stream_request(
             provider,
             &request_body,
@@ -1791,6 +1814,8 @@ pub async fn post_messages_cc(
                 is_stream: payload_stream,
             },
         ));
+// 留存原始请求体（默认关闭，开关在设置里）
+tracer.capture_prompt(&payload);
         // 缓存覆盖比例必须在进 websearch 分支前算好：这条路的兜底从前硬写
         // cache_read/write = 0，把整个 prompt 当新鲜 token 计价（单价是缓存读的
         // 10 倍），方向上是我方多收客户的钱。
@@ -1902,6 +1927,8 @@ pub async fn post_messages_cc(
                 is_stream: true,
             },
         ));
+// 留存原始请求体（默认关闭，开关在设置里）
+tracer.capture_prompt(&payload);
         handle_stream_request_buffered(
             provider,
             &request_body,
@@ -1927,6 +1954,8 @@ pub async fn post_messages_cc(
                 is_stream: false,
             },
         ));
+// 留存原始请求体（默认关闭，开关在设置里）
+tracer.capture_prompt(&payload);
         handle_non_stream_request(
             provider,
             &request_body,
@@ -2168,6 +2197,7 @@ mod tests {
             started_at: Instant::now(),
             first_token_at: parking_lot::Mutex::new(None),
             attempts: parking_lot::Mutex::new(Vec::new()),
+            prompt_store: None,
         };
 
         let attempt = |attempt, credential_id, outcome: &str| TraceAttempt {
@@ -2236,6 +2266,7 @@ mod tests {
             started_at: Instant::now(),
             first_token_at: parking_lot::Mutex::new(None),
             attempts: parking_lot::Mutex::new(Vec::new()),
+            prompt_store: None,
         };
 
         tracer.mark_first_token();
@@ -2266,6 +2297,7 @@ mod tests {
             started_at: Instant::now(),
             first_token_at: parking_lot::Mutex::new(None),
             attempts: parking_lot::Mutex::new(Vec::new()),
+            prompt_store: None,
         };
         let attempt = |credential_id, endpoint: &str, status, attempt_outcome: &str| TraceAttempt {
             attempt: 0,
@@ -2667,6 +2699,7 @@ mod tests {
             started_at: Instant::now(),
             first_token_at: parking_lot::Mutex::new(None),
             attempts: parking_lot::Mutex::new(Vec::new()),
+            prompt_store: None,
         }
     }
 

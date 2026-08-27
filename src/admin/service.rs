@@ -1574,7 +1574,7 @@ impl AdminService {
     /// 从磁盘加载最新配置并应用更新，再写回磁盘。
     ///
     /// 每次读最新文件再写，避免多次调用之间字段互相覆盖。
-    fn update_config_file(&self, updater: impl FnOnce(&mut Config)) {
+    pub fn update_config_file(&self, updater: impl FnOnce(&mut Config)) {
         if let Err(error) = self.token_manager.update_config_file(updater) {
             tracing::warn!("保存配置文件失败: {}", error);
         }
