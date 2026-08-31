@@ -137,6 +137,17 @@ pub struct Config {
     #[serde(default)]
     pub admin_api_key: Option<String>,
 
+    /// 只读观察者密钥（可选）。
+    ///
+    /// 拿这个 key 只能读流量面板，且读到的数据经过脱敏：没有客户 Key 名、
+    /// 没有成本与毛利、没有凭据明细、没有请求体。用途是把「服务在正常跑量」
+    /// 这件事给外部方看（支付方审核、合作方尽调），而不必交出管理权限。
+    ///
+    /// 与 `admin_api_key` 是两把不同的 key；相等时按管理员处理并在启动时告警，
+    /// 因为那等于没有降权。
+    #[serde(default)]
+    pub viewer_api_key: Option<String>,
+
     /// 上一次成功更新前正在运行的版本号，用于在前端展示「回退到 vX.Y.Z」按钮。
     /// 实际回退动作通过 `<exe>.backup` 文件完成，无需访问网络。
     #[serde(default)]
@@ -430,6 +441,7 @@ impl Default for Config {
             proxy_username: None,
             proxy_password: None,
             admin_api_key: None,
+            viewer_api_key: None,
             update_previous_version: None,
             github_token: None,
             update_last_applied_at: None,

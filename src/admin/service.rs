@@ -25,7 +25,7 @@ use crate::kiro::model::requests::kiro::KiroRequest;
 use crate::kiro::parser::decoder::EventStreamDecoder;
 use crate::kiro::provider::KiroProvider;
 use crate::kiro::token_manager::{
-    IdcReloginCredentials, MultiTokenManager, RefreshTokenInvalidError,
+    DisabledReason, IdcReloginCredentials, MultiTokenManager, RefreshTokenInvalidError,
 };
 use crate::model::config::Config;
 
@@ -1022,12 +1022,27 @@ impl AdminService {
         let mut success = 0_usize;
         let mut failure = 0_usize;
 
+        let mut recovered: Vec<u64> = Vec::new();
+
         for entry in snapshot.entries.into_iter() {
-            if entry.disabled {
+            // 额度用尽而被停用的凭据也要刷余额 —— 它的恢复信号只能从余额里读到。
+            //
+            // 2026-08-31 查实的一处卡死：`try_self_heal` 的准入只放
+            // `TooManyFailures`（见该函数注释），而这个循环此前跳过了全部
+            // disabled 凭据，于是额度用尽的号两条恢复路径都走不到，月初池子重置后
+            // 仍是停用状态。实例：#6 在 08-31 用满被自动停用，重置在 09-01。
+            // 由 `quota_parked_credentials_keep_refreshing` 钉住。
+            let quota_parked = is_quota_parked(entry.disabled, entry.disabled_reason.as_deref());
+            if entry.disabled && !quota_parked {
                 continue;
             }
             match self.fetch_balance(entry.id).await {
                 Ok(balance) => {
+                    // 判据与 `disable_quota_exceeded` 里的 `exceeded` 互为反面，
+                    // 两处要一起改，否则会出现「刚启用又被停掉」的抖动。
+                    let remaining_now = balance.remaining;
+                    let has_quota_again =
+                        has_quota_again(balance.remaining, balance.usage_percentage);
                     {
                         let mut cache = self.balance_cache.lock();
                         cache.insert(
@@ -1039,6 +1054,22 @@ impl AdminService {
                         );
                     }
                     success += 1;
+                    // 停在额度上的号一旦重新有余额，就地放回服役。
+                    // 只认 `QuotaExceeded` 这一个原因：手动停用、被封、token 失效
+                    // 都不在此列，它们的恢复各有前提，不该被余额顺带解禁。
+                    if quota_parked && has_quota_again {
+                        match self.token_manager.set_disabled(entry.id, false) {
+                            Ok(()) => {
+                                recovered.push(entry.id);
+                                tracing::info!(
+                                    "凭据 #{} 额度已恢复（剩余 {:.0}），自动重新启用",
+                                    entry.id,
+                                    remaining_now
+                                );
+                            }
+                            Err(e) => tracing::warn!("凭据 #{} 额度恢复但启用失败: {}", entry.id, e),
+                        }
+                    }
                 }
                 Err(e) => {
                     tracing::warn!("后台刷新凭据 #{} 余额失败: {}", entry.id, e);
@@ -1051,6 +1082,9 @@ impl AdminService {
 
         if success > 0 {
             self.save_balance_cache();
+        }
+        if !recovered.is_empty() {
+            tracing::info!("本轮自动恢复 {} 条额度用尽的凭据: {:?}", recovered.len(), recovered);
         }
         (success, failure)
     }
@@ -3506,9 +3540,69 @@ fn classify_rate_limit(error: &anyhow::Error) -> Option<AdminServiceError> {
         })
 }
 
+/// 该凭据是不是「只是停在额度上」——手动停用、被封、token 失效都不算。
+///
+/// 抽成自由函数是为了能单测：`refresh_all_balances` 本身要打上游，测不动。
+fn is_quota_parked(disabled: bool, reason: Option<&str>) -> bool {
+    disabled && reason == Some(DisabledReason::QuotaExceeded.as_str())
+}
+
+/// 额度是不是又有了。与 `disable_quota_exceeded` 里的 `exceeded` 判据互为反面，
+/// 两处必须一起改，否则会出现「刚启用又被停掉」的抖动。
+fn has_quota_again(remaining: f64, usage_percentage: f64) -> bool {
+    remaining > 0.0 && usage_percentage < 100.0
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---- 额度停用后的自动恢复（W-10）----
+
+    #[test]
+    fn quota_parked_credentials_keep_refreshing() {
+        // 停在额度上的：要继续刷余额，否则读不到恢复信号。
+        assert!(is_quota_parked(true, Some("QuotaExceeded")));
+        // 其余停用原因：不刷，它们的恢复各有前提。
+        for r in ["Manual", "Suspended", "InvalidRefreshToken", "TooManyRefreshFailures",
+                  "TooManyFailures", "InvalidConfig"] {
+            assert!(!is_quota_parked(true, Some(r)), "{r} 不该被当成停在额度上");
+        }
+        // 没停用的：这个判据与它无关。
+        assert!(!is_quota_parked(false, Some("QuotaExceeded")));
+        assert!(!is_quota_parked(true, None));
+    }
+
+    #[test]
+    fn quota_parked_uses_the_enum_not_a_literal() {
+        // 判据必须跟着枚举走：改名时应当一起动，而不是留下一个对不上的字面量。
+        assert!(is_quota_parked(true, Some(DisabledReason::QuotaExceeded.as_str())));
+    }
+
+    #[test]
+    fn quota_recovers_only_when_both_signals_agree() {
+        assert!(has_quota_again(5000.0, 50.0), "有余额且未满档，应判恢复");
+        // 两个信号各自都能否掉恢复 —— 分开钉，避免只覆盖到其中一支。
+        assert!(!has_quota_again(0.0, 50.0), "余额为 0 不算恢复");
+        assert!(!has_quota_again(-100.0, 50.0), "余额为负不算恢复");
+        assert!(!has_quota_again(5000.0, 100.0), "已用满 100% 不算恢复");
+        assert!(!has_quota_again(5000.0, 137.0), "超过 100% 不算恢复");
+    }
+
+    #[test]
+    fn recovery_judgement_is_the_inverse_of_the_disable_judgement() {
+        // `disable_quota_exceeded` 用的是 `remaining <= 0.0 || usage_percentage >= 100.0`。
+        // 两者必须严格互补，否则同一条凭据会被反复启用又停用。
+        for (rem, pct) in [(5000.0, 50.0), (0.0, 50.0), (5000.0, 100.0), (-1.0, 101.0),
+                           (0.1, 99.9), (0.0, 100.0)] {
+            let exceeded = rem <= 0.0 || pct >= 100.0;
+            assert_ne!(
+                exceeded,
+                has_quota_again(rem, pct),
+                "remaining={rem} pct={pct} 两个判据重叠或留了空隙"
+            );
+        }
+    }
 
     #[test]
     fn available_models_response_preserves_both_token_limits() {

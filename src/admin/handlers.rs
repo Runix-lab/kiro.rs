@@ -3316,3 +3316,100 @@ pub async fn delete_group(
     )))
     .into_response()
 }
+
+// ============ 只读观察者视图 ============
+//
+// 这两个 handler 是外部方（支付方审核、合作方尽调）唯一能看到的东西。
+// 它们刻意不复用 /stats/* —— 那些返回体带客户标识与金额，加过滤分支的话
+// 每次新增字段都要记得补一处，漏一次就是把经营数据发出去了。
+// 白名单在 middleware::VIEWER_ALLOWED，脱敏后的形状在 admin::viewer。
+
+/// 只读会话信息：告诉前端该渲染什么，并明说隐去了哪些内容。
+pub async fn viewer_session() -> impl IntoResponse {
+    Json(super::viewer::ViewerSession::new())
+}
+
+/// 只读流量概览。
+///
+/// `window` 取 `today`（默认）或 `7d`。窗口之外的参数一概不接受 ——
+/// 可自由指定区间等于给了一个探测工具。
+pub async fn viewer_traffic(
+    State(state): State<AdminState>,
+    Query(params): Query<std::collections::HashMap<String, String>>,
+) -> impl IntoResponse {
+    use super::usage_stats::{Range, StatsGranularity, StatsQueryWindow};
+
+    let window_key = params
+        .get("window")
+        .map(String::as_str)
+        .filter(|w| *w == "7d")
+        .unwrap_or("today");
+    let (range, granularity) = if window_key == "7d" {
+        (Range::Last7d, StatsGranularity::Day)
+    } else {
+        (Range::Last24h, StatsGranularity::Hour)
+    };
+    let q = StatsQueryWindow::preset(range, granularity);
+
+    let series = state
+        .usage_aggregator
+        .query_timeseries(q, None, None, &state.pricing);
+    let by_model = state
+        .usage_aggregator
+        .query_by_model(q, None, &state.pricing);
+
+    let requests: u64 = series.iter().map(|p| p.calls).sum();
+    let errors: u64 = series.iter().map(|p| p.errors).sum();
+    // 输入与输出合并上报：拆开可以反推成本结构，而对方要看的是「有没有量」。
+    let tokens: u64 = series
+        .iter()
+        .map(|p| {
+            p.input_tokens
+                .saturating_add(p.output_tokens)
+                .saturating_add(p.cache_creation_tokens)
+                .saturating_add(p.cache_read_tokens)
+        })
+        .sum();
+
+    let counts: Vec<(String, u64)> = by_model
+        .into_iter()
+        .map(|m| (m.model, m.calls))
+        .collect();
+
+    // 只取最近 24 个点，且只取 calls —— 时间戳与金额都不给。
+    let hourly_requests: Vec<u64> = series
+        .iter()
+        .rev()
+        .take(24)
+        .map(|p| p.calls)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect();
+
+    let current_rpm = state
+        .rate_ring
+        .as_ref()
+        .map(|r| r.snapshot().ingress_rpm)
+        .unwrap_or(0);
+
+    let active_credentials = state
+        .service
+        .get_all_credentials()
+        .credentials
+        .iter()
+        .filter(|c| !c.disabled)
+        .count() as u64;
+
+    Json(super::viewer::ViewerTraffic {
+        window: window_key.to_string(),
+        requests,
+        success_rate_pct: super::viewer::success_rate(requests, errors),
+        tokens,
+        models: super::viewer::model_shares(&counts, requests),
+        hourly_requests,
+        current_rpm,
+        active_credentials,
+        generated_at: chrono::Utc::now().to_rfc3339(),
+    })
+}

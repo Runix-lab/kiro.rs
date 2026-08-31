@@ -19,6 +19,7 @@ use super::{
         get_credential_balance, get_credential_models, get_current_models, get_global_proxy,
         get_load_balancing_mode, get_log_governance_config, get_proxy_pool, get_self_heal_config,
         get_scheduling_config, get_update_config, list_client_keys, list_groups, list_traces, poll_idc_login,
+        viewer_session, viewer_traffic,
         poll_idc_relogin, poll_social_login, poll_social_relogin, pull_update_image,
         reset_all_success_count, reset_client_key_stats, reset_failure_count, reset_success_count,
         rollback_image_update, rotate_client_key, run_scheduling_now, set_scheduling_config, set_account_rpm_limit_config,
@@ -67,6 +68,9 @@ pub fn create_admin_router(state: AdminState) -> Router {
             "/credentials",
             get(get_all_credentials).post(add_credential),
         )
+        // 只读观察者可达的两条（白名单在 middleware::VIEWER_ALLOWED）。
+        .route("/viewer/session", get(viewer_session))
+        .route("/viewer/traffic", get(viewer_traffic))
         .route("/credentials/export", get(export_credentials))
         .route(
             "/credentials/{id}",

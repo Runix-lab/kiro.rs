@@ -954,8 +954,11 @@ fn refresh_token_duplicate_exists(
 }
 
 /// 禁用原因
+///
+/// `pub(crate)`：`admin::service` 要按枚举判断"停在额度上"这一种，
+/// 不能靠硬编码 `"QuotaExceeded"` 字面量（改名会静默漂移）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum DisabledReason {
+pub(crate) enum DisabledReason {
     /// Admin API 手动禁用
     Manual,
     /// 连续失败达到阈值后自动禁用
@@ -974,7 +977,11 @@ enum DisabledReason {
 }
 
 impl DisabledReason {
-    fn as_str(self) -> &'static str {
+    /// 持久化与快照里用的稳定字符串。
+    ///
+    /// `pub` 是为了让调用方按枚举比较而不是硬编码字面量 —— 后者在改名时会静默漂移。
+    /// `admin::fleet_health` 的分级表与 `admin::service` 的额度恢复判断都依赖它。
+    pub fn as_str(self) -> &'static str {
         match self {
             Self::Manual => "Manual",
             Self::TooManyFailures => "TooManyFailures",

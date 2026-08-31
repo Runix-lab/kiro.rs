@@ -342,7 +342,9 @@ async fn main() {
             .with_rate_ring(kiro_provider.rate_ring())
             // 与 API 侧共用同一个留存实例，否则两侧各开一个库、各写一半
             .with_prompt_store(prompt_store.clone())
-            .with_pricing(common::pricing::PricingTable::from_config(&config.pricing));
+            .with_pricing(common::pricing::PricingTable::from_config(&config.pricing))
+            // 只读观察者密钥：拿它只能 GET /api/admin/viewer/*，返回脱敏后的流量概览。
+            .with_viewer_api_key(config.viewer_api_key.clone());
 
             // 启动余额后台刷新调度器（每 5 分钟一次，与缓存 TTL 对齐）
             admin_state

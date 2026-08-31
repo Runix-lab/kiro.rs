@@ -1125,6 +1125,12 @@ impl AdminErrorResponse {
         Self::new("not_found", message)
     }
 
+    /// 密钥有效但权限不够。与 `authentication_error` 分开，是为了让持只读密钥的人
+    /// 知道"key 没错，只是这里不给看"，而不是去怀疑密钥发错了。
+    pub fn forbidden(message: impl Into<String>) -> Self {
+        Self::new("permission_error", message)
+    }
+
     pub fn api_error(message: impl Into<String>) -> Self {
         Self::new("api_error", message)
     }

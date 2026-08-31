@@ -33,6 +33,7 @@ pub mod prompt_store;
 pub mod alerts;
 pub mod fleet_health;
 pub mod group_rules;
+pub mod viewer;
 #[cfg(test)]
 pub mod fleet_bench;
 
