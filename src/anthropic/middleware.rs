@@ -25,10 +25,42 @@ use super::types::ErrorResponse;
 pub struct KeyContext {
     /// 命中的客户端 Key id
     pub key_id: u64,
-    /// 该 Key 绑定的账号分组；None 表示未绑定，可使用全部账号
+    /// 该 Key 绑定的账号分组名。仅用于记账与 trace **展示**；
+    /// 调度可见性一律走 [`KeyContext::scope`]，不要在别处根据这个字段自己判。
     pub group: Option<String>,
+    /// 是否是系统 Key（`config.json` 的 apiKey 同步来的那个）。
+    ///
+    /// 只有它能看全池。客户 Key 即使没绑分组也不行 —— 那条曾经是等价的，
+    /// 于是所有把分组弄丢的路径都失败为提权（见 `GroupScope` 的注释）。
+    pub is_system: bool,
     /// 命中的入口 Key 类型。
     pub key_source: TraceKeySource,
+}
+
+impl KeyContext {
+    /// 这个 Key 能看到哪些上游凭据。**调度可见性的唯一出处。**
+    pub fn scope(&self) -> crate::kiro::token_manager::GroupScope<'_> {
+        use crate::kiro::token_manager::GroupScope;
+        if self.is_system {
+            return GroupScope::AllGroups;
+        }
+        match self.group.as_deref() {
+            Some(g) => GroupScope::Named(g),
+            None => GroupScope::Unassigned,
+        }
+    }
+
+    /// 同 [`scope`]，但 owned —— 给要跨 await 送进 async 任务的调用点。
+    pub fn scope_owned(&self) -> crate::kiro::token_manager::GroupScopeOwned {
+        use crate::kiro::token_manager::GroupScopeOwned;
+        if self.is_system {
+            return GroupScopeOwned::AllGroups;
+        }
+        match self.group.clone() {
+            Some(g) => GroupScopeOwned::Named(g),
+            None => GroupScopeOwned::Unassigned,
+        }
+    }
 }
 
 /// 应用共享状态
@@ -140,9 +172,12 @@ pub async fn auth_middleware(
     if let Some(mgr) = &state.client_keys {
         if let Some(id) = mgr.verify_and_touch(&presented) {
             let group = mgr.group_of(id);
+            // 全池可见性在这里一次定死，下游只读 KeyContext::scope()。
+            let is_system = mgr.is_system(id);
             request.extensions_mut().insert(KeyContext {
                 key_id: id,
                 group,
+                is_system,
                 key_source: TraceKeySource::ClientKey,
             });
             return next.run(request).await;

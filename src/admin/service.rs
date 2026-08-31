@@ -25,6 +25,7 @@ use crate::kiro::model::requests::kiro::KiroRequest;
 use crate::kiro::parser::decoder::EventStreamDecoder;
 use crate::kiro::provider::KiroProvider;
 use crate::kiro::token_manager::{
+    GroupScope,
     DisabledReason, IdcReloginCredentials, MultiTokenManager, RefreshTokenInvalidError,
 };
 use crate::model::config::Config;
@@ -944,7 +945,7 @@ impl AdminService {
         let started = std::time::Instant::now();
         let (credential_id, bytes) =
             tokio::time::timeout(std::time::Duration::from_secs(90), async {
-                let call = provider.call_api(&body, None, None).await?;
+                let call = provider.call_api(&body, None, GroupScope::AllGroups).await?;
                 let credential_id = call.credential_id;
                 let bytes = call.response.bytes().await?;
                 Ok::<_, anyhow::Error>((credential_id, bytes))

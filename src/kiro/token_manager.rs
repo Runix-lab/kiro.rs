@@ -1251,17 +1251,57 @@ pub struct IdcReloginCredentials {
 ///
 /// - `group = None`：Key 未绑定分组（含 master apiKey），匹配所有账号。
 /// - `group = Some(g)`：仅匹配 `cred_groups` 包含 `g` 的账号。
-fn group_matches(cred_groups: &[String], group: Option<&str>) -> bool {
-    match group {
-        None => true,
-        Some(g) => cred_groups.iter().any(|cg| cg == g),
+/// 一个 Key 能看到哪些上游凭据。
+///
+/// 为什么是枚举而不是继续用 `Option<&str>`:那个类型把两件语义完全不同的事压成了
+/// 同一个 `None` —— 「系统 Key,该看全池」和「客户 Key 忘填分组,不该看全池」。
+/// 结果是所有把分组弄丢的路径(漏填 / force 删组 / 分组名 typo)**一律失败为提权**,
+/// 而不是失败为拒绝。用枚举之后这两件事在类型上就分开了,调用方必须明确选一个。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GroupScope<'a> {
+    /// 全池可见。**只发给系统 Key**(`client_keys` 里 `is_system == true`)。
+    AllGroups,
+    /// 只可见 groups 含该名字的凭据。
+    Named(&'a str),
+    /// 只可见**没有任何分组**的凭据。
+    ///
+    /// 客户 Key 没绑分组时落在这里。此前它等价于 `AllGroups`,是那条越权的根。
+    Unassigned,
+}
+
+/// [`GroupScope`] 的 owned 版本，给要跨 await 传进 async 任务的地方用。
+///
+/// 存在的理由只是生命周期：`GroupScope` 借的是 Key 上那个分组名字符串，
+/// 跨 await 拿不住。语义与 `GroupScope` 一一对应，用 `as_ref()` 借回去。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GroupScopeOwned {
+    AllGroups,
+    Named(String),
+    Unassigned,
+}
+
+impl GroupScopeOwned {
+    pub fn as_ref(&self) -> GroupScope<'_> {
+        match self {
+            Self::AllGroups => GroupScope::AllGroups,
+            Self::Named(g) => GroupScope::Named(g),
+            Self::Unassigned => GroupScope::Unassigned,
+        }
+    }
+}
+
+fn group_matches(cred_groups: &[String], scope: GroupScope<'_>) -> bool {
+    match scope {
+        GroupScope::AllGroups => true,
+        GroupScope::Named(g) => cred_groups.iter().any(|cg| cg == g),
+        GroupScope::Unassigned => cred_groups.is_empty(),
     }
 }
 
 fn credential_matches_request(
     credentials: &KiroCredentials,
     model: Option<&str>,
-    group: Option<&str>,
+    scope: GroupScope<'_>,
 ) -> bool {
     let is_opus = model
         .map(|m| m.to_ascii_lowercase().contains("opus"))
@@ -1271,7 +1311,7 @@ fn credential_matches_request(
         return false;
     }
 
-    group_matches(&credentials.groups, group)
+    group_matches(&credentials.groups, scope)
 }
 
 fn normalize_self_heal_model(model: Option<&str>) -> Option<String> {
@@ -1663,7 +1703,7 @@ impl MultiTokenManager {
         }
     }
 
-    fn available_model_credential_ids(&self, group: Option<&str>) -> Vec<u64> {
+    fn available_model_credential_ids(&self, scope: GroupScope<'_>) -> Vec<u64> {
         let now = Instant::now();
         self.entries
             .lock()
@@ -1674,7 +1714,7 @@ impl MultiTokenManager {
                         .throttled_until
                         .map(|until| until > now)
                         .unwrap_or(false)
-                    && group_matches(&entry.credentials.groups, group)
+                    && group_matches(&entry.credentials.groups, scope)
             })
             .map(|entry| entry.id)
             .collect()
@@ -1683,9 +1723,9 @@ impl MultiTokenManager {
     /// 返回当前客户端分组可访问凭据的动态模型并集原始项。
     pub async fn discover_models_for_group(
         &self,
-        group: Option<&str>,
+        scope: GroupScope<'_>,
     ) -> Result<Vec<UpstreamModel>, ModelDiscoveryError> {
-        let ids = self.available_model_credential_ids(group);
+        let ids = self.available_model_credential_ids(scope);
         if ids.is_empty() {
             return Err(ModelDiscoveryError::NoAvailableCredentials);
         }
@@ -1724,7 +1764,7 @@ impl MultiTokenManager {
     pub fn start_model_cache_warmer(self: &Arc<Self>) {
         let manager = Arc::clone(self);
         tokio::spawn(async move {
-            match manager.discover_models_for_group(None).await {
+            match manager.discover_models_for_group(GroupScope::AllGroups).await {
                 Ok(models) => {
                     tracing::info!("模型缓存预热完成，共加载 {} 个模型条目", models.len())
                 }
@@ -1739,11 +1779,11 @@ impl MultiTokenManager {
     /// 获取指定分组的凭据总数（group=None 时返回全部凭据数）
     ///
     /// 用于按分组计算 failover 重试预算，避免小分组按全局账号数获得过多无效重试。
-    pub fn total_count_in_group(&self, group: Option<&str>) -> usize {
+    pub fn total_count_in_group(&self, scope: GroupScope<'_>) -> usize {
         self.entries
             .lock()
             .iter()
-            .filter(|e| group_matches(&e.credentials.groups, group))
+            .filter(|e| group_matches(&e.credentials.groups, scope))
             .count()
     }
 
@@ -1761,7 +1801,7 @@ impl MultiTokenManager {
         &self,
         entry: &CredentialEntry,
         model: Option<&str>,
-        group: Option<&str>,
+        scope: GroupScope<'_>,
         now: Instant,
     ) -> bool {
         !entry.disabled
@@ -1770,7 +1810,7 @@ impl MultiTokenManager {
                 .map(|until| until > now)
                 .unwrap_or(false)
             && !self.rpm_exceeded(entry, now)
-            && credential_matches_request(&entry.credentials, model, group)
+            && credential_matches_request(&entry.credentials, model, scope)
             && self.cached_model_support(entry.id, model) != CachedModelSupport::Unsupported
     }
 
@@ -1800,7 +1840,7 @@ impl MultiTokenManager {
         &self,
         entries: &[CredentialEntry],
         model: Option<&str>,
-        group: Option<&str>,
+        scope: GroupScope<'_>,
         now: Instant,
     ) -> Option<u64> {
         if !self.account_rpm_limit_enabled.load(Ordering::Relaxed) {
@@ -1820,7 +1860,7 @@ impl MultiTokenManager {
                     .throttled_until
                     .map(|until| until > now)
                     .unwrap_or(false)
-                && credential_matches_request(&entry.credentials, model, group)
+                && credential_matches_request(&entry.credentials, model, scope)
                 && self.cached_model_support(entry.id, model) != CachedModelSupport::Unsupported
         }) {
             let fresh_count = entry
@@ -1899,12 +1939,12 @@ impl MultiTokenManager {
         &self,
         entries: &[CredentialEntry],
         model: Option<&str>,
-        group: Option<&str>,
+        scope: GroupScope<'_>,
     ) -> bool {
         let now = Instant::now();
         entries
             .iter()
-            .any(|entry| self.entry_available_for_request(entry, model, group, now))
+            .any(|entry| self.entry_available_for_request(entry, model, scope, now))
     }
 
     /// 根据负载均衡模式选择下一个凭据
@@ -1917,7 +1957,7 @@ impl MultiTokenManager {
     fn select_next_credential(
         &self,
         model: Option<&str>,
-        group: Option<&str>,
+        scope: GroupScope<'_>,
     ) -> Option<(u64, KiroCredentials)> {
         let entries = self.entries.lock();
         let now = Instant::now();
@@ -1926,7 +1966,7 @@ impl MultiTokenManager {
         let available: Vec<_> = entries
             .iter()
             .filter_map(|e| {
-                if !self.entry_available_for_request(e, model, group, now) {
+                if !self.entry_available_for_request(e, model, scope, now) {
                     return None;
                 }
                 let model_support = self.cached_model_support(e.id, model);
@@ -1976,9 +2016,9 @@ impl MultiTokenManager {
     pub async fn acquire_context(
         &self,
         model: Option<&str>,
-        group: Option<&str>,
+        scope: GroupScope<'_>,
     ) -> anyhow::Result<CallContext> {
-        self.acquire_context_impl(model, group, true)
+        self.acquire_context_impl(model, scope, true)
             .await
             .map(|(context, _)| context)
     }
@@ -1990,10 +2030,10 @@ impl MultiTokenManager {
     async fn acquire_context_impl(
         &self,
         model: Option<&str>,
-        group: Option<&str>,
+        scope: GroupScope<'_>,
         update_current: bool,
     ) -> anyhow::Result<(CallContext, bool)> {
-        let total = self.total_count_in_group(group);
+        let total = self.total_count_in_group(scope);
         let max_attempts = (total * MAX_FAILURES_PER_CREDENTIAL as usize).max(1);
         let mut attempt_count = 0;
 
@@ -2027,7 +2067,7 @@ impl MultiTokenManager {
                         !e.disabled
                             && !e.throttled_until.map(|t| t > now).unwrap_or(false)
                             && !self.rpm_exceeded(e, now)
-                            && credential_matches_request(&e.credentials, model, group)
+                            && credential_matches_request(&e.credentials, model, scope)
                             && self.cached_model_support(e.id, model)
                                 == CachedModelSupport::Confirmed
                     });
@@ -2039,7 +2079,7 @@ impl MultiTokenManager {
                                 && !e.disabled
                                 && !e.throttled_until.map(|t| t > now).unwrap_or(false)
                                 && !self.rpm_exceeded(e, now)
-                                && credential_matches_request(&e.credentials, model, group)
+                                && credential_matches_request(&e.credentials, model, scope)
                                 && model_support != CachedModelSupport::Unsupported
                                 && (!confirmed_available
                                     || model_support == CachedModelSupport::Confirmed)
@@ -2051,12 +2091,12 @@ impl MultiTokenManager {
                     hit
                 } else {
                     // 当前凭据不可用或 balanced 模式，根据负载均衡策略选择
-                    let mut best = self.select_next_credential(model, group);
+                    let mut best = self.select_next_credential(model, scope);
 
                     // 没有可用凭据：如果是"自动禁用导致全灭"，做一次受控自愈
                     // （受冷却间隔与连续轮数上限约束，避免持续 403 死循环）。
-                    if best.is_none() && self.try_self_heal(model, group) {
-                        best = self.select_next_credential(model, group);
+                    if best.is_none() && self.try_self_heal(model, scope) {
+                        best = self.select_next_credential(model, scope);
                     }
 
                     if let Some((new_id, new_creds)) = best {
@@ -2068,7 +2108,7 @@ impl MultiTokenManager {
                     } else {
                         let entries = self.entries.lock();
                         if let Some(retry_after) =
-                            self.rpm_retry_after_secs(&entries, model, group, Instant::now())
+                            self.rpm_retry_after_secs(&entries, model, scope, Instant::now())
                         {
                             return Err(
                                 UpstreamRateLimitError::new(Some(retry_after.to_string())).into()
@@ -2595,7 +2635,7 @@ impl MultiTokenManager {
     /// * `id` - 凭据 ID（来自 CallContext）
     #[cfg(test)]
     pub fn report_failure(&self, id: u64) -> bool {
-        self.report_failure_for_request(id, None, None)
+        self.report_failure_for_request(id, None, GroupScope::AllGroups)
     }
 
     /// 报告指定请求作用域内的凭据失败，并返回该作用域是否还有可用凭据。
@@ -2603,18 +2643,18 @@ impl MultiTokenManager {
         &self,
         id: u64,
         model: Option<&str>,
-        group: Option<&str>,
+        scope: GroupScope<'_>,
     ) -> bool {
         let (result, newly_disabled) = {
             let mut entries = self.entries.lock();
             let mut current_id = self.current_id.lock();
 
             let Some(entry_index) = entries.iter().position(|entry| entry.id == id) else {
-                return self.has_available_for_request(&entries, model, group);
+                return self.has_available_for_request(&entries, model, scope);
             };
 
             if entries[entry_index].disabled {
-                return self.has_available_for_request(&entries, model, group);
+                return self.has_available_for_request(&entries, model, scope);
             }
 
             entries[entry_index].failure_count += 1;
@@ -2639,7 +2679,7 @@ impl MultiTokenManager {
                 if let Some(next) = entries
                     .iter()
                     .filter(|entry| {
-                        self.entry_available_for_request(entry, model, group, Instant::now())
+                        self.entry_available_for_request(entry, model, scope, Instant::now())
                     })
                     .min_by_key(|e| e.credentials.priority)
                 {
@@ -2655,7 +2695,7 @@ impl MultiTokenManager {
             }
 
             (
-                self.has_available_for_request(&entries, model, group),
+                self.has_available_for_request(&entries, model, scope),
                 disabled_now,
             )
         };
@@ -2676,25 +2716,25 @@ impl MultiTokenManager {
     /// 返回是否还有可用凭据可以重试。
     #[cfg(test)]
     pub fn report_suspended(&self, id: u64) -> bool {
-        self.report_suspended_for_request(id, None, None)
+        self.report_suspended_for_request(id, None, GroupScope::AllGroups)
     }
 
     pub fn report_suspended_for_request(
         &self,
         id: u64,
         model: Option<&str>,
-        group: Option<&str>,
+        scope: GroupScope<'_>,
     ) -> bool {
         let result = {
             let mut entries = self.entries.lock();
             let mut current_id = self.current_id.lock();
 
             let Some(entry_index) = entries.iter().position(|entry| entry.id == id) else {
-                return self.has_available_for_request(&entries, model, group);
+                return self.has_available_for_request(&entries, model, scope);
             };
 
             if entries[entry_index].disabled {
-                return self.has_available_for_request(&entries, model, group);
+                return self.has_available_for_request(&entries, model, scope);
             }
 
             let entry = &mut entries[entry_index];
@@ -2714,7 +2754,7 @@ impl MultiTokenManager {
             if let Some(next) = entries
                 .iter()
                 .filter(|entry| {
-                    self.entry_available_for_request(entry, model, group, Instant::now())
+                    self.entry_available_for_request(entry, model, scope, Instant::now())
                 })
                 .min_by_key(|e| e.credentials.priority)
             {
@@ -2754,7 +2794,7 @@ impl MultiTokenManager {
     /// 仅复活 [`DisabledReason::TooManyFailures`]；手动禁用、额度用尽、token 失效等
     /// 其它原因禁用的凭据不受影响。
     /// 返回本次是否实际执行了自愈（调用方据此决定是否重新选取凭据）。
-    fn try_self_heal(&self, model: Option<&str>, group: Option<&str>) -> bool {
+    fn try_self_heal(&self, model: Option<&str>, scope: GroupScope<'_>) -> bool {
         if !self.self_heal_enabled.load(Ordering::Relaxed) {
             tracing::debug!("当前请求没有可用凭据，但自愈已关闭");
             return false;
@@ -2774,7 +2814,7 @@ impl MultiTokenManager {
             for entry in entries.iter_mut() {
                 if !entry.disabled
                     || entry.disabled_reason != Some(DisabledReason::TooManyFailures)
-                    || !credential_matches_request(&entry.credentials, model, group)
+                    || !credential_matches_request(&entry.credentials, model, scope)
                     || self.cached_model_support(entry.id, model) == CachedModelSupport::Unsupported
                 {
                     continue;
@@ -2825,7 +2865,7 @@ impl MultiTokenManager {
 
         tracing::warn!(
             model = model.unwrap_or("<none>"),
-            group = group.unwrap_or("<all>"),
+            scope = ?scope,
             recovered_count = recovered.len(),
             recovered = ?recovered,
             "当前请求作用域无可用凭据，执行受控自愈"
@@ -2844,25 +2884,25 @@ impl MultiTokenManager {
     /// - 返回是否还有可用凭据
     #[cfg(test)]
     pub fn report_quota_exhausted(&self, id: u64) -> bool {
-        self.report_quota_exhausted_for_request(id, None, None)
+        self.report_quota_exhausted_for_request(id, None, GroupScope::AllGroups)
     }
 
     pub fn report_quota_exhausted_for_request(
         &self,
         id: u64,
         model: Option<&str>,
-        group: Option<&str>,
+        scope: GroupScope<'_>,
     ) -> bool {
         let result = {
             let mut entries = self.entries.lock();
             let mut current_id = self.current_id.lock();
 
             let Some(entry_index) = entries.iter().position(|entry| entry.id == id) else {
-                return self.has_available_for_request(&entries, model, group);
+                return self.has_available_for_request(&entries, model, scope);
             };
 
             if entries[entry_index].disabled {
-                return self.has_available_for_request(&entries, model, group);
+                return self.has_available_for_request(&entries, model, scope);
             }
 
             let entry = &mut entries[entry_index];
@@ -2882,7 +2922,7 @@ impl MultiTokenManager {
             if let Some(next) = entries
                 .iter()
                 .filter(|entry| {
-                    self.entry_available_for_request(entry, model, group, Instant::now())
+                    self.entry_available_for_request(entry, model, scope, Instant::now())
                 })
                 .min_by_key(|e| e.credentials.priority)
             {
@@ -3199,7 +3239,7 @@ impl MultiTokenManager {
         id: u64,
         cooldown: StdDuration,
         model: Option<&str>,
-        group: Option<&str>,
+        scope: GroupScope<'_>,
     ) -> usize {
         let now = Instant::now();
         {
@@ -3229,7 +3269,7 @@ impl MultiTokenManager {
                             .throttled_until
                             .map(|t| t > throttled_now)
                             .unwrap_or(false)
-                        && credential_matches_request(&e.credentials, model, group)
+                        && credential_matches_request(&e.credentials, model, scope)
                 })
                 .count()
         }
@@ -3692,7 +3732,7 @@ impl MultiTokenManager {
     pub async fn get_available_models_for_current(
         &self,
     ) -> anyhow::Result<(u64, ListAvailableModelsResponse, bool)> {
-        let (context, is_balanced) = self.acquire_context_impl(None, None, false).await?;
+        let (context, is_balanced) = self.acquire_context_impl(None, GroupScope::AllGroups, false).await?;
         let id = context.id;
         let response = self.refresh_model_cache_for(id, true).await?;
         Ok((id, response, is_balanced))
@@ -4774,7 +4814,7 @@ mod tests {
         let mgr = rpm_test_manager(true, 1);
         mgr.record_request(1);
 
-        let error = match mgr.acquire_context(None, None).await {
+        let error = match mgr.acquire_context(None, GroupScope::AllGroups).await {
             Ok(_) => panic!("RPM 已耗尽时不应返回调用上下文"),
             Err(error) => error,
         };
@@ -5295,7 +5335,7 @@ mod tests {
         .unwrap();
 
         disable_all_via_failures(&manager, &[1, 2]);
-        assert!(manager.try_self_heal(None, None), "全灭且启用时应执行自愈");
+        assert!(manager.try_self_heal(None, GroupScope::AllGroups), "全灭且启用时应执行自愈");
         assert_eq!(manager.available_count(), 2, "自愈后应恢复全部凭据");
 
         let (_, _, _, _, consecutive, total) = manager.get_self_heal_config();
@@ -5317,11 +5357,11 @@ mod tests {
         .unwrap();
 
         disable_all_via_failures(&manager, &[1, 2]);
-        assert!(manager.try_self_heal(None, None), "首次自愈应成功");
+        assert!(manager.try_self_heal(None, GroupScope::AllGroups), "首次自愈应成功");
 
         // 再次全灭，但仍在冷却窗口内 → 不应再次自愈
         disable_all_via_failures(&manager, &[1, 2]);
-        assert!(!manager.try_self_heal(None, None), "冷却窗口内不应再次自愈");
+        assert!(!manager.try_self_heal(None, GroupScope::AllGroups), "冷却窗口内不应再次自愈");
         assert_eq!(manager.available_count(), 0);
 
         let (_, _, _, _, consecutive, total) = manager.get_self_heal_config();
@@ -5340,11 +5380,11 @@ mod tests {
 
         // 无任何成功，连续自愈到达上限后停止
         disable_all_via_failures(&manager, &[1]);
-        assert!(manager.try_self_heal(None, None), "第 1 轮自愈");
+        assert!(manager.try_self_heal(None, GroupScope::AllGroups), "第 1 轮自愈");
         disable_all_via_failures(&manager, &[1]);
-        assert!(manager.try_self_heal(None, None), "第 2 轮自愈");
+        assert!(manager.try_self_heal(None, GroupScope::AllGroups), "第 2 轮自愈");
         disable_all_via_failures(&manager, &[1]);
-        assert!(!manager.try_self_heal(None, None), "达上限后应停止自愈");
+        assert!(!manager.try_self_heal(None, GroupScope::AllGroups), "达上限后应停止自愈");
         assert_eq!(manager.available_count(), 0);
     }
 
@@ -5358,9 +5398,9 @@ mod tests {
                 .unwrap();
 
         disable_all_via_failures(&manager, &[1]);
-        assert!(manager.try_self_heal(None, None), "第 1 轮自愈");
+        assert!(manager.try_self_heal(None, GroupScope::AllGroups), "第 1 轮自愈");
         disable_all_via_failures(&manager, &[1]);
-        assert!(manager.try_self_heal(None, None), "第 2 轮自愈");
+        assert!(manager.try_self_heal(None, GroupScope::AllGroups), "第 2 轮自愈");
 
         // 一次成功清零连续计数
         manager.report_success(1);
@@ -5369,7 +5409,7 @@ mod tests {
 
         // 清零后应能重新自愈（不受之前上限影响）
         disable_all_via_failures(&manager, &[1]);
-        assert!(manager.try_self_heal(None, None), "成功清零后应可再次自愈");
+        assert!(manager.try_self_heal(None, GroupScope::AllGroups), "成功清零后应可再次自愈");
     }
 
     #[test]
@@ -5401,7 +5441,7 @@ mod tests {
 
         // 自愈不应复活 Suspended 凭据
         assert!(
-            !manager.try_self_heal(None, None),
+            !manager.try_self_heal(None, GroupScope::AllGroups),
             "Suspended 凭据不参与自愈"
         );
         assert_eq!(manager.available_count(), 0);
@@ -5435,7 +5475,7 @@ mod tests {
                 .unwrap();
 
         disable_all_via_failures(&manager, &[1]);
-        assert!(!manager.try_self_heal(None, None), "自愈关闭时不应恢复");
+        assert!(!manager.try_self_heal(None, GroupScope::AllGroups), "自愈关闭时不应恢复");
         assert_eq!(manager.available_count(), 0);
     }
 
@@ -5454,7 +5494,7 @@ mod tests {
         let manager =
             MultiTokenManager::new(config, vec![first, second], None, None, false).unwrap();
 
-        assert!(manager.try_self_heal(None, None));
+        assert!(manager.try_self_heal(None, GroupScope::AllGroups));
         let (_, _, _, _, consecutive, total) = manager.get_self_heal_config();
         assert_eq!(consecutive, u32::MAX);
         assert_eq!(total, u64::MAX);
@@ -5478,7 +5518,7 @@ mod tests {
 
         disable_all_via_failures(&manager, &[1, 2]);
         let context = manager
-            .acquire_context(None, Some("g1"))
+            .acquire_context(None, GroupScope::Named("g1"))
             .await
             .expect("g1 应恢复自己的凭据");
         assert_eq!(context.id, 1);
@@ -5509,7 +5549,7 @@ mod tests {
             manager.report_failure(1);
         }
         manager
-            .acquire_context(None, Some("g1"))
+            .acquire_context(None, GroupScope::Named("g1"))
             .await
             .expect("g1 首轮自愈应成功");
         for _ in 0..MAX_FAILURES_PER_CREDENTIAL {
@@ -5518,7 +5558,7 @@ mod tests {
 
         manager.report_success(2);
         assert!(
-            manager.acquire_context(None, Some("g1")).await.is_err(),
+            manager.acquire_context(None, GroupScope::Named("g1")).await.is_err(),
             "g2 成功不能解除 g1 已达到的自愈上限"
         );
         let g1 = manager
@@ -5546,20 +5586,20 @@ mod tests {
         seed_model_cache(&manager, 1, &["model-a", "model-b"]);
 
         for _ in 0..MAX_FAILURES_PER_CREDENTIAL {
-            manager.report_failure_for_request(1, Some("model-a"), None);
+            manager.report_failure_for_request(1, Some("model-a"), GroupScope::AllGroups);
         }
         manager
-            .acquire_context(Some("model-a"), None)
+            .acquire_context(Some("model-a"), GroupScope::AllGroups)
             .await
             .expect("model-a 首轮自愈应成功");
         for _ in 0..MAX_FAILURES_PER_CREDENTIAL {
-            manager.report_failure_for_request(1, Some("model-a"), None);
+            manager.report_failure_for_request(1, Some("model-a"), GroupScope::AllGroups);
         }
 
         manager.report_success_for_request(1, Some("model-b"));
         assert!(
             manager
-                .acquire_context(Some("model-a"), None)
+                .acquire_context(Some("model-a"), GroupScope::AllGroups)
                 .await
                 .is_err(),
             "model-b 成功不能解除 model-a 已达到的自愈上限"
@@ -5582,7 +5622,7 @@ mod tests {
 
         assert!(
             manager
-                .acquire_context(None, Some("missing"))
+                .acquire_context(None, GroupScope::Named("missing"))
                 .await
                 .is_err()
         );
@@ -5610,7 +5650,7 @@ mod tests {
 
         assert!(
             manager
-                .acquire_context(Some("deepseek-3.2"), None)
+                .acquire_context(Some("deepseek-3.2"), GroupScope::AllGroups)
                 .await
                 .is_err()
         );
@@ -5645,11 +5685,11 @@ mod tests {
                 1,
                 StdDuration::from_secs(3600),
                 None,
-                Some("g1"),
+                GroupScope::Named("g1"),
             ),
             0
         );
-        assert!(manager.acquire_context(None, Some("g1")).await.is_err());
+        assert!(manager.acquire_context(None, GroupScope::Named("g1")).await.is_err());
         let g2 = manager
             .snapshot()
             .entries
@@ -5714,7 +5754,7 @@ mod tests {
         .unwrap();
         disable_all_via_failures(&manager, &[1]);
         manager
-            .acquire_context(None, None)
+            .acquire_context(None, GroupScope::AllGroups)
             .await
             .expect("首轮自愈应成功");
         disable_all_via_failures(&manager, &[1]);
@@ -5725,7 +5765,7 @@ mod tests {
             .into_sorted_credentials();
         let restarted =
             MultiTokenManager::new(config, loaded, None, Some(path.clone()), true).unwrap();
-        assert!(restarted.acquire_context(None, None).await.is_err());
+        assert!(restarted.acquire_context(None, GroupScope::AllGroups).await.is_err());
         let entry = &restarted.snapshot().entries[0];
         assert!(entry.disabled);
         assert_eq!(entry.disabled_reason.as_deref(), Some("TooManyFailures"));
@@ -5861,7 +5901,7 @@ mod tests {
         assert_eq!(manager.available_count(), 0);
 
         // 应触发自愈：重置失败计数并重新启用，避免必须重启进程
-        let ctx = manager.acquire_context(None, None).await.unwrap();
+        let ctx = manager.acquire_context(None, GroupScope::AllGroups).await.unwrap();
         assert!(ctx.token == "t1" || ctx.token == "t2");
         assert_eq!(manager.available_count(), 2);
     }
@@ -5884,7 +5924,7 @@ mod tests {
         let manager =
             MultiTokenManager::new(config, vec![bad_cred, good_cred], None, None, false).unwrap();
 
-        let ctx = manager.acquire_context(None, None).await.unwrap();
+        let ctx = manager.acquire_context(None, GroupScope::AllGroups).await.unwrap();
         assert_eq!(ctx.id, 2);
         assert_eq!(ctx.token, "good-token");
     }
@@ -5913,7 +5953,7 @@ mod tests {
         manager.report_success(1);
 
         let (context, is_balanced) = manager
-            .acquire_context_impl(None, None, false)
+            .acquire_context_impl(None, GroupScope::AllGroups, false)
             .await
             .unwrap();
 
@@ -5921,7 +5961,7 @@ mod tests {
         assert_eq!(context.id, 2);
         assert_eq!(manager.snapshot().current_id, 1);
 
-        let context = manager.acquire_context(None, None).await.unwrap();
+        let context = manager.acquire_context(None, GroupScope::AllGroups).await.unwrap();
         assert_eq!(context.id, 2);
         assert_eq!(manager.snapshot().current_id, 2);
     }
@@ -5947,7 +5987,7 @@ mod tests {
             MultiTokenManager::new(config, vec![first, second], None, None, false).unwrap();
 
         manager.report_success(1);
-        let context = manager.acquire_context(None, None).await.unwrap();
+        let context = manager.acquire_context(None, GroupScope::AllGroups).await.unwrap();
         assert_eq!(context.id, 2);
         assert_eq!(manager.snapshot().current_id, 2);
 
@@ -5999,7 +6039,7 @@ mod tests {
         assert_eq!(manager.available_count(), 0);
 
         let err = manager
-            .acquire_context(None, None)
+            .acquire_context(None, GroupScope::AllGroups)
             .await
             .err()
             .unwrap()
@@ -6044,7 +6084,7 @@ mod tests {
         assert_eq!(manager.available_count(), 0);
 
         let err = manager
-            .acquire_context(None, None)
+            .acquire_context(None, GroupScope::AllGroups)
             .await
             .err()
             .unwrap()
@@ -6770,7 +6810,7 @@ mod tests {
         seed_model_cache(&manager, 2, &["minimax-m2.5"]);
 
         let context = manager
-            .acquire_context(Some("minimax-m2.5"), None)
+            .acquire_context(Some("minimax-m2.5"), GroupScope::AllGroups)
             .await
             .unwrap();
         assert_eq!(context.id, 2);
@@ -6793,7 +6833,7 @@ mod tests {
         seed_model_cache(&manager, 2, &["deepseek-3.2"]);
 
         let context = manager
-            .acquire_context(Some("deepseek-3.2"), None)
+            .acquire_context(Some("deepseek-3.2"), GroupScope::AllGroups)
             .await
             .unwrap();
         assert_eq!(context.id, 2);
@@ -6811,7 +6851,7 @@ mod tests {
         .unwrap();
 
         let context = manager
-            .acquire_context(Some("future-model"), None)
+            .acquire_context(Some("future-model"), GroupScope::AllGroups)
             .await
             .unwrap();
         assert_eq!(context.id, 1);
@@ -6832,11 +6872,11 @@ mod tests {
         .unwrap();
 
         assert!(matches!(
-            manager.discover_models_for_group(Some("g2")).await,
+            manager.discover_models_for_group(GroupScope::Named("g2")).await,
             Err(ModelDiscoveryError::NoAvailableCredentials)
         ));
         assert!(matches!(
-            manager.discover_models_for_group(Some("g1")).await,
+            manager.discover_models_for_group(GroupScope::Named("g1")).await,
             Err(ModelDiscoveryError::ColdStartFailed {
                 credential_count: 1
             })
@@ -6861,23 +6901,51 @@ mod tests {
         .unwrap();
         seed_model_cache(&manager, 1, &["glm-5"]);
 
-        let models = manager.discover_models_for_group(Some("g1")).await.unwrap();
+        let models = manager.discover_models_for_group(GroupScope::Named("g1")).await.unwrap();
         assert_eq!(models.len(), 1);
         assert_eq!(models[0].model_id, "glm-5");
     }
 
     #[test]
     fn test_group_matches_helper() {
-        // 未绑定分组(None)匹配任何账号
-        assert!(group_matches(&[], None));
-        assert!(group_matches(&["g1".to_string()], None));
-        // 绑定分组时只匹配 groups 含该名的账号
+        // AllGroups：全池可见。只发给系统 Key。
+        assert!(group_matches(&[], GroupScope::AllGroups));
+        assert!(group_matches(&["g1".to_string()], GroupScope::AllGroups));
+        // Named：只匹配 groups 含该名的账号
         assert!(group_matches(
             &["g1".to_string(), "g2".to_string()],
-            Some("g1")
+            GroupScope::Named("g1")
         ));
-        assert!(!group_matches(&["g2".to_string()], Some("g1")));
-        assert!(!group_matches(&[], Some("g1")));
+        assert!(!group_matches(&["g2".to_string()], GroupScope::Named("g1")));
+        assert!(!group_matches(&[], GroupScope::Named("g1")));
+    }
+
+    #[test]
+    fn unassigned_key_cannot_reach_grouped_credentials() {
+        // 这条钉的是一个真漏洞：`Unassigned` 此前等价于 `AllGroups`，于是客户 Key
+        // 漏填分组就能调度到别的客户的专属号。改完之后它只能看到无分组的凭据。
+        assert!(
+            !group_matches(&["custB".to_string()], GroupScope::Unassigned),
+            "没绑分组的 Key 不该够到别人的专属号"
+        );
+        assert!(
+            !group_matches(
+                &["custB".to_string(), "custC".to_string()],
+                GroupScope::Unassigned
+            ),
+            "多分组的凭据同样不该对未绑分组的 Key 可见"
+        );
+        // 无分组凭据仍然可见 —— 否则这类 Key 一条号都用不上。
+        assert!(group_matches(&[], GroupScope::Unassigned));
+    }
+
+    #[test]
+    fn scopes_are_not_interchangeable() {
+        // AllGroups 与 Unassigned 在有分组凭据上的结论必须相反。
+        // 若哪天有人把两者合并回一个 None，这条会红。
+        let grouped = ["custB".to_string()];
+        assert!(group_matches(&grouped, GroupScope::AllGroups));
+        assert!(!group_matches(&grouped, GroupScope::Unassigned));
     }
 
     #[test]
@@ -6897,15 +6965,15 @@ mod tests {
         .unwrap();
 
         // g1 只能选到 A(id=1)
-        let g1 = manager.select_next_credential(None, Some("g1"));
+        let g1 = manager.select_next_credential(None, GroupScope::Named("g1"));
         assert_eq!(g1.map(|(id, _)| id), Some(1));
         // g2 只能选到 B(id=2)
-        let g2 = manager.select_next_credential(None, Some("g2"));
+        let g2 = manager.select_next_credential(None, GroupScope::Named("g2"));
         assert_eq!(g2.map(|(id, _)| id), Some(2));
         // 不存在的分组 → 无可用账号
-        assert!(manager.select_next_credential(None, Some("nope")).is_none());
+        assert!(manager.select_next_credential(None, GroupScope::Named("nope")).is_none());
         // 未绑定分组(None) → 可选到账号
-        assert!(manager.select_next_credential(None, None).is_some());
+        assert!(manager.select_next_credential(None, GroupScope::AllGroups).is_some());
     }
 
     #[tokio::test]
@@ -6927,11 +6995,11 @@ mod tests {
         .unwrap();
 
         // Warm current_id with the highest-priority Free account.
-        let current = manager.acquire_context(None, None).await.unwrap();
+        let current = manager.acquire_context(None, GroupScope::AllGroups).await.unwrap();
         assert_eq!(current.id, 1);
 
         let opus = manager
-            .acquire_context(Some("claude-opus-4.6"), None)
+            .acquire_context(Some("claude-opus-4.6"), GroupScope::AllGroups)
             .await
             .unwrap();
         assert_eq!(
@@ -6955,10 +7023,10 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(manager.total_count_in_group(Some("g1")), 2); // A,B
-        assert_eq!(manager.total_count_in_group(Some("g2")), 1); // B
-        assert_eq!(manager.total_count_in_group(None), 3); // 全部
-        assert_eq!(manager.total_count_in_group(Some("none")), 0);
+        assert_eq!(manager.total_count_in_group(GroupScope::Named("g1")), 2); // A,B
+        assert_eq!(manager.total_count_in_group(GroupScope::Named("g2")), 1); // B
+        assert_eq!(manager.total_count_in_group(GroupScope::AllGroups), 3); // 全部
+        assert_eq!(manager.total_count_in_group(GroupScope::Named("none")), 0);
     }
 
     #[test]
@@ -6974,7 +7042,7 @@ mod tests {
 
         assert_eq!(
             manager
-                .select_next_credential(None, Some("g1"))
+                .select_next_credential(None, GroupScope::Named("g1"))
                 .map(|(id, _)| id),
             Some(1)
         );
@@ -6984,14 +7052,14 @@ mod tests {
                 1,
                 StdDuration::from_secs(60),
                 None,
-                Some("g1"),
+                GroupScope::Named("g1"),
             ),
             0
         );
-        assert!(manager.select_next_credential(None, Some("g1")).is_none());
+        assert!(manager.select_next_credential(None, GroupScope::Named("g1")).is_none());
         assert_eq!(
             manager
-                .select_next_credential(None, Some("g2"))
+                .select_next_credential(None, GroupScope::Named("g2"))
                 .map(|(id, _)| id),
             Some(2)
         );
@@ -7019,14 +7087,14 @@ mod tests {
         // 让 A(id1) 成功若干次 → balanced 应转向 success_count 更小的 B(id2)
         manager.report_success(1);
         manager.report_success(1);
-        let pick = manager.select_next_credential(None, Some("g1"));
+        let pick = manager.select_next_credential(None, GroupScope::Named("g1"));
         assert_eq!(
             pick.map(|(id, _)| id),
             Some(2),
             "balanced 应在 g1 内选 success_count 最小的 B"
         );
         // g2 不受 g1 计数影响，仍只会选到 C(id3)
-        let pick_g2 = manager.select_next_credential(None, Some("g2"));
+        let pick_g2 = manager.select_next_credential(None, GroupScope::Named("g2"));
         assert_eq!(pick_g2.map(|(id, _)| id), Some(3));
     }
 
@@ -7047,16 +7115,16 @@ mod tests {
         .unwrap();
 
         // 正常情况下 g1 能拿到 context
-        assert!(manager.acquire_context(None, Some("g1")).await.is_ok());
+        assert!(manager.acquire_context(None, GroupScope::Named("g1")).await.is_ok());
 
         // 手动禁用 g1 内唯一账号 A(id1)
         manager.set_disabled(1, true).unwrap();
 
         // 严格隔离：g1 无可用账号 → Err，且不会选到 B/C
-        let res = manager.acquire_context(None, Some("g1")).await;
+        let res = manager.acquire_context(None, GroupScope::Named("g1")).await;
         assert!(res.is_err(), "g1 内全部账号禁用后应失败，不回退到其他分组");
 
         // 但 g2 仍可用
-        assert!(manager.acquire_context(None, Some("g2")).await.is_ok());
+        assert!(manager.acquire_context(None, GroupScope::Named("g2")).await.is_ok());
     }
 }

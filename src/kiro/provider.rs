@@ -24,7 +24,7 @@ use crate::kiro::endpoint::{KiroEndpoint, RequestContext};
 use crate::kiro::error::UpstreamRateLimitError;
 use crate::kiro::machine_id;
 use crate::kiro::model::credentials::KiroCredentials;
-use crate::kiro::token_manager::MultiTokenManager;
+use crate::kiro::token_manager::{GroupScope, MultiTokenManager};
 use crate::model::config::TlsBackend;
 use parking_lot::Mutex;
 
@@ -297,9 +297,9 @@ impl KiroProvider {
         &self,
         request_body: &str,
         sink: Option<&dyn TraceSink>,
-        group: Option<&str>,
+        scope: GroupScope<'_>,
     ) -> anyhow::Result<KiroCallResult> {
-        self.call_api_with_retry(request_body, false, sink, group).await
+        self.call_api_with_retry(request_body, false, sink, scope).await
     }
 
     /// 发送流式 API 请求
@@ -307,18 +307,18 @@ impl KiroProvider {
         &self,
         request_body: &str,
         sink: Option<&dyn TraceSink>,
-        group: Option<&str>,
+        scope: GroupScope<'_>,
     ) -> anyhow::Result<KiroCallResult> {
-        self.call_api_with_retry(request_body, true, sink, group).await
+        self.call_api_with_retry(request_body, true, sink, scope).await
     }
 
     /// 发送 MCP API 请求（WebSearch 等工具调用）
     pub async fn call_mcp(
         &self,
         request_body: &str,
-        group: Option<&str>,
+        scope: GroupScope<'_>,
     ) -> anyhow::Result<reqwest::Response> {
-        let result = self.call_mcp_with_retry(request_body, None, group).await?;
+        let result = self.call_mcp_with_retry(request_body, None, scope).await?;
         self.token_manager
             .report_success_for_request(result.credential_id, None);
         Ok(result.response)
@@ -329,12 +329,12 @@ impl KiroProvider {
         &self,
         request_body: &str,
         sink: &dyn TraceSink,
-        group: Option<&str>,
+        scope: GroupScope<'_>,
         validate: fn(&str) -> anyhow::Result<T>,
         is_benign_error: fn(&anyhow::Error) -> bool,
     ) -> anyhow::Result<T> {
         let result = self
-            .call_mcp_with_retry(request_body, Some(sink), group)
+            .call_mcp_with_retry(request_body, Some(sink), scope)
             .await?;
         let status = result.response.status().as_u16();
         let body = match result.response.text().await {
@@ -394,9 +394,9 @@ impl KiroProvider {
         &self,
         request_body: &str,
         sink: Option<&dyn TraceSink>,
-        group: Option<&str>,
+        scope: GroupScope<'_>,
     ) -> anyhow::Result<McpCallResult> {
-        let total_credentials = self.token_manager.total_count_in_group(group).max(1);
+        let total_credentials = self.token_manager.total_count_in_group(scope).max(1);
         let max_retries = (total_credentials * MAX_RETRIES_PER_CREDENTIAL).min(MAX_TOTAL_RETRIES);
         let mut last_error: Option<anyhow::Error> = None;
         let mut force_refreshed: HashSet<u64> = HashSet::new();
@@ -404,7 +404,7 @@ impl KiroProvider {
         for attempt in 0..max_retries {
             let attempt_start = Instant::now();
             // MCP 调用不涉及模型选择，但必须遵守客户端 Key 的凭据分组隔离。
-            let mut ctx = match self.token_manager.acquire_context(None, group).await {
+            let mut ctx = match self.token_manager.acquire_context(None, scope).await {
                 Ok(c) => c,
                 Err(e) => {
                     if is_rate_limit_error(&e) {
@@ -475,7 +475,7 @@ impl KiroProvider {
                     last_error = Some(e);
                     // endpoint 解析失败：记为失败，换下一张凭据
                     self.token_manager
-                        .report_failure_for_request(ctx.id, None, group);
+                        .report_failure_for_request(ctx.id, None, scope);
                     continue;
                 }
             };
@@ -573,7 +573,7 @@ impl KiroProvider {
                 );
                 let has_available = self
                     .token_manager
-                    .report_quota_exhausted_for_request(ctx.id, None, group);
+                    .report_quota_exhausted_for_request(ctx.id, None, scope);
                 if !has_available {
                     anyhow::bail!("MCP 请求失败（所有凭据已用尽）: {} {}", status, body);
                 }
@@ -615,7 +615,7 @@ impl KiroProvider {
                     );
                     let has_available = self
                         .token_manager
-                        .report_suspended_for_request(ctx.id, None, group);
+                        .report_suspended_for_request(ctx.id, None, scope);
                     if !has_available {
                         anyhow::bail!("MCP 请求失败（所有凭据已用尽）: {} {}", status, body);
                     }
@@ -649,7 +649,7 @@ impl KiroProvider {
 
                 let has_available = self
                     .token_manager
-                    .report_failure_for_request(ctx.id, None, group);
+                    .report_failure_for_request(ctx.id, None, scope);
                 if !has_available {
                     anyhow::bail!("MCP 请求失败（所有凭据已用尽）: {} {}", status, body);
                 }
@@ -744,10 +744,10 @@ impl KiroProvider {
         request_body: &str,
         is_stream: bool,
         sink: Option<&dyn TraceSink>,
-        group: Option<&str>,
+        scope: GroupScope<'_>,
     ) -> anyhow::Result<KiroCallResult> {
         // 重试预算按当前请求所属分组的账号数计算，避免小分组按全局账号数获得过多无效重试
-        let total_credentials = self.token_manager.total_count_in_group(group).max(1);
+        let total_credentials = self.token_manager.total_count_in_group(scope).max(1);
         // 吞吐模式把上限提到"能走完整个分组"：常态的 4 次硬顶意味着 7 条凭据的池子
         // 最多只试 4 个，溢出根本走不到后面的储备档。仍然留一个绝对上限，
         // 避免超大池子把单个请求拖成长尾。
@@ -767,7 +767,7 @@ impl KiroProvider {
         for attempt in 0..max_retries {
             let attempt_start = Instant::now();
             // 获取调用上下文（绑定 index、credentials、token）
-            let mut ctx = match self.token_manager.acquire_context(model.as_deref(), group).await {
+            let mut ctx = match self.token_manager.acquire_context(model.as_deref(), scope).await {
                 Ok(c) => c,
                 Err(e) => {
                     if is_rate_limit_error(&e) {
@@ -816,7 +816,7 @@ impl KiroProvider {
                     );
                     last_error = Some(e);
                     self.token_manager
-                        .report_failure_for_request(ctx.id, model.as_deref(), group);
+                        .report_failure_for_request(ctx.id, model.as_deref(), scope);
                     continue;
                 }
             };
@@ -911,7 +911,7 @@ impl KiroProvider {
                 let has_available = self.token_manager.report_quota_exhausted_for_request(
                     ctx.id,
                     model.as_deref(),
-                    group,
+                    scope,
                 );
                 if !has_available {
                     anyhow::bail!(
@@ -963,7 +963,7 @@ impl KiroProvider {
                     let has_available = self.token_manager.report_suspended_for_request(
                         ctx.id,
                         model.as_deref(),
-                        group,
+                        scope,
                     );
                     if !has_available {
                         anyhow::bail!(
@@ -1009,7 +1009,7 @@ impl KiroProvider {
 
                 let has_available =
                     self.token_manager
-                        .report_failure_for_request(ctx.id, model.as_deref(), group);
+                        .report_failure_for_request(ctx.id, model.as_deref(), scope);
                 if !has_available {
                     anyhow::bail!(
                         "{} API 请求失败（所有凭据已用尽）: {} {}",
@@ -1070,7 +1070,7 @@ impl KiroProvider {
                         ctx.id,
                         cooldown,
                         model.as_deref(),
-                        group,
+                        scope,
                     );
                 self.emit_attempt(
                     sink, attempt, ctx.id, endpoint_name, Some(429),

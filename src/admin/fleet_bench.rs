@@ -29,6 +29,7 @@
 
 #[cfg(test)]
 mod tests {
+    use crate::kiro::token_manager::GroupScope;
     use crate::admin::AdminService;
     use crate::admin::scheduling::{SchedulingConfig, SchedulingProfile};
     use crate::kiro::model::credentials::KiroCredentials;
@@ -408,21 +409,21 @@ mod tests {
 
         mgr.set_load_balancing_mode("priority".to_string()).unwrap();
         // 预热一次，避免第一次调用把 current_id 初始化的成本算进样本
-        let _ = mgr.acquire_context(model, None).await.unwrap();
+        let _ = mgr.acquire_context(model, GroupScope::AllGroups).await.unwrap();
         let mut acquire_priority_samples = Vec::with_capacity(REPEATS);
         for _ in 0..REPEATS {
             let t = Instant::now();
-            let ctx = mgr.acquire_context(model, None).await.unwrap();
+            let ctx = mgr.acquire_context(model, GroupScope::AllGroups).await.unwrap();
             acquire_priority_samples.push(t.elapsed().as_micros() as u64);
             assert!(!ctx.token.is_empty());
         }
 
         mgr.set_load_balancing_mode("balanced".to_string()).unwrap();
-        let _ = mgr.acquire_context(model, None).await.unwrap();
+        let _ = mgr.acquire_context(model, GroupScope::AllGroups).await.unwrap();
         let mut acquire_balanced_samples = Vec::with_capacity(REPEATS);
         for _ in 0..REPEATS {
             let t = Instant::now();
-            let ctx = mgr.acquire_context(model, None).await.unwrap();
+            let ctx = mgr.acquire_context(model, GroupScope::AllGroups).await.unwrap();
             acquire_balanced_samples.push(t.elapsed().as_micros() as u64);
             assert!(!ctx.token.is_empty());
         }

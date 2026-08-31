@@ -13,7 +13,7 @@ use crate::kiro::model::available_models::{TokenLimits, UpstreamModel};
 use crate::kiro::model::events::{Event, TokenUsage};
 use crate::kiro::model::requests::kiro::KiroRequest;
 use crate::kiro::parser::decoder::EventStreamDecoder;
-use crate::kiro::token_manager::ModelDiscoveryError;
+use crate::kiro::token_manager::{GroupScopeOwned, ModelDiscoveryError};
 use crate::token;
 use anyhow::Error;
 use axum::{
@@ -705,7 +705,7 @@ pub async fn get_models(
 
     let upstream = match provider
         .token_manager()
-        .discover_models_for_group(key_ctx.group.as_deref())
+        .discover_models_for_group(key_ctx.scope())
         .await
     {
         Ok(models) => models,
@@ -818,7 +818,7 @@ pub async fn post_messages(
             provider,
             &payload,
             input_tokens,
-            key_ctx.group.as_deref(),
+            key_ctx.scope(),
             Some(&tracer),
         )
         .await;
@@ -868,7 +868,7 @@ tracer.capture_prompt(&payload);
             hook,
             tracer,
             payload_stream,
-            key_ctx.group.clone(),
+            key_ctx.scope_owned(),
             state.tool_compatibility_mode,
             cache_usage,
         )
@@ -977,7 +977,7 @@ tracer.capture_prompt(&payload);
             hook,
             cache_usage,
             tracer,
-            key_ctx.group.clone(),
+            key_ctx.scope_owned(),
         )
         .await
     } else {
@@ -1004,7 +1004,7 @@ tracer.capture_prompt(&payload);
             hook,
             cache_usage,
             tracer,
-            key_ctx.group.clone(),
+            key_ctx.scope_owned(),
         )
         .await
     }
@@ -1022,11 +1022,11 @@ async fn handle_stream_request(
     hook: UsageRecordHook,
     cache_usage: super::cache_metering::CacheUsage,
     tracer: std::sync::Arc<RequestTracer>,
-    group: Option<String>,
+    scope: GroupScopeOwned,
 ) -> Response {
     // 调用 Kiro API（支持多凭据故障转移）
     let call_result = match provider
-        .call_api_stream(request_body, Some(tracer.as_ref()), group.as_deref())
+        .call_api_stream(request_body, Some(tracer.as_ref()), scope.as_ref())
         .await
     {
         Ok(resp) => resp,
@@ -1259,11 +1259,11 @@ async fn handle_non_stream_request(
     hook: UsageRecordHook,
     cache_usage: super::cache_metering::CacheUsage,
     tracer: std::sync::Arc<RequestTracer>,
-    group: Option<String>,
+    scope: GroupScopeOwned,
 ) -> Response {
     // 调用 Kiro API（支持多凭据故障转移）
     let call_result = match provider
-        .call_api(request_body, Some(tracer.as_ref()), group.as_deref())
+        .call_api(request_body, Some(tracer.as_ref()), scope.as_ref())
         .await
     {
         Ok(resp) => resp,
@@ -1785,7 +1785,7 @@ pub async fn post_messages_cc(
             provider,
             &payload,
             input_tokens,
-            key_ctx.group.as_deref(),
+            key_ctx.scope(),
             Some(&tracer),
         )
         .await;
@@ -1832,7 +1832,7 @@ tracer.capture_prompt(&payload);
             hook,
             tracer,
             payload_stream,
-            key_ctx.group.clone(),
+            key_ctx.scope_owned(),
             state.tool_compatibility_mode,
             cache_usage,
         )
@@ -1940,7 +1940,7 @@ tracer.capture_prompt(&payload);
             total_input_tokens,
             cache_usage,
             tracer,
-            key_ctx.group.clone(),
+            key_ctx.scope_owned(),
         )
         .await
     } else {
@@ -1967,7 +1967,7 @@ tracer.capture_prompt(&payload);
             hook,
             cache_usage,
             tracer,
-            key_ctx.group.clone(),
+            key_ctx.scope_owned(),
         )
         .await
     }
@@ -1988,11 +1988,11 @@ async fn handle_stream_request_buffered(
     fallback_input_tokens: i32,
     cache_usage: super::cache_metering::CacheUsage,
     tracer: std::sync::Arc<RequestTracer>,
-    group: Option<String>,
+    scope: GroupScopeOwned,
 ) -> Response {
     // 调用 Kiro API（支持多凭据故障转移）
     let call_result = match provider
-        .call_api_stream(request_body, Some(tracer.as_ref()), group.as_deref())
+        .call_api_stream(request_body, Some(tracer.as_ref()), scope.as_ref())
         .await
     {
         Ok(resp) => resp,

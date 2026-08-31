@@ -7,6 +7,7 @@
 //! Reuses: converter::convert_request (feedback), provider.call_api_stream, EventStreamDecoder,
 //! websearch::{create_mcp_request, call_mcp_api, parse_search_results, generate_search_summary}。
 
+use crate::kiro::token_manager::{GroupScope, GroupScopeOwned};
 use std::convert::Infallible;
 use std::sync::Arc;
 
@@ -392,7 +393,7 @@ async fn run_round(
     payload: &MessagesRequest,
     fallback_input_tokens: i32,
     tracer: &RequestTracer,
-    group: Option<&str>,
+    scope: GroupScope<'_>,
     tool_compatibility_mode: ToolCompatibilityMode,
     cache_usage: &super::cache_metering::CacheUsage,
 ) -> Result<(RoundOutcome, u64), RoundFailure> {
@@ -450,7 +451,7 @@ async fn run_round(
     };
 
     let call_result = match provider
-        .call_api_stream(&request_body, Some(tracer), group)
+        .call_api_stream(&request_body, Some(tracer), scope)
         .await
     {
         Ok(r) => r,
@@ -811,7 +812,7 @@ pub(super) async fn run_web_search_loop(
     hook: UsageRecordHook,
     tracer: Arc<RequestTracer>,
     stream_client: bool,
-    group: Option<String>,
+    scope: GroupScopeOwned,
     tool_compatibility_mode: ToolCompatibilityMode,
     cache_usage: super::cache_metering::CacheUsage,
 ) -> Response {
@@ -840,7 +841,7 @@ pub(super) async fn run_web_search_loop(
                 &payload,
                 round_fallback_input_tokens,
                 tracer.as_ref(),
-                group.as_deref(),
+                scope.as_ref(),
                 tool_compatibility_mode,
                 &cache_usage,
             )
@@ -961,7 +962,7 @@ pub(super) async fn run_web_search_loop(
                     &provider,
                     &mcp_request,
                     Some(tracer.as_ref()),
-                    group.as_deref(),
+                    scope.as_ref(),
                 )
                 .await
                 {
@@ -1026,7 +1027,7 @@ pub(super) async fn run_web_search_loop(
                     &provider,
                     &mcp_request,
                     Some(tracer.as_ref()),
-                    group.as_deref(),
+                    scope.as_ref(),
                 )
                 .await
                 {

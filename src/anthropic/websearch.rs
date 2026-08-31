@@ -2,6 +2,7 @@
 //!
 //! 实现 Anthropic WebSearch 请求到 Kiro MCP 的转换和响应生成
 
+use crate::kiro::token_manager::GroupScope;
 use std::convert::Infallible;
 
 use axum::{
@@ -577,7 +578,7 @@ pub async fn handle_websearch_request(
     provider: std::sync::Arc<crate::kiro::provider::KiroProvider>,
     payload: &MessagesRequest,
     input_tokens: i32,
-    group: Option<&str>,
+    scope: GroupScope<'_>,
     sink: Option<&dyn TraceSink>,
 ) -> Response {
     // 1. 提取搜索查询
@@ -602,7 +603,7 @@ pub async fn handle_websearch_request(
 
     // 3. 调用 Kiro MCP API
     let search_results =
-        match finish_mcp_call(call_mcp_api(&provider, &mcp_request, sink, group).await) {
+        match finish_mcp_call(call_mcp_api(&provider, &mcp_request, sink, scope).await) {
             Ok(results) => results,
             Err(response) => return response,
         };
@@ -623,7 +624,7 @@ pub(crate) async fn call_mcp_api(
     provider: &crate::kiro::provider::KiroProvider,
     request: &McpRequest,
     sink: Option<&dyn TraceSink>,
-    group: Option<&str>,
+    scope: GroupScope<'_>,
 ) -> anyhow::Result<McpResponse> {
     let request_body = serde_json::to_string(request)?;
 
@@ -634,14 +635,14 @@ pub(crate) async fn call_mcp_api(
             .call_mcp_with_trace(
                 &request_body,
                 sink,
-                group,
+                scope,
                 parse_mcp_response,
                 is_no_results_mcp_error,
             )
             .await;
     }
 
-    let response = provider.call_mcp(&request_body, group).await?;
+    let response = provider.call_mcp(&request_body, scope).await?;
     let body = response.text().await?;
     parse_mcp_response(&body)
 }
