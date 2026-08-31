@@ -49,10 +49,21 @@ docker build -t "$IMAGE" "$SRC_DIR"
 # ---------- 3. green smoke: isolated data dir, no credentials ----------
 if [ "$SKIP_GREEN" != "--skip-green" ]; then
   log "green smoke on 127.0.0.1:$GREEN_PORT (isolated data dir, no credentials)"
-  rm -rf "$GREEN_DIR" && mkdir -p "$GREEN_DIR/data"
+  # sudo on the removal: the green container runs as root and leaves root-owned
+  # artifacts behind (traces.db, prompts.db, rotated logs), so a plain rm -rf fails
+  # on the leftovers from the previous run.
+  sudo rm -rf "$GREEN_DIR" && mkdir -p "$GREEN_DIR/data"
   # Copy runtime config only. credentials.json is deliberately left out so the green
   # instance cannot refresh real tokens (single-writer constraint, ARCHITECTURE.md §8).
-  cp "$DEPLOY_DIR/data/config.json" "$GREEN_DIR/data/config.json"
+  #
+  # sudo, and then chown back: the app writes config.json as 0600 (it holds adminApiKey,
+  # see src/common/secret_file.rs) and the container runs as root, so the file ends up
+  # root-owned and unreadable to the user running this script. A plain cp fails with
+  # "Permission denied" and the deploy dies before it touches anything — which is how
+  # this was found. Keep the copy 0600 so the secret is not widened on the way through.
+  sudo cp "$DEPLOY_DIR/data/config.json" "$GREEN_DIR/data/config.json"
+  sudo chown "$(id -u):$(id -g)" "$GREEN_DIR/data/config.json"
+  chmod 600 "$GREEN_DIR/data/config.json"
   docker rm -f kiro-rs-green >/dev/null 2>&1 || true
   docker run -d --name kiro-rs-green \
     -p "127.0.0.1:$GREEN_PORT:8990" \
@@ -73,7 +84,7 @@ if [ "$SKIP_GREEN" != "--skip-green" ]; then
   code=$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$GREEN_PORT/v1/models")
   [ "$code" = "401" ] || { docker rm -f kiro-rs-green >/dev/null 2>&1 || true; die "green /v1/models expected 401 got $code"; }
   docker rm -f kiro-rs-green >/dev/null 2>&1 || true
-  rm -rf "$GREEN_DIR"
+  sudo rm -rf "$GREEN_DIR"
   log "green smoke passed"
 fi
 
