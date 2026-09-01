@@ -110,7 +110,6 @@ impl GroupManager {
     }
 
     /// 校验一组名字是否全部已注册；返回未注册的名字列表（调用方据此决定是否拒绝写入）
-    #[allow(dead_code)]
     pub fn missing<'a>(&self, names: impl IntoIterator<Item = &'a str>) -> Vec<String> {
         let inner = self.inner.read();
         names
@@ -246,6 +245,24 @@ pub type SharedGroupManager = Arc<GroupManager>;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn missing_accepts_empty_input() {
+        // 空输入必须合法：凭据可以不属于任何分组，而四个写入入口都会拿空数组
+        // 调一次 missing()。若它把空当成错误，加号就会被无理由拒掉。
+        let mgr = GroupManager::new();
+        assert!(mgr.missing(std::iter::empty()).is_empty());
+    }
+
+    #[test]
+    fn missing_is_case_and_space_sensitive() {
+        // 分组名不做归一化，所以大小写和空格差异都是不同的名字。
+        // 这条钉住这个事实,免得将来有人以为 missing() 会帮他 trim。
+        let mgr = GroupManager::new();
+        mgr.create("for_O".into(), None).unwrap();
+        assert_eq!(mgr.missing(["for_o"]), vec!["for_o"]);
+        assert_eq!(mgr.missing([" for_O"]), vec![" for_O"]);
+    }
 
     #[test]
     fn create_then_list_sorted() {

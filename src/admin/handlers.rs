@@ -216,6 +216,17 @@ pub async fn add_credential(
     State(state): State<AdminState>,
     Json(payload): Json<AddCredentialRequest>,
 ) -> impl IntoResponse {
+    let unknown = state.groups.missing(payload.groups.iter().map(String::as_str));
+    if !unknown.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(super::types::AdminErrorResponse::invalid_request(format!(
+                "分组未注册：{}。先建分组再挂，或检查是否拼错",
+                unknown.join("、")
+            ))),
+        )
+            .into_response();
+    }
     match state.service.add_credential(payload).await {
         Ok(response) => Json(response).into_response(),
         Err(e) => e.into_http_response(),
@@ -234,6 +245,29 @@ pub async fn batch_import_credentials(
     State(state): State<AdminState>,
     Json(req): Json<BatchImportRequest>,
 ) -> Response {
+    // 分组名先全量校验，再开始导。这里是 SSE 流式返回，一旦开跑就只能逐条报错，
+    // 导到第 30 条才发现分组名拼错的话，前 29 条已经落库且挂着一个不存在的分组。
+    // 一次性拒绝整批，让人改完重来。
+    {
+        let mut unknown: Vec<String> = req
+            .credentials
+            .iter()
+            .flat_map(|c| state.groups.missing(c.groups.iter().map(String::as_str)))
+            .collect();
+        unknown.sort();
+        unknown.dedup();
+        if !unknown.is_empty() {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(super::types::AdminErrorResponse::invalid_request(format!(
+                    "分组未注册：{}。整批未导入，先建分组或改掉拼错的名字",
+                    unknown.join("、")
+                ))),
+            )
+                .into_response();
+        }
+    }
+
     let concurrency = req.concurrency.unwrap_or(8).clamp(1, 16) as usize;
     let total = req.credentials.len();
     let verify = req.verify;
@@ -346,6 +380,22 @@ pub async fn update_credential(
     Path(id): Path<u64>,
     Json(payload): Json<UpdateCredentialRequest>,
 ) -> impl IntoResponse {
+    // 分组名必须已注册。写错一个字的后果是不对称的：Key 上写错 → 该 Key 够不到
+    // 任何号，请求直接失败，很响；**凭据上写错 → 该分组的客户可达号数静默少一条**，
+    // 没有任何报错，要等到容量不够才发现。所以在入口拦住。
+    if let Some(ref groups) = payload.groups {
+        let unknown = state.groups.missing(groups.iter().map(String::as_str));
+        if !unknown.is_empty() {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(super::types::AdminErrorResponse::invalid_request(format!(
+                    "分组未注册：{}。先建分组再挂，或检查是否拼错",
+                    unknown.join("、")
+                ))),
+            )
+                .into_response();
+        }
+    }
     match state.service.update_credential(id, payload) {
         Ok(_) => Json(SuccessResponse::new(format!("凭据 #{} 已更新", id))).into_response(),
         Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
@@ -929,16 +979,30 @@ pub async fn create_client_key(
         )
             .into_response();
     }
+    let group = payload
+        .group
+        .map(|g| g.trim().to_string())
+        .filter(|g| !g.is_empty());
+    // 建 Key 时就拦，别等它被 bootstrap 反向注册成正式分组。
+    if let Some(ref g) = group {
+        let unknown = state.groups.missing(std::iter::once(g.as_str()));
+        if !unknown.is_empty() {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(super::types::AdminErrorResponse::invalid_request(format!(
+                    "分组未注册：{g}。先建分组再绑，或检查是否拼错"
+                ))),
+            )
+                .into_response();
+        }
+    }
     let entry = state.client_keys.create(
         name.to_string(),
         payload
             .description
             .map(|d| d.trim().to_string())
             .filter(|d| !d.is_empty()),
-        payload
-            .group
-            .map(|g| g.trim().to_string())
-            .filter(|g| !g.is_empty()),
+        group,
     );
     Json(CreateClientKeyResponse {
         id: entry.id,
@@ -996,6 +1060,21 @@ pub async fn update_client_key(
             Some(t.to_string())
         }
     });
+    // 同 update_credential：分组名必须已注册。Key 上写错虽然会立刻失败(够不到号),
+    // 但错的名字会被启动时的 bootstrap_from_existing 反向注册成一个正式分组,
+    // 之后在下拉框里与真分组长得一模一样。
+    if let Some(Some(ref g)) = group {
+        let unknown = state.groups.missing(std::iter::once(g.as_str()));
+        if !unknown.is_empty() {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(super::types::AdminErrorResponse::invalid_request(format!(
+                    "分组未注册：{g}。先建分组再绑，或检查是否拼错"
+                ))),
+            )
+                .into_response();
+        }
+    }
     // 折扣：>0 生效，<=0 视为清除定价（Option<Option<f64>>：外层"是否改动"，内层"设成什么"）
     //
     // 上界不能省。中文里"6 折"和折扣系数 0.6 差 10 倍、和 0.06 差 100 倍，
