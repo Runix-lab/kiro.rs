@@ -1,0 +1,253 @@
+<!doctype html>
+<!--
+  Read-only traffic view, served at /api/admin/viewer/ (English only).
+
+  Why a standalone page instead of a tab in the admin UI: the admin UI is
+  Chinese throughout and has no i18n layer, and the people who get this link are
+  external reviewers who need to read it without help. Bolting i18n onto the
+  whole panel to serve one page would be the larger change, and it would put a
+  read-only visitor inside the same bundle that renders credentials and billing.
+
+  No build step on purpose. This file is embedded verbatim with include_str! so
+  it cannot drift out of sync with a stale admin-ui/dist, and so that changing a
+  sentence here does not require a frontend rebuild.
+
+  It holds the key in sessionStorage, not localStorage: the tab closing should
+  end the session, since this link is handed to third parties.
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex, nofollow">
+<title>Traffic Overview — Read Only</title>
+<style>
+  :root {
+    --bg: #0b0d12; --panel: #14171f; --line: #232733;
+    --ink: #e8eaf0; --ink-2: #9aa3b5; --ink-3: #6b7488;
+    --accent: #d9a441; --ok: #4ba36b; --warn: #c9873a;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--ink);
+    font: 15px/1.55 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  }
+  .wrap { max-width: 940px; margin: 0 auto; padding: 40px 24px 64px; }
+  header { display: flex; align-items: baseline; gap: 14px; flex-wrap: wrap; margin-bottom: 6px; }
+  h1 { font-size: 22px; font-weight: 650; margin: 0; letter-spacing: .01em; }
+  .badge {
+    font-size: 11px; font-weight: 600; letter-spacing: .08em; text-transform: uppercase;
+    color: var(--accent); border: 1px solid var(--accent); border-radius: 3px; padding: 2px 7px;
+  }
+  .sub { color: var(--ink-3); font-size: 13px; margin: 0 0 28px; }
+  .gate { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 24px; max-width: 460px; }
+  .gate label { display: block; font-size: 13px; color: var(--ink-2); margin-bottom: 8px; }
+  input {
+    width: 100%; padding: 10px 12px; border-radius: 6px; border: 1px solid var(--line);
+    background: #0e1117; color: var(--ink); font-size: 14px; font-family: ui-monospace, Menlo, monospace;
+  }
+  input:focus { outline: none; border-color: var(--accent); }
+  button {
+    margin-top: 14px; padding: 9px 18px; border-radius: 6px; border: 0; cursor: pointer;
+    background: var(--accent); color: #1a1405; font-size: 14px; font-weight: 600;
+  }
+  button:disabled { opacity: .55; cursor: default; }
+  .err { color: #d1685f; font-size: 13px; margin-top: 12px; }
+  .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: 14px; margin-bottom: 30px; }
+  .card { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 18px; }
+  .card .k { font-size: 11px; letter-spacing: .07em; text-transform: uppercase; color: var(--ink-3); }
+  .card .v { font-size: 26px; font-weight: 650; margin-top: 7px; font-variant-numeric: tabular-nums; }
+  .card .v small { font-size: 14px; font-weight: 500; color: var(--ink-2); }
+  section { margin-bottom: 30px; }
+  h2 { font-size: 13px; letter-spacing: .07em; text-transform: uppercase; color: var(--ink-3); font-weight: 600; margin: 0 0 12px; }
+  table { width: 100%; border-collapse: collapse; background: var(--panel); border: 1px solid var(--line); border-radius: 8px; overflow: hidden; }
+  th, td { text-align: left; padding: 11px 16px; font-size: 14px; border-bottom: 1px solid var(--line); }
+  th { font-size: 11px; letter-spacing: .06em; text-transform: uppercase; color: var(--ink-3); font-weight: 600; }
+  tr:last-child td { border-bottom: 0; }
+  td.num { text-align: right; font-variant-numeric: tabular-nums; }
+  .bar { height: 5px; background: var(--accent); border-radius: 3px; min-width: 2px; }
+  .spark { display: flex; align-items: flex-end; gap: 3px; height: 76px; background: var(--panel);
+           border: 1px solid var(--line); border-radius: 8px; padding: 14px 16px; }
+  .spark i { flex: 1; background: #2f3a4d; border-radius: 2px 2px 0 0; min-height: 2px; }
+  .spark i.hi { background: var(--accent); }
+  .note { background: var(--panel); border: 1px solid var(--line); border-left: 2px solid var(--ink-3);
+          border-radius: 6px; padding: 16px 18px; color: var(--ink-2); font-size: 13.5px; }
+  .note b { color: var(--ink); font-weight: 600; }
+  .note ul { margin: 8px 0 0; padding-left: 20px; }
+  footer { color: var(--ink-3); font-size: 12px; margin-top: 34px; display: flex; gap: 16px; flex-wrap: wrap; }
+  .seg { display: inline-flex; border: 1px solid var(--line); border-radius: 6px; overflow: hidden; margin-left: auto; }
+  .seg button { margin: 0; border-radius: 0; background: transparent; color: var(--ink-2); font-weight: 500; padding: 6px 14px; font-size: 13px; }
+  .seg button.on { background: var(--accent); color: #1a1405; font-weight: 600; }
+  [hidden] { display: none !important; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h1>Traffic Overview</h1>
+    <span class="badge">Read Only</span>
+    <div class="seg" id="seg" hidden>
+      <button data-w="today" class="on">Today</button>
+      <button data-w="7d">Last 7 days</button>
+    </div>
+  </header>
+  <p class="sub" id="sub">Live gateway traffic. This view cannot modify anything.</p>
+
+  <div class="gate" id="gate">
+    <label for="key">Access key</label>
+    <input id="key" type="password" autocomplete="off" spellcheck="false" placeholder="Paste the read-only key">
+    <button id="go">View traffic</button>
+    <div class="err" id="err" hidden></div>
+  </div>
+
+  <div id="app" hidden>
+    <div class="cards" id="cards"></div>
+    <section>
+      <h2>Requests per hour <span id="hrs" style="text-transform:none;letter-spacing:0"></span></h2>
+      <div class="spark" id="spark"></div>
+    </section>
+    <section>
+      <h2>Model distribution</h2>
+      <table>
+        <thead><tr><th>Model</th><th class="num">Requests</th><th class="num">Share</th><th style="width:34%"></th></tr></thead>
+        <tbody id="models"></tbody>
+      </table>
+    </section>
+    <section>
+      <h2>What this view excludes</h2>
+      <div class="note" id="redacted"></div>
+    </section>
+    <footer>
+      <span id="gen"></span>
+      <span>Figures come from the gateway's own request accounting.</span>
+    </footer>
+  </div>
+</div>
+
+<script>
+(function () {
+  var BASE = '/api/admin/viewer';
+  var KEY = 'kiro-viewer-key';
+  var win = 'today';
+
+  var $ = function (id) { return document.getElementById(id); };
+  var fmt = function (n) { return (n == null ? '—' : Number(n).toLocaleString('en-US')); };
+
+  // Tokens run into the billions; a raw digit string is unreadable at a glance.
+  function compact(n) {
+    if (n == null) return '—';
+    n = Number(n);
+    if (n >= 1e9) return (n / 1e9).toFixed(2) + 'B';
+    if (n >= 1e6) return (n / 1e6).toFixed(1) + 'M';
+    if (n >= 1e3) return (n / 1e3).toFixed(1) + 'K';
+    return String(n);
+  }
+
+  function get(path) {
+    return fetch(BASE + path, {
+      headers: { Authorization: 'Bearer ' + sessionStorage.getItem(KEY) }
+    }).then(function (r) {
+      if (r.status === 401 || r.status === 403) throw new Error('AUTH');
+      if (!r.ok) throw new Error('HTTP ' + r.status);
+      return r.json();
+    });
+  }
+
+  function card(k, v, sub) {
+    return '<div class="card"><div class="k">' + k + '</div><div class="v">' + v +
+           (sub ? ' <small>' + sub + '</small>' : '') + '</div></div>';
+  }
+
+  function render(d) {
+    $('cards').innerHTML =
+      card('Requests', fmt(d.requests), win === '7d' ? '/ 7 days' : '/ today') +
+      card('Success rate', d.successRatePct + '<small>%</small>') +
+      card('Tokens processed', compact(d.tokens)) +
+      card('Current throughput', fmt(d.currentRpm), 'req/min') +
+      card('Active accounts', fmt(d.activeCredentials));
+
+    var h = d.hourlyRequests || [];
+    var max = Math.max.apply(null, h.concat([1]));
+    $('hrs').textContent = h.length ? '(' + h.length + ' most recent buckets)' : '';
+    $('spark').innerHTML = h.map(function (v) {
+      var pct = Math.max(2, Math.round(v / max * 100));
+      // Mark the busiest bucket so the shape of the day is readable without axes.
+      return '<i class="' + (v === max ? 'hi' : '') + '" style="height:' + pct + '%" title="' + fmt(v) + ' requests"></i>';
+    }).join('');
+
+    var ms = d.models || [];
+    $('models').innerHTML = ms.length
+      ? ms.map(function (m) {
+          return '<tr><td>' + m.model + '</td><td class="num">' + fmt(m.requests) +
+                 '</td><td class="num">' + m.sharePct.toFixed(1) + '%</td>' +
+                 '<td><div class="bar" style="width:' + Math.max(2, m.sharePct) + '%"></div></td></tr>';
+        }).join('')
+      : '<tr><td colspan="4" style="color:var(--ink-3)">No traffic in this window.</td></tr>';
+
+    $('gen').textContent = 'Generated ' + new Date(d.generatedAt).toUTCString();
+  }
+
+  function renderSession(s) {
+    $('sub').textContent = s.title || 'Live gateway traffic. This view cannot modify anything.';
+    // State the exclusions rather than let a reviewer wonder whether the numbers
+    // were trimmed. An unexplained gap invites a worse assumption than a stated one.
+    $('redacted').innerHTML =
+      '<b>Deliberately not shown.</b> These are withheld for customer confidentiality, ' +
+      'not because the figures above are partial:<ul>' +
+      (s.redacted || []).map(function (x) { return '<li>' + x + '</li>'; }).join('') +
+      '</ul>';
+  }
+
+  function load() {
+    Promise.all([get('/session'), get('/traffic?window=' + win)])
+      .then(function (r) {
+        renderSession(r[0]);
+        render(r[1]);
+        $('gate').hidden = true;
+        $('app').hidden = false;
+        $('seg').hidden = false;
+      })
+      .catch(function (e) {
+        if (e.message === 'AUTH') {
+          sessionStorage.removeItem(KEY);
+          $('app').hidden = true;
+          $('seg').hidden = true;
+          $('gate').hidden = false;
+          fail('That key was not accepted. Check it with whoever sent you this link.');
+        } else {
+          fail('Could not load traffic (' + e.message + '). Try again shortly.');
+        }
+      });
+  }
+
+  function fail(msg) {
+    $('err').textContent = msg;
+    $('err').hidden = false;
+    $('go').disabled = false;
+  }
+
+  $('go').onclick = function () {
+    var v = $('key').value.trim();
+    if (!v) return;
+    $('err').hidden = true;
+    $('go').disabled = true;
+    sessionStorage.setItem(KEY, v);
+    $('key').value = '';
+    load();
+  };
+  $('key').onkeydown = function (e) { if (e.key === 'Enter') $('go').click(); };
+
+  Array.prototype.forEach.call($('seg').children, function (b) {
+    b.onclick = function () {
+      Array.prototype.forEach.call($('seg').children, function (x) { x.classList.remove('on'); });
+      b.classList.add('on');
+      win = b.dataset.w;
+      load();
+    };
+  });
+
+  if (sessionStorage.getItem(KEY)) load();
+})();
+</script>
+</body>
+</html>

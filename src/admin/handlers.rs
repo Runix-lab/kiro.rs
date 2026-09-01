@@ -3667,3 +3667,25 @@ pub async fn send_test_alert(State(state): State<AdminState>) -> impl IntoRespon
             .into_response()
     }
 }
+
+/// GET /api/admin/viewer/ —— 只读流量页（英文）。
+///
+/// **页面本身不鉴权**，数据仍要 viewer key（页面里让访问者粘贴）。
+/// 这样做是因为浏览器直接打开 URL 带不上 Authorization header；
+/// 页面是个空壳，没有 key 什么都拿不到。
+///
+/// `include_str!` 而不是走 admin-ui 的构建产物：这一页不该依赖前端构建是否新鲜，
+/// 也不该让改一句话变成一次 npm build。
+pub async fn viewer_page() -> impl IntoResponse {
+    (
+        [
+            (axum::http::header::CONTENT_TYPE, "text/html; charset=utf-8"),
+            // 对外链接，别让搜索引擎收录
+            (
+                axum::http::HeaderName::from_static("x-robots-tag"),
+                "noindex, nofollow",
+            ),
+        ],
+        include_str!("viewer_page.html"),
+    )
+}

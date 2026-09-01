@@ -68,15 +68,19 @@ pub struct ViewerSession {
 }
 
 impl ViewerSession {
+    /// 文案是**英文**的，与管理台其余部分不同。
+    ///
+    /// 这个视图的读者是外部审核方（支付服务商、合作方尽调），他们读不了中文面板，
+    /// 而这些串会直接渲染在页面上。管理台自身仍是中文 —— 只有这一个对外视图翻。
     pub fn new() -> Self {
         Self {
             role: "viewer",
-            title: "流量概览（只读）".to_string(),
+            title: "Live gateway traffic. This view cannot modify anything.".to_string(),
             redacted: vec![
-                "客户标识与按客户的用量拆分",
-                "成本、毛利与任何金额",
-                "上游账号明细与额度",
-                "请求内容与 prompt",
+                "Customer identities and per-customer usage",
+                "Cost, margin, and any monetary figures",
+                "Upstream account details and quotas",
+                "Request contents and prompts",
             ],
         }
     }
@@ -208,5 +212,36 @@ mod tests {
         let s = ViewerSession::new();
         assert_eq!(s.role, "viewer");
         assert!(!s.redacted.is_empty(), "要明确告知隐去了什么");
+    }
+
+    #[test]
+    fn session_text_is_english_for_external_readers() {
+        // 这些串直接渲染给支付服务商/尽调方看。管理台其余部分是中文，
+        // 这一个视图刻意不是 —— 拿到链接的人读不了中文面板。
+        let s = ViewerSession::new();
+        let all = format!("{} {}", s.title, s.redacted.join(" "));
+        assert!(
+            !all.chars().any(|c| ('\u{4e00}'..='\u{9fff}').contains(&c)),
+            "只读视图的文案不该出现中文：{all}"
+        );
+        assert!(s.redacted.len() >= 3, "要明确列出隐去了哪些内容");
+    }
+
+    #[test]
+    fn viewer_page_ships_no_secrets() {
+        // 这一页是**公开**路由（浏览器直接打开带不上 header），所以它绝不能
+        // 内嵌任何密钥。将来谁往里写死一个 key，这条会红。
+        let page = include_str!("viewer_page.html");
+        for bad in ["sk-", "kv-test", "adminApiKey", "viewerApiKey", "34.46.", "open.feishu.cn"] {
+            assert!(!page.contains(bad), "只读页里出现了 {bad}");
+        }
+        // 它应当引导访问者自己粘 key，而不是内置一个
+        assert!(page.contains("sessionStorage"), "key 应存在会话级存储里");
+        // 查真实调用而不是"提到过" —— 页面注释里解释了为什么不用 localStorage，
+        // 单纯搜字符串会把那句解释也算成违规（第一次写这条测试时就是这样红的）。
+        assert!(
+            !page.contains("localStorage.setItem") && !page.contains("localStorage.getItem"),
+            "别把 key 存进 localStorage：这个链接给的是第三方，标签页关掉就该结束"
+        );
     }
 }

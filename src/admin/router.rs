@@ -20,7 +20,7 @@ use super::{
         get_load_balancing_mode, get_log_governance_config, get_proxy_pool, get_self_heal_config,
         get_scheduling_config, get_update_config, list_client_keys, list_groups, list_traces, poll_idc_login,
         credentials_fleet, get_alert_config, send_test_alert, update_alert_config,
-        viewer_session, viewer_traffic,
+        viewer_page, viewer_session, viewer_traffic,
         poll_idc_relogin, poll_social_login, poll_social_relogin, pull_update_image,
         reset_all_success_count, reset_client_key_stats, reset_failure_count, reset_success_count,
         rollback_image_update, rotate_client_key, run_scheduling_now, set_scheduling_config, set_account_rpm_limit_config,
@@ -222,7 +222,13 @@ pub fn create_admin_router(state: AdminState) -> Router {
             admin_auth_middleware,
         ));
 
+    // 只读流量页：**不过认证层**。它是个空壳 HTML，数据要访问者自己粘 viewer key
+    // 才拿得到（浏览器直接打开 URL 带不上 Authorization header）。
+    // 放在 authenticated 之外，否则外部方连页面都打不开。
+    let public = Router::new().route("/viewer/", get(viewer_page));
+
     Router::new()
+        .merge(public)
         .merge(authenticated)
         .layer(DefaultBodyLimit::max(MAX_ADMIN_BODY_SIZE))
         .with_state(state)
