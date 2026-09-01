@@ -394,6 +394,22 @@ impl ClientKeyManager {
             .count()
     }
 
+    /// 绑定该分组的 Key 名字（按名字排序，便于稳定展示）。
+    ///
+    /// 强制删除分组时用来告诉运营"这次影响了谁" —— 只报个数量的话，
+    /// 拿到消息的人还得自己去翻是哪几把 Key 断了。
+    pub fn names_with_group(&self, group: &str) -> Vec<String> {
+        let inner = self.inner.read();
+        let mut names: Vec<String> = inner
+            .entries
+            .values()
+            .filter(|e| e.group.as_deref() == Some(group))
+            .map(|e| e.name.clone())
+            .collect();
+        names.sort();
+        names
+    }
+
     /// 指定 id 的 Key 是否为系统 Key（不存在也返回 false）。
     pub fn is_system(&self, id: u64) -> bool {
         self.inner
@@ -612,6 +628,33 @@ pub type SharedClientKeyManager = Arc<ClientKeyManager>;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn names_with_group_lists_affected_keys_sorted() {
+        let mgr = ClientKeyManager::new();
+        mgr.create("zeta".into(), None, Some("for_O".into()));
+        mgr.create("alpha".into(), None, Some("for_O".into()));
+        mgr.create("other".into(), None, Some("nibrouter".into()));
+        mgr.create("nogroup".into(), None, None);
+
+        // 排序过：强删分组的提示语里名字顺序要稳定，否则同一次操作两次调用
+        // 读起来像影响了不同的 Key。
+        assert_eq!(mgr.names_with_group("for_O"), vec!["alpha", "zeta"]);
+        assert_eq!(mgr.names_with_group("nibrouter"), vec!["other"]);
+        // 未绑分组的不算进任何分组
+        assert!(mgr.names_with_group("ghost").is_empty());
+    }
+
+    #[test]
+    fn names_and_count_with_group_agree() {
+        // 两个方法各自实现了同一个筛选条件，容易漂。这条钉住它们一致。
+        let mgr = ClientKeyManager::new();
+        mgr.create("a".into(), None, Some("g".into()));
+        mgr.create("b".into(), None, Some("g".into()));
+        mgr.create("c".into(), None, None);
+        assert_eq!(mgr.names_with_group("g").len(), mgr.count_with_group("g"));
+        assert_eq!(mgr.names_with_group("nope").len(), mgr.count_with_group("nope"));
+    }
 
     #[test]
     fn create_and_verify() {

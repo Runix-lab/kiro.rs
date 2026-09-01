@@ -3374,7 +3374,16 @@ pub async fn delete_group(
             .into_response();
     }
 
+    // 级联清理会把引用该分组的客户端 Key 的 group 置空。置空之后它们落进
+    // `GroupScope::Unassigned`，只能看到**没有任何分组**的凭据 —— 若当前一条这样的
+    // 凭据都没有，这些 Key 就此断供。这不是"删了个标签"，而是一次停服。
+    //
+    // 所以 force 分支不再只回一句"已删除"：把受影响的 Key 名字和它们删完能看到
+    // 几条凭据一起报出来。行为不变（force 是显式选择的），但结果不能是静默的。
+    let mut affected_keys: Vec<String> = Vec::new();
+    let mut unassigned_creds = 0_usize;
     if query.force {
+        affected_keys = state.client_keys.names_with_group(&name);
         if let Err(e) = state.service.token_manager().remove_credential_group(&name) {
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -3386,14 +3395,37 @@ pub async fn delete_group(
                 .into_response();
         }
         state.client_keys.clear_group(&name);
+        // 清理之后再数：此刻的"无分组凭据数"就是这些 Key 接下来能用到的全部。
+        unassigned_creds = state
+            .service
+            .get_all_credentials()
+            .credentials
+            .iter()
+            .filter(|c| c.groups.is_empty() && !c.disabled)
+            .count();
     }
 
     state.groups.delete(&name);
-    Json(super::types::SuccessResponse::new(format!(
-        "分组 {} 已删除",
-        name
-    )))
-    .into_response()
+
+    let mut msg = format!("分组 {} 已删除", name);
+    if !affected_keys.is_empty() {
+        msg.push_str(&format!(
+            "。{} 个客户端 Key 的分组已被清空（{}），它们现在只能使用无分组凭据，\
+             当前有 {} 条可用",
+            affected_keys.len(),
+            affected_keys.join("、"),
+            unassigned_creds
+        ));
+        if unassigned_creds == 0 {
+            msg.push_str(" —— ⚠️ 也就是说这些 Key 现在发请求会失败，请立即给它们绑新分组");
+            tracing::warn!(
+                group = %name,
+                keys = ?affected_keys,
+                "强制删除分组后这些 Key 无可用凭据，已断供"
+            );
+        }
+    }
+    Json(super::types::SuccessResponse::new(msg)).into_response()
 }
 
 // ============ 只读观察者视图 ============
