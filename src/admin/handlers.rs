@@ -3524,3 +3524,70 @@ pub async fn viewer_traffic(
         generated_at: chrono::Utc::now().to_rfc3339(),
     })
 }
+
+/// 舰队列表的排序权重：越需要动手的越小（排在前面）。
+///
+/// 抽成函数是为了能单测。它决定运营打开面板第一眼看到什么 —— 如果 healthy 的
+/// 号排在前面，100 条时需要处置的那几条就被埋在下面了，这个视图也就没用了。
+fn fleet_sort_rank(level: Option<&str>) -> u8 {
+    match level {
+        Some("dead") => 0,
+        Some("critical") => 1,
+        Some("warn") => 2,
+        _ => 3,
+    }
+}
+
+/// GET /api/admin/credentials/fleet
+///
+/// 舰队视图的数据源：每条凭据一个健康分级 + 全池汇总。
+///
+/// 与 `/credentials` 分开是因为用途不同。那个接口给的是"每条凭据的全部字段"，
+/// 100 条时 55KB；这个接口给的是"哪几条需要你动手"，前端默认只渲染它。
+/// 响应里**不含 token hash、代理地址、邮箱**——分级不需要它们，少送就少一份泄露面。
+pub async fn credentials_fleet(State(state): State<AdminState>) -> impl IntoResponse {
+    let (per_cred, summary) = state.service.fleet_health();
+    // 需处置的排前面（dead → critical → warn），同级按 id 升序，顺序稳定。
+    let mut items: Vec<serde_json::Value> = per_cred
+        .into_iter()
+        .map(|(id, a)| {
+            serde_json::json!({
+                "id": id,
+                "level": a.level,
+                "headline": a.headline,
+                "reasons": a.reasons,
+            })
+        })
+        .collect();
+    items.sort_by(|a, b| {
+        fleet_sort_rank(a["level"].as_str())
+            .cmp(&fleet_sort_rank(b["level"].as_str()))
+            .then_with(|| a["id"].as_u64().cmp(&b["id"].as_u64()))
+    });
+    Json(serde_json::json!({ "summary": summary, "credentials": items }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fleet_sort_puts_actionable_first() {
+        // 运营打开面板第一眼要看到需要动手的。healthy 排前面等于这个视图白做。
+        let mut levels = vec![Some("healthy"), Some("warn"), Some("dead"), Some("critical")];
+        levels.sort_by_key(|l| fleet_sort_rank(*l));
+        assert_eq!(
+            levels,
+            vec![Some("dead"), Some("critical"), Some("warn"), Some("healthy")]
+        );
+    }
+
+    #[test]
+    fn fleet_sort_treats_unknown_level_as_healthy() {
+        // 认不出的级别排到最后，而不是当成最紧急插到最前面 —— 一个拼错的
+        // 级别名不该把真正需要处置的号挤下去。
+        assert_eq!(fleet_sort_rank(Some("healthy")), fleet_sort_rank(None));
+        assert_eq!(fleet_sort_rank(Some("bogus")), fleet_sort_rank(None));
+        assert!(fleet_sort_rank(Some("bogus")) > fleet_sort_rank(Some("warn")));
+    }
+}

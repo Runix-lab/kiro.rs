@@ -1120,6 +1120,70 @@ impl AdminService {
             .collect()
     }
 
+    /// 舰队健康：每条凭据一个分级 + 全池汇总。
+    ///
+    /// 建在 snapshot + 余额缓存上，而不是复用 `get_all_credentials()` 的
+    /// `CredentialStatusItem` —— 后者没有 `auto_demoted_from` 与
+    /// `throttled_remaining_secs`，而这两条正是"这个号是不是在降级服役"的判据。
+    ///
+    /// 余额**不设 TTL 过滤**：陈旧本身是 `fleet_health` 要报的一种状态
+    /// （`BalanceStale`），先按 TTL 丢掉再判等于把这个信号删了。新鲜度交给
+    /// `balance_cached_at` 表达。
+    pub fn fleet_health(
+        &self,
+    ) -> (
+        Vec<(u64, crate::admin::fleet_health::HealthAssessment)>,
+        crate::admin::fleet_health::FleetSummary,
+    ) {
+        use crate::admin::fleet_health::{HealthInput, HealthThresholds, assess, summarize};
+        let snapshot = self.token_manager.snapshot();
+        let balances = self.balance_cache.lock();
+        // 一轮评估共用同一个 now：逐条取会让排序在同一次请求内抖动。
+        let now_unix = Utc::now().timestamp() as f64;
+        let thresholds = HealthThresholds::default();
+
+        let inputs: Vec<HealthInput> = snapshot
+            .entries
+            .iter()
+            .map(|e| {
+                let cached = balances.get(&e.id);
+                let bal = cached.map(|c| &c.data);
+                HealthInput {
+                    id: e.id,
+                    disabled: e.disabled,
+                    disabled_reason: e.disabled_reason.clone(),
+                    auto_demoted_from: e.auto_demoted_from,
+                    priority: e.priority,
+                    throttled_remaining_secs: e.throttled_remaining_secs,
+                    refresh_failure_count: e.refresh_failure_count,
+                    success_count: e.success_count,
+                    total_failure_count: e.total_failure_count,
+                    groups: e.groups.clone(),
+                    subscription_title: bal.and_then(|b| b.subscription_title.clone()),
+                    expires_at: e.expires_at.clone(),
+                    usage_percentage: bal.map(|b| b.usage_percentage),
+                    remaining: bal.map(|b| b.remaining),
+                    overage_enabled: bal.and_then(|b| b.overage_enabled).unwrap_or(false),
+                    balance_cached_at: cached.map(|c| c.cached_at),
+                    last_used_at: e.last_used_at.clone(),
+                    now_unix,
+                }
+            })
+            .collect();
+        drop(balances);
+
+        let assessed: Vec<(HealthInput, crate::admin::fleet_health::HealthAssessment)> = inputs
+            .into_iter()
+            .map(|i| {
+                let a = assess(&i, &thresholds);
+                (i, a)
+            })
+            .collect();
+        let summary = summarize(&assessed);
+        let per_cred = assessed.into_iter().map(|(i, a)| (i.id, a)).collect();
+        (per_cred, summary)
+    }
+
     /// 开启吞吐模式前的预估。观测值来自真实用量，不是拍脑袋的常数。
     pub fn throughput_estimate(
         &self,
