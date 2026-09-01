@@ -328,7 +328,18 @@ async fn main() {
                     .with_log_governance(
                         Some(admin_trace_store.clone()),
                         Some(usage_recorder.clone()),
-                    );
+                    )
+                    // 外发告警：未配 webhook 时 dispatcher 自己会静默跳过发送，
+                    // 所以这里无条件装配，不用在两处各判一次"配了没"。
+                    .with_alerts(Some(std::sync::Arc::new(
+                        admin::alerts::AlertDispatcher::new(
+                            config.alerts.clone(),
+                            // 15s 超时：告警是旁路，慢过这个就该放弃而不是拖住
+                            // 余额刷新循环。
+                            http_client::build_client(None, 15, config.tls_backend)
+                                .unwrap_or_default(),
+                        ),
+                    )));
             let admin_state = admin::AdminState::new(
                 admin_key,
                 admin_service,

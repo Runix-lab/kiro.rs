@@ -418,25 +418,57 @@ impl AlertDispatcher {
         if !self.should_emit(event, now) {
             return;
         }
+        // 标题与级别在这里取好：post_card 只管发，不认识 AlertEvent。
+        self.post_card(&feishu_payload(event), &event.title(), event.severity().as_str())
+            .await;
+    }
 
+    /// 手动测试卡。**绕过去抖与级别过滤**。
+    ///
+    /// 绕过是刻意的：连点两次"测试"就该收到两张。若它也走去抖，第二次静默不发，
+    /// 人会以为 webhook 坏了 —— 而这个功能存在的唯一目的就是排除这种怀疑。
+    ///
+    /// 复用 `post_card` 而不是自己写一遍发送：两套代码的话，测试通了并不能说明
+    /// 真告警能通，这个自检就失去意义了。
+    pub async fn send_test(&self) -> bool {
+        let payload = serde_json::json!({
+            "msg_type": "interactive",
+            "card": {
+                "config": {"wide_screen_mode": true},
+                "header": {
+                    "title": {"tag": "plain_text", "content": "🔔 Kiro 号池告警自检"},
+                    "template": "blue"
+                },
+                "elements": [{
+                    "tag": "div",
+                    "text": {
+                        "tag": "lark_md",
+                        "content": "收到这张卡说明 webhook 与签名都是通的。\n这是手动触发的自检，不代表当前有异常。"
+                    }
+                }]
+            }
+        });
+        self.post_card(&payload, "告警自检", "test").await
+    }
+
+    /// 实际发送。返回是否**确认送达**（HTTP 2xx 且业务 code == 0）。
+    async fn post_card(&self, payload: &serde_json::Value, title: &str, severity: &str) -> bool {
         let url = {
             let config = self.config.read();
             match config.webhook_url.as_deref().map(str::trim) {
                 Some(u) if !u.is_empty() => u.to_string(),
-                _ => return,
+                _ => {
+                    tracing::warn!(alert = %title, "未配置 webhook，跳过发送");
+                    return false;
+                }
             }
         };
-
-        let payload = feishu_payload(event);
-        // 日志只带标题与状态码：url 这个变量除了交给 reqwest 之外不进任何格式化串
-        let title = event.title();
-        let severity = event.severity();
 
         let result = self
             .client
             .post(&url)
             .timeout(Duration::from_secs(DISPATCH_TIMEOUT_SECS))
-            .json(&payload)
+            .json(payload)
             .send()
             .await;
 
@@ -461,25 +493,28 @@ impl AlertDispatcher {
                     .and_then(|v| v.get("code").and_then(serde_json::Value::as_i64));
 
                 if (200..300).contains(&status) && biz_code == Some(0) {
-                    tracing::info!(severity = severity.as_str(), status, alert = %title, "告警已发送");
+                    tracing::info!(severity, status, alert = %title, "告警已发送");
+                    true
                 } else {
                     tracing::warn!(
-                        severity = severity.as_str(),
+                        severity,
                         status,
                         code = biz_code,
                         alert = %title,
                         "告警发送被拒绝"
                     );
+                    false
                 }
             }
             Err(e) => {
                 // reqwest 的错误默认会把请求 URL 打进 Display，without_url() 把它摘掉
                 tracing::warn!(
-                    severity = severity.as_str(),
+                    severity,
                     alert = %title,
                     error = %e.without_url(),
                     "告警发送失败"
                 );
+                false
             }
         }
     }

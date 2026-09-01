@@ -233,6 +233,13 @@ pub struct AdminService {
     trace_store: Option<crate::admin::trace_db::SharedTraceStore>,
     /// 用量日志记录器（用于日志治理：保留天数运行时可改）
     usage_recorder: Option<crate::admin::usage_stats::SharedRecorder>,
+    /// 外发告警。`None` = 未装配（嵌入式/测试）。
+    alerts: Option<Arc<crate::admin::alerts::AlertDispatcher>>,
+    /// 上一轮各凭据的健康级别，用于只在**跨级变差**时告警。
+    ///
+    /// 存在这里而不是每轮重算：告警要的是"变化"，而健康分级本身是无状态的纯函数。
+    /// 没有这份上一轮快照，每轮都会把同一个问题重报一次，去抖窗口再长也压不住。
+    prev_health: Mutex<HashMap<u64, crate::admin::fleet_health::HealthLevel>>,
 }
 
 /// Social 登录会话状态
@@ -567,6 +574,8 @@ impl AdminService {
             social_sessions: Arc::new(Mutex::new(HashMap::new())),
             trace_store: None,
             usage_recorder: None,
+            alerts: None,
+            prev_health: Mutex::new(HashMap::new()),
         };
 
         // 后台任务：每 5 分钟清理过期的登录会话，防止内存泄漏
@@ -606,6 +615,120 @@ impl AdminService {
         self.trace_store = trace_store;
         self.usage_recorder = usage_recorder;
         self
+    }
+
+    /// 注入外发告警。`None` = 不告警（嵌入式/测试装配）。
+    pub fn with_alerts(
+        mut self,
+        alerts: Option<Arc<crate::admin::alerts::AlertDispatcher>>,
+    ) -> Self {
+        self.alerts = alerts;
+        self
+    }
+
+    /// 告警分发器（供 admin 接口读写配置、发测试卡）。
+    pub fn alerts(&self) -> Option<&Arc<crate::admin::alerts::AlertDispatcher>> {
+        self.alerts.as_ref()
+    }
+
+    /// 评估一轮舰队健康并把**变差的**推出去。
+    ///
+    /// 在余额刷新之后调用：那时余额和调度结果都是最新的，此刻的分级才可信。
+    ///
+    /// 只报跨级变差。变好不报 —— 恢复通知的价值远低于它带来的噪音，而运营真正
+    /// 需要知道的是"现在还有什么没解决"，那个看面板。
+    async fn evaluate_and_alert(&self) {
+        use crate::admin::alerts::AlertEvent;
+        use crate::admin::fleet_health::{HealthLevel, HealthReason};
+
+        let Some(dispatcher) = self.alerts.as_ref() else {
+            return;
+        };
+        let (per_cred, summary) = self.fleet_health();
+        let now = Utc::now().timestamp() as f64;
+
+        let current: HashMap<u64, HealthLevel> =
+            per_cred.iter().map(|(id, a)| (*id, a.level)).collect();
+        let worsened: Vec<u64> = {
+            let prev = self.prev_health.lock();
+            crate::admin::alerts::transitions(&prev, &current)
+        };
+
+        let mut events: Vec<AlertEvent> = Vec::new();
+        for id in &worsened {
+            let Some((_, assessment)) = per_cred.iter().find(|(cid, _)| cid == id) else {
+                continue;
+            };
+            // 一条凭据可能同时命中多个理由，逐条转成事件；由 dispatcher 的
+            // 去抖决定实际发几条。
+            for reason in &assessment.reasons {
+                match reason {
+                    HealthReason::Disabled { reason, recoverable } => {
+                        events.push(AlertEvent::CredentialDisabled {
+                            id: *id,
+                            email: None,
+                            reason: reason.clone(),
+                            recoverable: *recoverable,
+                        })
+                    }
+                    HealthReason::RefreshFailing { count, .. } => {
+                        events.push(AlertEvent::CredentialRefreshFailing {
+                            id: *id,
+                            email: None,
+                            count: *count,
+                        })
+                    }
+                    HealthReason::QuotaExhausted | HealthReason::QuotaCritical { .. } => {
+                        events.push(AlertEvent::CredentialQuotaCritical {
+                            id: *id,
+                            email: None,
+                            usage_pct: match reason {
+                                HealthReason::QuotaCritical { usage_pct } => *usage_pct,
+                                _ => 100.0,
+                            },
+                            remaining: 0.0,
+                        })
+                    }
+                    HealthReason::AutoDemoted { from, to } => {
+                        events.push(AlertEvent::CredentialDemoted {
+                            id: *id,
+                            email: None,
+                            from: *from,
+                            to: *to,
+                        })
+                    }
+                    // 其余理由（idle / unassigned / 订阅掉档 / 余额陈旧 / 冷却）
+                    // 只进面板，不打断人。判据见 alerts.rs 头部。
+                    _ => {}
+                }
+            }
+        }
+
+        // 分组饿死：客户下一个请求就会失败，这条比任何单条凭据都紧急。
+        for (group, available) in &summary.available_by_group {
+            if *available == 0 {
+                events.push(AlertEvent::GroupStarved {
+                    group: group.clone(),
+                    total_in_group: 0,
+                });
+            }
+        }
+
+        let pool_threshold = dispatcher.config_snapshot().pool_low_threshold;
+        if summary.total > 0 && summary.healthy < pool_threshold {
+            events.push(AlertEvent::PoolCapacityLow {
+                healthy: summary.healthy,
+                total: summary.total,
+                threshold: pool_threshold,
+            });
+        }
+
+        for ev in &events {
+            dispatcher.dispatch(ev, now).await;
+        }
+        // 只有走完这一轮才更新快照：中途 panic 的话下一轮会重算，而不是把
+        // 没报出去的变差状态当成"已经报过了"。
+        *self.prev_health.lock() = current;
     }
 
     /// 获取所有凭据状态
@@ -1303,6 +1426,9 @@ impl AdminService {
                     err,
                     started.elapsed().as_secs_f32()
                 );
+                // 告警放在刷新与调度之后：此刻余额与优先级都是最新的。
+                // 放前面的话报出来的是上一轮的状态。
+                svc.evaluate_and_alert().await;
                 tokio::time::sleep(interval).await;
             }
         });

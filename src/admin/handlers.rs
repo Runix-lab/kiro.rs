@@ -3591,3 +3591,79 @@ mod tests {
         assert!(fleet_sort_rank(Some("bogus")) > fleet_sort_rank(Some("warn")));
     }
 }
+
+// ============ 外发告警配置 ============
+
+/// GET /api/admin/alerts/config
+///
+/// 返回不含 webhook URL 的安全视图（只有"是否已配置"）。
+pub async fn get_alert_config(State(state): State<AdminState>) -> impl IntoResponse {
+    match state.service.alerts() {
+        Some(a) => Json(serde_json::to_value(a.public_config()).unwrap_or_default()).into_response(),
+        None => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(super::types::AdminErrorResponse::invalid_request(
+                "本实例未装配告警",
+            )),
+        )
+            .into_response(),
+    }
+}
+
+/// PUT /api/admin/alerts/config
+///
+/// 改完立刻生效，不需要重启 —— 上一次「保存了但没生效」的坑就是配置只落文件、
+/// 没更新内存里的运行时副本（见 scheduling 那次）。这里两边一起改。
+pub async fn update_alert_config(
+    State(state): State<AdminState>,
+    Json(patch): Json<super::alerts::AlertConfigPatch>,
+) -> impl IntoResponse {
+    let Some(a) = state.service.alerts() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(super::types::AdminErrorResponse::invalid_request(
+                "本实例未装配告警",
+            )),
+        )
+            .into_response();
+    };
+    a.update_config(patch);
+    // 落盘，否则重启就回到 config.json 里的旧值。运行时副本已在上面改过，
+    // 两边一起动——只改文件不改内存，就是「保存了但没生效」那个坑。
+    let snapshot = a.config_snapshot();
+    state
+        .service
+        .update_config_file(move |c| c.alerts = snapshot);
+    Json(serde_json::to_value(a.public_config()).unwrap_or_default()).into_response()
+}
+
+/// POST /api/admin/alerts/test
+///
+/// 发一张测试卡。配完 webhook 后没有这个的话，只能等下一次真故障才知道通不通 ——
+/// 而那时候正是最不想发现"告警本身是坏的"的时刻。
+pub async fn send_test_alert(State(state): State<AdminState>) -> impl IntoResponse {
+    let Some(a) = state.service.alerts() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(super::types::AdminErrorResponse::invalid_request(
+                "本实例未装配告警",
+            )),
+        )
+            .into_response();
+    };
+    let ok = a.send_test().await;
+    if ok {
+        Json(super::types::SuccessResponse::new(
+            "测试卡已发送，去群里确认收到".to_string(),
+        ))
+        .into_response()
+    } else {
+        (
+            StatusCode::BAD_GATEWAY,
+            Json(super::types::AdminErrorResponse::api_error(
+                "发送失败：检查 webhook 与签名密钥（详情见服务日志，此处不回显以免泄露）",
+            )),
+        )
+            .into_response()
+    }
+}

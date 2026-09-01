@@ -19,7 +19,8 @@ use super::{
         get_credential_balance, get_credential_models, get_current_models, get_global_proxy,
         get_load_balancing_mode, get_log_governance_config, get_proxy_pool, get_self_heal_config,
         get_scheduling_config, get_update_config, list_client_keys, list_groups, list_traces, poll_idc_login,
-        credentials_fleet, viewer_session, viewer_traffic,
+        credentials_fleet, get_alert_config, send_test_alert, update_alert_config,
+        viewer_session, viewer_traffic,
         poll_idc_relogin, poll_social_login, poll_social_relogin, pull_update_image,
         reset_all_success_count, reset_client_key_stats, reset_failure_count, reset_success_count,
         rollback_image_update, rotate_client_key, run_scheduling_now, set_scheduling_config, set_account_rpm_limit_config,
@@ -72,6 +73,8 @@ pub fn create_admin_router(state: AdminState) -> Router {
         .route("/viewer/session", get(viewer_session))
         .route("/viewer/traffic", get(viewer_traffic))
         .route("/credentials/fleet", get(credentials_fleet))
+        .route("/alerts/config", get(get_alert_config).put(update_alert_config))
+        .route("/alerts/test", post(send_test_alert))
         .route("/credentials/export", get(export_credentials))
         .route(
             "/credentials/{id}",

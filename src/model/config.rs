@@ -137,6 +137,13 @@ pub struct Config {
     #[serde(default)]
     pub admin_api_key: Option<String>,
 
+    /// 外发告警配置（飞书群机器人）。
+    ///
+    /// 缺省是关闭的：一个没配 webhook 的实例不该在日志里刷发送失败。
+    /// 🔴 `webhookUrl` 只写不读——任何对外接口都只回"是否已配置"。
+    #[serde(default)]
+    pub alerts: crate::admin::alerts::AlertConfig,
+
     /// 只读观察者密钥（可选）。
     ///
     /// 拿这个 key 只能读流量面板，且读到的数据经过脱敏：没有客户 Key 名、
@@ -442,6 +449,7 @@ impl Default for Config {
             proxy_password: None,
             admin_api_key: None,
             viewer_api_key: None,
+            alerts: Default::default(),
             update_previous_version: None,
             github_token: None,
             update_last_applied_at: None,
@@ -610,5 +618,45 @@ mod tests {
         .unwrap();
         assert!(config.account_rpm_limit_enabled);
         assert_eq!(config.account_rpm_limit, 120);
+    }
+}
+
+#[cfg(test)]
+mod alerts_config_tests {
+    use super::*;
+
+    #[test]
+    fn config_without_alerts_section_still_loads() {
+        // 线上 config.json 里没有 alerts 段。若它不是 #[serde(default)]，
+        // 部署这版就会在启动时解析失败——服务直接起不来。
+        let json = r#"{"host":"0.0.0.0","port":8990}"#;
+        let c: Config = serde_json::from_str(json).expect("缺 alerts 段也必须能加载");
+        assert!(!c.alerts.enabled, "缺省必须是关闭的");
+        assert!(c.alerts.webhook_url.is_none());
+    }
+
+    #[test]
+    fn alerts_section_roundtrips() {
+        let mut c = Config::default();
+        c.alerts.enabled = true;
+        c.alerts.webhook_url = Some("https://example.invalid/hook".into());
+        let s = serde_json::to_string(&c).unwrap();
+        let back: Config = serde_json::from_str(&s).unwrap();
+        assert!(back.alerts.enabled);
+        assert_eq!(
+            back.alerts.webhook_url.as_deref(),
+            Some("https://example.invalid/hook")
+        );
+    }
+
+    #[test]
+    fn alerts_config_debug_hides_the_webhook() {
+        // config.json 整体被 {:?} 打进日志的场景是存在的（启动时的配置转储）。
+        // AlertConfig 的手写 Debug 必须挡住 webhook。
+        let mut c = Config::default();
+        c.alerts.webhook_url = Some("https://secret.invalid/aaa-bbb".into());
+        let dumped = format!("{:?}", c.alerts);
+        assert!(!dumped.contains("secret.invalid"), "webhook 泄漏进 Debug: {dumped}");
+        assert!(dumped.contains("webhook_configured"));
     }
 }
