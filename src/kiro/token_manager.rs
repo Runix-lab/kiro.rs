@@ -2114,11 +2114,29 @@ impl MultiTokenManager {
                                 UpstreamRateLimitError::new(Some(retry_after.to_string())).into()
                             );
                         }
-                        // 注意：必须在 bail! 之前计算 available_count，
+                        // 注意：必须在 bail! 之前算完计数，
                         // 因为 available_count() 会尝试获取 entries 锁，
                         // 而此时我们已经持有该锁，会导致死锁
-                        let available = entries.iter().filter(|e| !e.disabled).count();
-                        anyhow::bail!("所有凭据均已禁用（{}/{}）", available, total);
+                        let enabled = entries.iter().filter(|e| !e.disabled).count();
+                        // 分组可见性要单独数。原来只报 `!disabled` 的条数，于是
+                        // 「有 6 条启用但一条都不在这把 Key 的分组里」会打印成
+                        // 「所有凭据均已禁用（6/0）」—— 数字自相矛盾，而且把人往
+                        // "去看谁被禁用了"的方向带，真正的原因是分组配错。
+                        let in_scope = entries
+                            .iter()
+                            .filter(|e| {
+                                !e.disabled && group_matches(&e.credentials.groups, scope)
+                            })
+                            .count();
+                        if enabled > 0 && in_scope == 0 {
+                            anyhow::bail!(
+                                "该 Key 的分组下没有可用凭据（全池启用 {}/{} 条，命中本分组 0 条）\
+                                 —— 检查 Key 绑的分组名，以及是否有凭据挂在该分组上",
+                                enabled,
+                                total
+                            );
+                        }
+                        anyhow::bail!("所有凭据均已禁用（{}/{}）", enabled, total);
                     }
                 };
 
